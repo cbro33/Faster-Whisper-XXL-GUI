@@ -1,0 +1,95 @@
+QMainWindow {
+    background-color: #000000;
+    color: #ffffff;
+}
+QWidget {
+    background-color: #000000;
+    color: #ffffff;
+}
+QGroupBox {
+    background-color: #000000;
+    border: 1px solid #222222;
+    border-radius: 5px;
+    margin-top: 10px;
+    padding-top: 10px;
+    font-weight: bold;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 0 5px 0 5px;
+}
+QLineEdit, QTextEdit, QListWidget, QComboBox, QSpinBox, QDoubleSpinBox {
+    background-color: #111111;
+    border: 1px solid #222222;
+    padding: 5px;
+    border-radius: 3px;
+}
+QLineEdit:focus, QTextEdit:focus, QComboBox:focus {
+    border: 1px solid #007acc;
+}
+QPushButton {
+    background-color: #007acc;
+    color: white;
+    border: none;
+    padding: 8px 15px;
+    border-radius: 3px;
+    font-weight: bold;
+}
+QPushButton:hover {
+    background-color: #005a9e;
+}
+QPushButton:pressed {
+    background-color: #004578;
+}
+QPushButton:disabled {
+    background-color: #222222;
+    color: #666666;
+}
+QTabWidget::pane {
+    border: 1px solid #222222;
+    background-color: #000000;
+}
+QTabBar::tab {
+    background-color: #111111;
+    color: #ffffff;
+    padding: 8px 20px;
+    margin-right: 2px;
+}
+QTabBar::tab:selected {
+    background-color: #007acc;
+}
+QCheckBox {
+    spacing: 5px;
+}
+QCheckBox::indicator {
+    width: 18px;
+    height: 18px;
+    border: 1px solid #222222;
+    background-color: #111111;
+    border-radius: 3px;
+}
+QCheckBox::indicator:checked {
+    background-color: #007acc;
+    image: url(check.png);
+}
+QScrollBar:vertical {
+    background-color: #000000;
+    width: 12px;
+    border-radius: 6px;
+}
+QScrollBar::handle:vertical {
+    background-color: #222222;
+    border-radius: 6px;
+    min-height: 20px;
+}
+QScrollBar::handle:vertical:hover {
+    background-color: #333333;
+}
+
+QComboBox QAbstractItemView {
+    background-color: #000000;
+    color: #ffffff;
+    border: 1px solid #222222;
+    selection-background-color: #007acc;
+}

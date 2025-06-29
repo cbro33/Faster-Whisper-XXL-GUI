@@ -1,0 +1,96 @@
+QMainWindow {
+    background-color: #f0f0f0;
+    color: #000000;
+}
+QWidget {
+    background-color: #ffffff;
+    color: #000000;
+}
+QGroupBox {
+    background-color: #ffffff;
+    border: 1px solid #dcdcdc;
+    border-radius: 5px;
+    margin-top: 10px;
+    padding-top: 10px;
+    font-weight: bold;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 0 5px 0 5px;
+}
+QLineEdit, QTextEdit, QListWidget, QComboBox, QSpinBox, QDoubleSpinBox {
+    background-color: #f0f0f0;
+    border: 1px solid #dcdcdc;
+    padding: 5px;
+    border-radius: 3px;
+}
+QLineEdit:focus, QTextEdit:focus, QComboBox:focus {
+    border: 1px solid #007acc;
+}
+QPushButton {
+    background-color: #007acc;
+    color: white;
+    border: none;
+    padding: 8px 15px;
+    border-radius: 3px;
+    font-weight: bold;
+}
+QPushButton:hover {
+    background-color: #005a9e;
+}
+QPushButton:pressed {
+    background-color: #004578;
+}
+QPushButton:disabled {
+    background-color: #dcdcdc;
+    color: #999999;
+}
+QTabWidget::pane {
+    border: 1px solid #dcdcdc;
+    background-color: #ffffff;
+}
+QTabBar::tab {
+    background-color: #dcdcdc;
+    color: #000000;
+    padding: 8px 20px;
+    margin-right: 2px;
+}
+QTabBar::tab:selected {
+    background-color: #007acc;
+    color: white;
+}
+QCheckBox {
+    spacing: 5px;
+}
+QCheckBox::indicator {
+    width: 18px;
+    height: 18px;
+    border: 1px solid #dcdcdc;
+    background-color: #f0f0f0;
+    border-radius: 3px;
+}
+QCheckBox::indicator:checked {
+    background-color: #007acc;
+    image: url(check.png);
+}
+QScrollBar:vertical {
+    background-color: #ffffff;
+    width: 12px;
+    border-radius: 6px;
+}
+QScrollBar::handle:vertical {
+    background-color: #dcdcdc;
+    border-radius: 6px;
+    min-height: 20px;
+}
+QScrollBar::handle:vertical:hover {
+    background-color: #c0c0c0;
+}
+
+QComboBox QAbstractItemView {
+    background-color: #f0f0f0;
+    color: #000000;
+    border: 1px solid #dcdcdc;
+    selection-background-color: #007acc;
+}

@@ -1,0 +1,5 @@
+output/
+build/
+dist/
+faster-whisper-xxl-gui.spec
+settings.json
