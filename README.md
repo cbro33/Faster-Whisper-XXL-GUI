@@ -18,7 +18,19 @@ Faster Whisper XXL GUI is a user-friendly graphical interface for the powerful F
 *   **Theming:** Choose between Light, Dark, and AMOLED themes.
 *   **Persistent Settings:** Your preferences are saved for future use.
 
-## Installation
+## Download (Windows)
+
+For most users, the easiest way to get started is to download the latest standalone executable (`.exe`) from the **[Releases](https://github.com/cbro33/Faster-Whisper-XXL-GUI/releases)** page.
+
+1.  Go to the [Releases](https://github.com/cbro33/Faster-Whisper-XXL-GUI/releases) section.
+2.  Download the `.exe` file from the latest release.
+3.  Run the file. No installation is needed.
+
+The first time you run the application, it will prompt you to automatically download and set up the necessary Faster Whisper XXL executable and FFmpeg.
+
+## Installation from Source
+
+This method is for developers or users who want to run the application directly from the Python source code.
 
 1.  **Prerequisites:**
     *   Python 3.8 or higher.
@@ -37,9 +49,8 @@ Faster Whisper XXL GUI is a user-friendly graphical interface for the powerful F
 
 4.  **Run the application:**
     ```bash
-    python faster-whisper-xxl-gui.py
+    python src/faster-whisper-xxl-gui.py
     ```
-    The first time you run the application, it will prompt you to automatically download and set up the necessary Faster Whisper XXL executable and FFmpeg.
 
 ## Usage
 
