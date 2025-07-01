@@ -4,12 +4,33 @@ import json
 import platform
 import shutil
 import requests
-import py7zr
+import threading
+import logging
+import subprocess
 from pathlib import Path
-from PyQt6.QtWidgets import *
-from PyQt6.QtCore import *
-from PyQt6.QtGui import *
+from PyQt6.QtWidgets import (QProgressBar, QGridLayout, QDialog, QSplitter, QWidget, 
+                             QHBoxLayout, QVBoxLayout, QLabel, QComboBox, QTabWidget, 
+                             QGroupBox, QFormLayout, QLineEdit, QPushButton, QCheckBox, 
+                             QTextEdit, QDoubleSpinBox, QSpinBox, QScrollArea, QMessageBox, 
+                             QProgressDialog, QApplication, QMainWindow, QFileDialog, QCompleter)
+from PyQt6.QtCore import pyqtSignal, QThread, Qt, QTimer, QProcess, QByteArray
+from PyQt6.QtGui import QIcon, QPalette, QColor, QTextCursor, QFont
 import yt_dlp
+
+# --- Setup Logging ---
+# Create a dedicated logs directory
+log_dir = os.path.join(os.getcwd(), "logs")
+os.makedirs(log_dir, exist_ok=True)
+log_file = os.path.join(log_dir, "debug_log.txt")
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s - %(levelname)s - %(module)s - %(message)s",
+    handlers=[
+        logging.FileHandler(log_file, mode='w', encoding='utf-8'),
+        logging.StreamHandler() # Also print to console
+    ]
+)
 
 def resource_path(relative_path):
     """ Get absolute path to resource, works for dev and for PyInstaller """
@@ -17,8 +38,12 @@ def resource_path(relative_path):
         # PyInstaller creates a temp folder and stores path in _MEIPASS
         base_path = sys._MEIPASS
     except Exception:
+        # Fallback for normal execution
         base_path = os.path.abspath(".")
+    
+    # In this new structure, resources are in a 'resources' subdirectory
     return os.path.join(base_path, "resources", relative_path)
+
 
 class YouTubeDownloader(QThread):
     finished = pyqtSignal(str)
@@ -36,7 +61,11 @@ class YouTubeDownloader(QThread):
         if self.stop_requested:
             raise yt_dlp.utils.DownloadError("Download cancelled by user.")
         if d['status'] == 'downloading':
-            self.progress.emit(f"Downloading: {d['_percent_str']} of {d.get('_total_bytes_str', 'N/A')} at {d.get('_speed_str', 'N/A')}")
+            # Sanitize the output to prevent weird formatting issues
+            percent_str = d.get('_percent_str', 'N/A').strip()
+            total_bytes_str = d.get('_total_bytes_str', 'N/A').strip()
+            speed_str = d.get('_speed_str', 'N/A').strip()
+            self.progress.emit(f"Downloading: {percent_str} of {total_bytes_str} at {speed_str}")
         elif d['status'] == 'finished':
             self.progress.emit("Download finished, now processing...")
 
@@ -54,6 +83,7 @@ class YouTubeDownloader(QThread):
                     'outtmpl': output_template,
                     'noplaylist': True,
                     'progress_hooks': [self.progress_hook],
+                    'logger': logging.getLogger('yt_dlp'),
                 }
             else:
                 ydl_opts = {
@@ -61,20 +91,237 @@ class YouTubeDownloader(QThread):
                     'outtmpl': output_template,
                     'noplaylist': True,
                     'progress_hooks': [self.progress_hook],
+                    'logger': logging.getLogger('yt_dlp'),
                 }
             
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info_dict = ydl.extract_info(self.url, download=True)
                 final_filename = ydl.prepare_filename(info_dict)
+                
                 if self.audio_only:
                     base, _ = os.path.splitext(final_filename)
                     final_filename = base + '.mp3'
+                
+                if not os.path.exists(final_filename):
+                    raise FileNotFoundError(f"Post-processing failed. Expected file not found: {final_filename}")
+
                 self.finished.emit(final_filename)
         except Exception as e:
+            logging.error(f"yt-dlp thread error: {e}", exc_info=True)
             self.error.emit(str(e))
 
     def stop(self):
         self.stop_requested = True
+
+
+class DownloadManager(QDialog):
+    download_progress = pyqtSignal(int, int, str)
+    extraction_progress = pyqtSignal(int, int, str)
+    error_occurred = pyqtSignal(str)
+    download_finished_signal = pyqtSignal()
+    extraction_finished_signal = pyqtSignal()
+
+    def __init__(self, url, files_to_extract, destination_dir, parent=None):
+        super().__init__(parent)
+        self.url = url
+        self.files_to_extract = files_to_extract
+        self.destination_dir = destination_dir
+        self.error_string = None
+        self.archive_path = "whisper_essentials.7z"
+        self.worker_thread = None
+        self.cancelled = False
+
+        self.setWindowTitle("Setup Progress")
+        self.setModal(True)
+        layout = QVBoxLayout(self)
+        self.status_label = QLabel(f"Downloading from: {self.url}", self)
+        layout.addWidget(self.status_label)
+        self.progress_bar = QProgressBar(self)
+        layout.addWidget(self.progress_bar)
+        self.details_label = QLabel("Initializing...", self)
+        layout.addWidget(self.details_label)
+
+        self.cancel_button = QPushButton("Cancel", self)
+        layout.addWidget(self.cancel_button)
+        
+        self.cancel_button.clicked.connect(self.cancel)
+        self.download_progress.connect(self.update_download_progress)
+        self.extraction_progress.connect(self.update_extraction_progress)
+        self.error_occurred.connect(self.on_error)
+        self.download_finished_signal.connect(self.start_extraction)
+        self.extraction_finished_signal.connect(self.on_extraction_finished)
+
+        QTimer.singleShot(100, self.start_download)
+
+    def start_download(self):
+        self.details_label.setText("Starting download...")
+        self.worker_thread = threading.Thread(target=self.download_worker)
+        self.worker_thread.start()
+
+    def download_worker(self):
+        try:
+            response = requests.get(self.url, stream=True, timeout=15)
+            response.raise_for_status()
+            total_size = int(response.headers.get('content-length', 0))
+
+            downloaded_size = 0
+            with open(self.archive_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if self.cancelled:
+                        self.cleanup_archive()
+                        return
+                    f.write(chunk)
+                    downloaded_size += len(chunk)
+                    status_text = f"{downloaded_size / (1024*1024):.2f} MB / {total_size / (1024*1024):.2f} MB"
+                    self.download_progress.emit(downloaded_size, total_size, status_text)
+            
+            if not self.cancelled:
+                self.download_finished_signal.emit()
+        except Exception as e:
+            self.error_occurred.emit(f"Download failed: {e}")
+
+    def update_download_progress(self, value, total, text):
+        if self.progress_bar.maximum() != total:
+            self.progress_bar.setMaximum(total)
+        self.progress_bar.setValue(value)
+        self.details_label.setText(text)
+
+    def start_extraction(self):
+        self.status_label.setText("Extracting files...")
+        self.progress_bar.setValue(0)
+        self.details_label.setText("Preparing to extract...")
+        self.worker_thread = threading.Thread(target=self.extraction_worker)
+        self.worker_thread.start()
+
+    def extraction_worker(self):
+        extract_dir = "temp_extract"
+        try:
+            logging.info("--- Starting Extraction ---")
+            if os.path.exists(extract_dir):
+                logging.info(f"Removing existing temp directory: {extract_dir}")
+                shutil.rmtree(extract_dir)
+            os.makedirs(extract_dir, exist_ok=True)
+            logging.info(f"Created temp directory: {extract_dir}")
+
+            sevenzip_executable = shutil.which('7z')
+            if not sevenzip_executable and sys.platform == "win32":
+                prog_files = os.environ.get("ProgramFiles", "C:\\Program Files")
+                prog_files_x86 = os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")
+                possible_paths = [
+                    os.path.join(prog_files, "7-Zip", "7z.exe"),
+                    os.path.join(prog_files_x86, "7-Zip", "7z.exe")
+                ]
+                for path in possible_paths:
+                    if os.path.exists(path):
+                        sevenzip_executable = path
+                        break
+            if not sevenzip_executable:
+                error_msg = ("7-Zip/p7zip executable not found. Please install it and ensure it's in your system's PATH. "
+                             "On Windows, install from 7-zip.org. On Linux, use e.g., 'sudo apt install p7zip-full'.")
+                raise FileNotFoundError(error_msg)
+
+            logging.info(f"Using 7-Zip executable: {sevenzip_executable}")
+            self.extraction_progress.emit(0, 0, "Extracting archive using 7-Zip... (This may take a moment)")
+            command = [sevenzip_executable, 'x', self.archive_path, f'-o{extract_dir}', '-y']
+            logging.info(f"Executing command: {' '.join(command)}")
+            result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace')
+            if result.returncode != 0:
+                logging.error(f"7-Zip failed with code {result.returncode}\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}")
+                raise RuntimeError(f"7-Zip extraction failed. Error: {result.stderr or result.stdout}")
+            logging.info("Extraction complete.")
+
+            self.extraction_progress.emit(1, 2, "Finalizing installation...")
+
+            extracted_items = os.listdir(extract_dir)
+            logging.info(f"Items in temp_extract: {extracted_items}")
+
+            source_dir = None
+            for item in extracted_items:
+                path = os.path.join(extract_dir, item)
+                if os.path.isdir(path):
+                    source_dir = path
+                    break
+            if not source_dir:
+                if any(f in extracted_items for f in self.files_to_extract):
+                    source_dir = extract_dir
+                else:
+                    raise FileNotFoundError(f"Extraction failed: Could not find a source directory or required files within {extract_dir}.")
+
+            logging.info(f"Source directory for moving files: {source_dir}")
+
+            os.makedirs(self.destination_dir, exist_ok=True)
+            logging.info(f"Ensured destination directory exists: {self.destination_dir}")
+
+            for item_name in os.listdir(source_dir):
+                source_path = os.path.join(source_dir, item_name)
+                dest_path = os.path.join(self.destination_dir, item_name)
+                logging.info(f"Moving '{source_path}' to '{dest_path}'")
+                
+                if os.path.isdir(dest_path):
+                    shutil.rmtree(dest_path)
+                elif os.path.exists(dest_path):
+                    os.remove(dest_path)
+                
+                shutil.move(source_path, dest_path)
+
+            self.extraction_progress.emit(2, 2, "Verifying files...")
+            logging.info("Verifying extracted files...")
+
+            for filename in self.files_to_extract:
+                final_path = os.path.join(self.destination_dir, filename)
+                if not os.path.exists(final_path) or os.path.getsize(final_path) == 0:
+                    raise FileNotFoundError(f"Verification failed: '{filename}' is missing or empty in '{self.destination_dir}' after extraction.")
+                logging.info(f"Verified '{final_path}' successfully.")
+
+            if not self.cancelled:
+                self.extraction_finished_signal.emit()
+                logging.info("--- Extraction Successful ---")
+
+        except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            logging.error(f"--- Extraction Failed ---\n{error_details}")
+            self.error_occurred.emit(f"Extraction process failed: {e}")
+        finally:
+            if not self.error_string:
+                self.cleanup_archive_and_dir(extract_dir)
+
+    def cleanup_archive_and_dir(self, dir_path):
+        self.cleanup_archive()
+        if os.path.exists(dir_path):
+            shutil.rmtree(dir_path, ignore_errors=True)
+
+    def update_extraction_progress(self, value, total, text):
+        if total == 0:
+            self.progress_bar.setRange(0, 0)
+        else:
+            self.progress_bar.setRange(0, total)
+            self.progress_bar.setValue(value)
+        self.details_label.setText(text)
+
+    def on_extraction_finished(self):
+        self.accept()
+
+    def on_error(self, message):
+        self.error_string = message
+        self.reject()
+
+    def cancel(self):
+        if not self.cancelled:
+            self.cancelled = True
+            self.status_label.setText("Cancelling...")
+            self.cancel_button.setEnabled(False)
+            self.error_string = "User cancelled."
+            self.reject()
+
+    def cleanup_archive(self):
+        if os.path.exists(self.archive_path):
+            os.remove(self.archive_path)
+
+    def reject(self):
+        self.cleanup_archive_and_dir("temp_extract")
+        super().reject()
+
 
 class WhisperGUI(QMainWindow):
     def __init__(self):
@@ -88,11 +335,12 @@ class WhisperGUI(QMainWindow):
         
         self.executable_path = None
         self.executable_name = None
+        self.bin_dir = os.path.join(os.getcwd(), "bin")
         
-        # This new method is called on startup to ensure dependencies are met.
+        self.output_buffer = ""
+        self.last_line_was_overwrite = False
+        
         if not self.check_and_setup_dependencies():
-            # If setup fails or is cancelled, we close the app.
-            # Using QTimer to allow the constructor to finish before closing.
             QTimer.singleShot(0, self.close)
             return
 
@@ -100,99 +348,52 @@ class WhisperGUI(QMainWindow):
         self.load_settings()
 
     def check_and_setup_dependencies(self):
-        """
-        Checks for faster-whisper-xxl and ffmpeg, and downloads them if missing.
-        Returns True on success, False on failure/cancellation.
-        """
         if sys.platform == "win32":
             self.executable_name = "faster-whisper-xxl.exe"
             url = "https://github.com/Purfview/whisper-standalone-win/releases/download/Faster-Whisper-XXL/Faster-Whisper-XXL_r245.4_windows.7z"
-            files_to_extract = [self.executable_name, "ffmpeg.exe"]
-        elif sys.platform == "linux" or sys.platform == "darwin":
+            self.files_to_check = [self.executable_name, "ffmpeg.exe"]
+        elif sys.platform in ["linux", "darwin"]:
             self.executable_name = "faster-whisper-xxl"
             url = "https://github.com/Purfview/whisper-standalone-win/releases/download/Faster-Whisper-XXL/Faster-Whisper-XXL_r245.4_linux.7z"
-            files_to_extract = [self.executable_name, "ffmpeg"]
+            self.files_to_check = [self.executable_name, "ffmpeg"]
         else:
-            QMessageBox.critical(self, "Unsupported OS", f"Your operating system '{sys.platform}' is not supported for automatic download.")
+            QMessageBox.critical(self, "Unsupported OS", f"Your OS '{sys.platform}' is not supported.")
             return False
 
-        # 1. Check if executable exists in the current directory
-        if os.path.exists(self.executable_name):
-            self.executable_path = os.path.abspath(self.executable_name)
-            print(f"Found local executable: {self.executable_path}")
+        local_executable_path = os.path.join(self.bin_dir, self.executable_name)
+        all_files_in_bin = all(os.path.exists(os.path.join(self.bin_dir, f)) for f in self.files_to_check)
+
+        if all_files_in_bin:
+            self.executable_path = os.path.abspath(local_executable_path)
+            logging.info(f"Found all required files in: {self.bin_dir}")
             return True
 
-        # 2. Check if executable exists in system PATH
         path_in_system = shutil.which(self.executable_name)
         if path_in_system:
-            self.executable_path = path_in_system
-            print(f"Found executable in PATH: {self.executable_path}")
-            return True
+            logging.info(f"Found executable in system PATH: {path_in_system}, but will prefer local 'bin' setup.")
 
-        # 3. If not found, prompt the user to download
-        msg_box = QMessageBox(self)
-        msg_box.setIcon(QMessageBox.Icon.Information)
-        msg_box.setText("Required files not found.")
-        msg_box.setInformativeText(f"The core executable '{self.executable_name}' was not found.\n\n"
-                                   "Would you like to download and extract it automatically? (Approx. 500-600 MB)\n\n"
-                                   "This is a one-time setup.")
-        msg_box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        msg_box.setDefaultButton(QMessageBox.StandardButton.Yes)
+        reply = QMessageBox.question(self, "Download Required Files?",
+                                f"The core components (e.g., '{self.executable_name}') were not found in the 'bin' directory.\n\n"
+                                "Would you like to download and set them up automatically? (Approx. 1.4 GB)\n\n"
+                                "This is a one-time setup.",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                QMessageBox.StandardButton.Yes)
         
-        if msg_box.exec() == QMessageBox.StandardButton.No:
+        if reply == QMessageBox.StandardButton.No:
+            QMessageBox.warning(self, "Setup Incomplete", "Application cannot run without the required files.")
             return False
 
-        # 4. Perform download and extraction
-        archive_name = "whisper_essentials.7z"
-        try:
-            # --- Download with progress ---
-            response = requests.get(url, stream=True)
-            response.raise_for_status()
-            total_size = int(response.headers.get('content-length', 0))
-            
-            progress = QProgressDialog("Downloading required files...", "Cancel", 0, total_size, self)
-            progress.setWindowTitle("Setup")
-            progress.setWindowModality(Qt.WindowModality.WindowModal)
-            progress.show()
-
-            downloaded_size = 0
-            with open(archive_name, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if progress.wasCanceled():
-                        raise Exception("Download cancelled by user.")
-                    f.write(chunk)
-                    downloaded_size += len(chunk)
-                    progress.setValue(downloaded_size)
-                    QApplication.processEvents()
-
-            progress.setLabelText("Extracting files...")
-            QApplication.processEvents()
-            
-            # --- Extract ---
-            with py7zr.SevenZipFile(archive_name, mode='r') as z:
-                z.extract(targets=files_to_extract, path=".")
-            
-            progress.setValue(total_size) # Mark as complete
-            
-            # --- Cleanup and Finalize ---
-            os.remove(archive_name)
-
-            if not os.path.exists(self.executable_name):
-                 raise FileNotFoundError(f"Extraction failed. '{self.executable_name}' not found after extraction.")
-
-            self.executable_path = os.path.abspath(self.executable_name)
-
-            # Set execute permissions on Linux/macOS
-            if sys.platform != "win32":
+        self.download_manager = DownloadManager(url, self.files_to_check, self.bin_dir, self)
+        if self.download_manager.exec() == QDialog.DialogCode.Accepted:
+            self.executable_path = os.path.abspath(local_executable_path)
+            if sys.platform != "win32" and os.path.exists(self.executable_path):
                 os.chmod(self.executable_path, 0o755)
-
-            QMessageBox.information(self, "Setup Complete", "Required files have been successfully downloaded and set up.")
+            QMessageBox.information(self, "Setup Complete", f"Dependencies have been installed to the '{self.bin_dir}' folder.")
             return True
-
-        except Exception as e:
-            QMessageBox.critical(self, "Setup Failed", f"An error occurred during setup:\n\n{e}\n\nThe application will now close.")
-            if os.path.exists(archive_name):
-                os.remove(archive_name) # Clean up partial download
+        else:
+            error_message = self.download_manager.error_string or "Download or extraction was cancelled or failed."
+            detailed_error = f"Failed to set up dependencies: {error_message}\n\nCheck 'logs/debug_log.txt' for details."
+            QMessageBox.critical(self, "Setup Failed", detailed_error)
             return False
 
     def init_ui(self):
@@ -207,7 +408,6 @@ class WhisperGUI(QMainWindow):
         central_layout = QHBoxLayout(central_widget)
         central_layout.addWidget(self.main_splitter)
 
-        # --- Left Panel (Controls) ---
         left_panel = QWidget()
         left_layout = QVBoxLayout(left_panel)
         left_layout.setSpacing(10)
@@ -257,7 +457,6 @@ class WhisperGUI(QMainWindow):
         button_layout = self.create_button_layout()
         left_layout.addLayout(button_layout)
 
-        # --- Right Panel (Output) ---
         right_panel = self.create_output_console()
 
         self.main_splitter.addWidget(left_panel)
@@ -289,8 +488,9 @@ class WhisperGUI(QMainWindow):
         self.youtube_url = QLineEdit()
         self.youtube_url.setPlaceholderText("Enter YouTube URL...")
         layout.addRow("YouTube URL:", self.youtube_url)
-        self.audio_only_checkbox = QCheckBox("Audio-only")
-        self.audio_only_checkbox.setToolTip("If checked, only downloads the audio. Uncheck to download the full video.")
+        self.audio_only_checkbox = QCheckBox("Audio-only (Recommended)")
+        self.audio_only_checkbox.setObjectName("audio_only_checkbox")
+        self.audio_only_checkbox.setToolTip("If checked, only downloads the audio as MP3. Uncheck to download the full video.")
         self.audio_only_checkbox.setChecked(True)
         layout.addRow(self.audio_only_checkbox)
 
@@ -306,6 +506,8 @@ class WhisperGUI(QMainWindow):
         self.language_combo.addItems(languages)
         self.language_combo.setEditable(True)
         self.language_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        # --- THIS IS THE CORRECTED LINE ---
+        self.language_combo.completer().setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
         layout.addRow("Language:", self.language_combo)
         self.compute_combo = QComboBox()
         self.compute_combo.addItems(['default', 'auto', 'int8', 'int8_float16', 'int8_float32', 'int8_bfloat16', 'int16', 'float16', 'float32', 'bfloat16'])
@@ -323,6 +525,7 @@ class WhisperGUI(QMainWindow):
         num_rows = 4
         for i, fmt in enumerate(formats):
             checkbox = QCheckBox(fmt)
+            checkbox.setObjectName(f"format_checkbox_{fmt}")
             self.output_format_checkboxes[fmt] = checkbox
             row = i % num_rows
             col = i // num_rows
@@ -337,6 +540,9 @@ class WhisperGUI(QMainWindow):
         layout = QVBoxLayout(output_group)
         self.output_text = QTextEdit()
         self.output_text.setReadOnly(True)
+        font = QFont("Courier New" if sys.platform == "win32" else "Monospace")
+        font.setPointSize(10)
+        self.output_text.setFont(font)
         layout.addWidget(self.output_text)
         return output_group
 
@@ -369,29 +575,36 @@ class WhisperGUI(QMainWindow):
         self.temperature = QDoubleSpinBox()
         self.temperature.setRange(0.0, 1.0)
         self.temperature.setSingleStep(0.1)
+        self.temperature.setDecimals(1)
         scroll_layout.addRow("Temperature:", self.temperature)
         self.beam_size = QSpinBox()
-        self.beam_size.setRange(1, 10)
+        self.beam_size.setRange(1, 100)
         scroll_layout.addRow("Beam Size:", self.beam_size)
         self.best_of = QSpinBox()
-        self.best_of.setRange(1, 10)
+        self.best_of.setRange(1, 100)
         scroll_layout.addRow("Best Of:", self.best_of)
         self.patience = QDoubleSpinBox()
         self.patience.setRange(0.0, 10.0)
         self.patience.setSingleStep(0.1)
+        self.patience.setDecimals(1)
         scroll_layout.addRow("Patience:", self.patience)
         self.initial_prompt = QTextEdit()
         self.initial_prompt.setMaximumHeight(80)
         scroll_layout.addRow("Initial Prompt:", self.initial_prompt)
         self.word_timestamps = QCheckBox("Word Timestamps")
+        self.word_timestamps.setObjectName("word_timestamps_checkbox")
         scroll_layout.addRow(self.word_timestamps)
         self.without_timestamps = QCheckBox("Without Timestamps")
+        self.without_timestamps.setObjectName("without_timestamps_checkbox")
         scroll_layout.addRow(self.without_timestamps)
         self.verbose = QCheckBox("Verbose")
+        self.verbose.setObjectName("verbose_checkbox")
         scroll_layout.addRow(self.verbose)
         self.print_progress = QCheckBox("Print Progress")
+        self.print_progress.setObjectName("print_progress_checkbox")
         scroll_layout.addRow(self.print_progress)
         self.highlight_words = QCheckBox("Highlight Words")
+        self.highlight_words.setObjectName("highlight_words_checkbox")
         scroll_layout.addRow(self.highlight_words)
         scroll.setWidget(scroll_widget)
         scroll.setWidgetResizable(True)
@@ -401,6 +614,7 @@ class WhisperGUI(QMainWindow):
     def setup_vad_tab(self, tab):
         layout = QFormLayout(tab)
         self.vad_filter = QCheckBox("Enable VAD Filter")
+        self.vad_filter.setObjectName("vad_filter_checkbox")
         layout.addRow(self.vad_filter)
         self.vad_method = QComboBox()
         self.vad_method.addItems(['silero_v4_fw', 'silero_v5_fw', 'silero_v3', 'silero_v4', 'silero_v5', 'pyannote_v3', 'pyannote_onnx_v3', 'auditok', 'webrtc'])
@@ -408,6 +622,7 @@ class WhisperGUI(QMainWindow):
         self.vad_threshold = QDoubleSpinBox()
         self.vad_threshold.setRange(0.0, 1.0)
         self.vad_threshold.setSingleStep(0.01)
+        self.vad_threshold.setDecimals(2)
         layout.addRow("VAD Threshold:", self.vad_threshold)
         self.vad_min_speech = QSpinBox()
         self.vad_min_speech.setRange(0, 10000)
@@ -417,16 +632,21 @@ class WhisperGUI(QMainWindow):
     def setup_audio_tab(self, tab):
         layout = QFormLayout(tab)
         self.ff_mp3 = QCheckBox("Convert to MP3")
+        self.ff_mp3.setObjectName("ff_mp3_checkbox")
         layout.addRow(self.ff_mp3)
         self.ff_loudnorm = QCheckBox("Loudness Normalization")
+        self.ff_loudnorm.setObjectName("ff_loudnorm_checkbox")
         layout.addRow(self.ff_loudnorm)
         self.ff_speechnorm = QCheckBox("Speech Normalization")
+        self.ff_speechnorm.setObjectName("ff_speechnorm_checkbox")
         layout.addRow(self.ff_speechnorm)
         self.ff_tempo = QDoubleSpinBox()
         self.ff_tempo.setRange(0.5, 2.0)
         self.ff_tempo.setSingleStep(0.1)
+        self.ff_tempo.setDecimals(1)
         self.ff_tempo.setEnabled(False)
         self.tempo_checkbox = QCheckBox("Adjust Tempo")
+        self.tempo_checkbox.setObjectName("tempo_checkbox")
         self.tempo_checkbox.toggled.connect(self.ff_tempo.setEnabled)
         tempo_layout = QHBoxLayout()
         tempo_layout.addWidget(self.tempo_checkbox)
@@ -434,14 +654,20 @@ class WhisperGUI(QMainWindow):
         layout.addRow("Tempo:", tempo_layout)
 
     def apply_theme(self, theme_name):
-        theme = theme_name.lower()
-        self.settings["theme"] = theme
-        qss_file = resource_path(f"{theme}_theme.qss")
-        try:
-            with open(qss_file, "r") as f:
+        self.settings["theme"] = theme_name.lower()
+        qss_path = ""
+        if theme_name.lower() == "dark":
+            qss_path = resource_path("dark_theme.qss")
+        elif theme_name.lower() == "amoled":
+            qss_path = resource_path("amoled_theme.qss")
+        
+        if qss_path and os.path.exists(qss_path):
+            with open(qss_path, "r") as f:
                 self.setStyleSheet(f.read())
-        except FileNotFoundError:
-            print(f"Theme file '{qss_file}' not found. Using default theme.")
+        else:
+            self.setStyleSheet("") 
+            if qss_path: 
+                logging.warning(f"Theme file not found: {qss_path}")
 
     def browse_file(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select Audio/Video File", "", "Audio/Video Files (*.mp3 *.wav *.m4a *.mp4 *.avi *.mov *.mkv);;All Files (*.*)")
@@ -461,19 +687,18 @@ class WhisperGUI(QMainWindow):
         return dir_path
 
     def build_command(self, input_file):
+        if not self.executable_path or not os.path.exists(self.executable_path):
+             QMessageBox.critical(self, "Error", f"Core executable not found at: {self.executable_path}. Please restart the application to run the setup.")
+             return None
         if not input_file or not os.path.exists(input_file):
             QMessageBox.warning(self, "Warning", f"Input file not found: {input_file}")
             return None
         
-        # Use the executable path determined at startup
         cmd = [self.executable_path, input_file]
-        
         options = {
-            "-m": self.model_combo.currentText(),
-            "--task": self.task_combo.currentText(),
+            "-m": self.model_combo.currentText(), "--task": self.task_combo.currentText(),
             "-l": self.language_combo.currentText() if self.language_combo.currentText() != 'auto' else None,
-            "--compute_type": self.compute_combo.currentText(),
-            "--device": self.device_combo.currentText(),
+            "--compute_type": self.compute_combo.currentText(), "--device": self.device_combo.currentText(),
             "--temperature": str(self.temperature.value()) if self.temperature.value() > 0 else None,
             "--beam_size": str(self.beam_size.value()) if self.beam_size.value() != 5 else None,
             "--best_of": str(self.best_of.value()) if self.best_of.value() != 5 else None,
@@ -488,6 +713,7 @@ class WhisperGUI(QMainWindow):
         for option, value in options.items():
             if value is not None:
                 cmd.extend([option, value])
+        
         checkboxes = {
             "--word_timestamps": self.word_timestamps, "--without_timestamps": self.without_timestamps,
             "--verbose": self.verbose, "--print_progress": self.print_progress, "--highlight_words": self.highlight_words,
@@ -497,15 +723,22 @@ class WhisperGUI(QMainWindow):
         for option, checkbox in checkboxes.items():
             if checkbox.isChecked():
                 cmd.append(option)
+        
         selected_formats = [fmt for fmt, cb in self.output_format_checkboxes.items() if fmt != 'all' and cb.isChecked()]
-        if self.output_format_checkboxes['all'].isChecked():
+        if not selected_formats and not self.output_format_checkboxes['all'].isChecked():
+            selected_formats = ['srt']
+        elif self.output_format_checkboxes['all'].isChecked():
             selected_formats = ['all']
+
         if selected_formats:
             cmd.extend(["--output_format"] + selected_formats)
         return cmd
 
     def start_processing(self):
         self.stop_requested = False
+        self.output_buffer = ""
+        self.last_line_was_overwrite = False
+
         active_tab = self.tabs.currentWidget()
         if active_tab == self.file_tab:
             self.run_transcription(self.file_path.text())
@@ -521,18 +754,19 @@ class WhisperGUI(QMainWindow):
         if not command: return
         
         self.output_text.clear()
+        
         quoted_command_parts = []
         for arg in command:
             if ' ' in arg or '"' in arg or "'" in arg:
-                processed_arg = arg.replace('"', '\"').replace("'", "\'")
+                processed_arg = arg.replace('"', '\\"')
                 quoted_command_parts.append(f'"{processed_arg}"')
             else:
                 quoted_command_parts.append(arg)
         display_command = ' '.join(quoted_command_parts)
         
-        self.output_text.append(f"<b>Running command:</b> {display_command}\n")
-        self.output_text.append("-" * 80 + "\n")
-        
+        logging.info(f"Starting QProcess with command: {command}")
+        self._append_text_to_console(f"<b>Running command:</b><br><pre>{display_command}</pre><hr>", is_html=True)
+
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         
@@ -540,49 +774,110 @@ class WhisperGUI(QMainWindow):
         self.process.readyReadStandardOutput.connect(self.handle_stdout)
         self.process.readyReadStandardError.connect(self.handle_stderr)
         self.process.finished.connect(self.on_finished)
+        
+        self.process.errorOccurred.connect(self.on_process_error)
+
         self.process.start(command[0], command[1:])
 
     def stop_processing(self):
         self.stop_requested = True
         if self.downloader and self.downloader.isRunning():
+            self._append_text_to_console("\n<b style='color:#ff6b6b;'>Requesting download cancellation...</b>\n", is_html=True)
             self.downloader.stop()
-            self.append_error("\nDownload cancelled by user.")
-            self.run_btn.setEnabled(True)
-            self.stop_btn.setEnabled(False)
         if self.process and self.process.state() == QProcess.ProcessState.Running:
+            self._append_text_to_console("\n<b style='color:#ff6b6b;'>Terminating process...</b>\n", is_html=True)
             self.process.terminate()
+            if not self.process.waitForFinished(2000):
+                self._append_text_to_console("<b style='color:#ff6b6b;'>Process did not terminate gracefully, killing it.</b>\n", is_html=True)
+                self.process.kill()
+
 
     def handle_stdout(self):
-        data = self.process.readAllStandardOutput().data().decode(errors='ignore')
-        self.append_output(data)
+        data = self.process.readAllStandardOutput().data().decode('utf-8', errors='ignore')
+        self._append_text_to_console(data)
 
     def handle_stderr(self):
-        data = self.process.readAllStandardError().data().decode(errors='ignore')
-        self.append_error(data)
+        data = self.process.readAllStandardError().data().decode('utf-8', errors='ignore')
+        self._append_text_to_console(data)
 
-    def append_output(self, text):
-        if not text: return
-        self.output_text.moveCursor(QTextCursor.MoveOperation.End)
-        self.output_text.insertPlainText(text)
-        self.output_text.verticalScrollBar().setValue(self.output_text.verticalScrollBar().maximum())
+    def _append_text_to_console(self, text_chunk, is_html=False):
+        cursor = self.output_text.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
 
-    def append_error(self, text):
-        if not text: return
-        self.output_text.moveCursor(QTextCursor.MoveOperation.End)
-        self.output_text.insertHtml(f"<span style='color: #ff6b6b;'>{text.replace('\n', '<br>')}</span>")
-        self.output_text.verticalScrollBar().setValue(self.output_text.verticalScrollBar().maximum())
+        if is_html:
+            cursor.insertHtml(text_chunk)
+            self.last_line_was_overwrite = False 
+            self.output_text.ensureCursorVisible()
+            return
+
+        self.output_buffer += text_chunk.replace('\r\n', '\n')
+
+        while '\n' in self.output_buffer or '\r' in self.output_buffer:
+            r_pos = self.output_buffer.find('\r')
+            n_pos = self.output_buffer.find('\n')
+            
+            if r_pos != -1 and (r_pos < n_pos or n_pos == -1):
+                break_pos = r_pos
+                line_ending = '\r'
+            else:
+                break_pos = n_pos
+                line_ending = '\n'
+            
+            line = self.output_buffer[:break_pos]
+            self.output_buffer = self.output_buffer[break_pos + 1:]
+
+            if self.last_line_was_overwrite:
+                cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+                cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
+                cursor.removeSelectedText()
+                cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock)
+
+            cursor.insertText(line)
+
+            if line_ending == '\n':
+                self.last_line_was_overwrite = False
+            else: # line_ending == '\r'
+                self.last_line_was_overwrite = True
+        
+        self.output_text.ensureCursorVisible()
 
     def on_finished(self, exit_code, exit_status):
+        logging.info(f"QProcess finished. Exit Code: {exit_code}, Exit Status: {exit_status}")
+        
+        if self.output_buffer:
+            self._append_text_to_console(self.output_buffer + '\n')
+            self.output_buffer = ""
+        
+        if self.last_line_was_overwrite:
+            self.output_text.append("")
+        
+        self.output_text.insertHtml("<hr>")
         if self.stop_requested:
-            self.append_error("\nProcess stopped by user.")
+            self._append_text_to_console("<b>Process stopped by user.</b>", is_html=True)
+        elif exit_code == 0:
+            self._append_text_to_console("<b>Process completed successfully.</b>", is_html=True)
         else:
-            self.output_text.append("\n<b>Process completed.</b>")
+            status_str = "Crashed" if exit_status == QProcess.ExitStatus.CrashExit else "Failed"
+            self._append_text_to_console(f"<b style='color: red;'>Process {status_str} with exit code {exit_code}.</b>", is_html=True)
         
         self.run_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.process = None
         self.downloader = None
         self.stop_requested = False
+        
+    def on_process_error(self, error):
+        error_map = {
+            QProcess.ProcessError.FailedToStart: "Failed to start: The process failed to start. Check if the executable exists, has the correct permissions, and if all required libraries are available.",
+            QProcess.ProcessError.Crashed: "Crashed: The process crashed some time after starting.",
+            QProcess.ProcessError.Timedout: "Timed out: The last waitFor...() function timed out.",
+            QProcess.ProcessError.ReadError: "Read Error: An error occurred when attempting to read from the process.",
+            QProcess.ProcessError.WriteError: "Write Error: An error occurred when attempting to write to the process.",
+            QProcess.ProcessError.UnknownError: "Unknown Error: An unknown error occurred."
+        }
+        error_message = error_map.get(error, "An unspecified error occurred.")
+        logging.error(f"QProcess ErrorOccurred: {error_message}")
+        self._append_text_to_console(f"<hr><b style='color: red;'>PROCESS STARTUP ERROR:</b><br>{error_message}<hr>", is_html=True)
 
     def download_and_transcribe(self):
         url = self.youtube_url.text()
@@ -596,37 +891,47 @@ class WhisperGUI(QMainWindow):
         self.downloader = YouTubeDownloader(url, output_path, audio_only)
         self.downloader.finished.connect(self.on_download_finished)
         self.downloader.error.connect(self.on_download_error)
-        self.downloader.progress.connect(self.append_output)
+        self.downloader.progress.connect(lambda text: self._append_text_to_console(text + "\n"))
         
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         
         self.output_text.clear()
-        self.output_text.append(f"<b>Starting download from:</b> {url}")
+        self._append_text_to_console(f"<b>Starting download from:</b> {url}\n<hr>", is_html=True)
         self.downloader.start()
 
     def on_download_finished(self, file_path):
-        self.output_text.append(f"<b>Download finished:</b> {file_path}")
+        if self.stop_requested:
+            self.on_finished(0, QProcess.ExitStatus.NormalExit) 
+            return
+
+        self._append_text_to_console(f"<b>Download finished, output file:</b><br>{file_path}\n<hr>", is_html=True)
         self.run_transcription(input_file=file_path)
 
     def on_download_error(self, error_message):
-        if "Download cancelled by user" not in error_message:
-            self.append_error(f"YouTube Download Error: {error_message}")
+        if "cancelled by user" in error_message and self.stop_requested:
+            self.on_finished(0, QProcess.ExitStatus.NormalExit)
+            return
+
+        self._append_text_to_console(f"<b style='color: red;'>YouTube Download Error:</b><br>{error_message}\n", is_html=True)
         self.run_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.downloader = None
 
     def closeEvent(self, event):
-        # Prevent saving settings if UI was never initialized (e.g., setup was cancelled)
+        if self.process and self.process.state() == QProcess.ProcessState.Running:
+            self.stop_processing()
+            self.process.waitForFinished(1000)
+
         if hasattr(self, 'main_splitter'):
             self.save_settings()
+        
         super().closeEvent(event)
 
     def save_settings(self):
         self.settings["geometry"] = self.saveGeometry().data().hex()
         self.settings["splitter_sizes"] = self.main_splitter.sizes()
         self.settings["output_dir"] = self.output_dir.text()
-        self.settings["audio_only"] = self.audio_only_checkbox.isChecked()
         self.settings["model"] = self.model_combo.currentText()
         self.settings["task"] = self.task_combo.currentText()
         self.settings["language"] = self.language_combo.currentText()
@@ -637,41 +942,42 @@ class WhisperGUI(QMainWindow):
         self.settings["best_of"] = self.best_of.value()
         self.settings["patience"] = self.patience.value()
         self.settings["initial_prompt"] = self.initial_prompt.toPlainText()
-        checkbox_settings = {
-            "word_timestamps": self.word_timestamps.isChecked(), "without_timestamps": self.without_timestamps.isChecked(),
-            "verbose": self.verbose.isChecked(), "print_progress": self.print_progress.isChecked(),
-            "highlight_words": self.highlight_words.isChecked(), "vad_filter": self.vad_filter.isChecked(),
-            "ff_mp3": self.ff_mp3.isChecked(), "ff_loudnorm": self.ff_loudnorm.isChecked(),
-            "ff_speechnorm": self.ff_speechnorm.isChecked(), "tempo_checkbox": self.tempo_checkbox.isChecked(),
-        }
+        
+        checkbox_settings = {cb.objectName(): cb.isChecked() for cb in self.findChildren(QCheckBox) if cb.objectName()}
         self.settings["checkboxes"] = checkbox_settings
-        self.settings["output_formats"] = [fmt for fmt, cb in self.output_format_checkboxes.items() if cb.isChecked()]
-        with open(self.settings_file, "w") as f:
-            json.dump(self.settings, f, indent=4)
+
+        output_formats = [fmt for fmt, cb in self.output_format_checkboxes.items() if cb.isChecked()]
+        self.settings["output_formats"] = output_formats
+        
+        try:
+            with open(self.settings_file, "w") as f:
+                json.dump(self.settings, f, indent=4)
+        except Exception as e:
+            logging.error(f"Failed to save settings: {e}")
 
     def load_settings(self):
         try:
-            with open(self.settings_file, "r") as f:
-                self.settings = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
+            if os.path.exists(self.settings_file):
+                with open(self.settings_file, "r") as f:
+                    self.settings = json.load(f)
+            else:
+                self.settings = {}
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logging.warning(f"Could not load settings file: {e}. Using defaults.")
             self.settings = {}
 
         theme = self.settings.get("theme", "dark")
         self.theme_combo.blockSignals(True)
-        self.theme_combo.setCurrentText(theme.upper() if theme == "amoled" else theme.capitalize())
+        self.theme_combo.setCurrentText(theme.capitalize())
         self.theme_combo.blockSignals(False)
         self.apply_theme(theme)
 
-        geometry = self.settings.get("geometry")
-        if geometry:
-            self.restoreGeometry(QByteArray.fromHex(bytes(geometry, 'utf-8')))
-        
-        splitter_sizes = self.settings.get("splitter_sizes")
-        if splitter_sizes:
+        if geometry_hex := self.settings.get("geometry"):
+            self.restoreGeometry(QByteArray.fromHex(bytes(geometry_hex, 'utf-8')))
+        if splitter_sizes := self.settings.get("splitter_sizes"):
             self.main_splitter.setSizes(splitter_sizes)
 
         self.output_dir.setText(self.settings.get("output_dir", ""))
-        self.audio_only_checkbox.setChecked(self.settings.get("audio_only", True))
         self.model_combo.setCurrentText(self.settings.get("model", "large-v3"))
         self.task_combo.setCurrentText(self.settings.get("task", "transcribe"))
         self.language_combo.setCurrentText(self.settings.get("language", "auto"))
@@ -682,34 +988,32 @@ class WhisperGUI(QMainWindow):
         self.best_of.setValue(self.settings.get("best_of", 5))
         self.patience.setValue(self.settings.get("patience", 1.0))
         self.initial_prompt.setPlainText(self.settings.get("initial_prompt", ""))
-        
+
+        all_checkboxes = {cb.objectName(): cb for cb in self.findChildren(QCheckBox) if cb.objectName()}
         checkbox_settings = self.settings.get("checkboxes", {})
-        self.word_timestamps.setChecked(checkbox_settings.get("word_timestamps", False))
-        self.without_timestamps.setChecked(checkbox_settings.get("without_timestamps", False))
-        self.verbose.setChecked(checkbox_settings.get("verbose", False))
-        self.print_progress.setChecked(checkbox_settings.get("print_progress", False))
-        self.highlight_words.setChecked(checkbox_settings.get("highlight_words", False))
-        self.vad_filter.setChecked(checkbox_settings.get("vad_filter", False))
-        self.ff_mp3.setChecked(checkbox_settings.get("ff_mp3", False))
-        self.ff_loudnorm.setChecked(checkbox_settings.get("ff_loudnorm", False))
-        self.ff_speechnorm.setChecked(checkbox_settings.get("ff_speechnorm", False))
-        self.tempo_checkbox.setChecked(checkbox_settings.get("tempo_checkbox", False))
+        for name, checked in checkbox_settings.items():
+            if name in all_checkboxes:
+                all_checkboxes[name].setChecked(checked)
         
-        output_formats = self.settings.get("output_formats", [])
+        output_formats = self.settings.get("output_formats", ["srt"])
         for fmt, cb in self.output_format_checkboxes.items():
             cb.setChecked(fmt in output_formats)
 
 def main():
+    if hasattr(Qt.ApplicationAttribute, 'AA_EnableHighDpiScaling'):
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling, True)
+    if hasattr(Qt.ApplicationAttribute, 'AA_UseHighDpiPixmaps'):
+        QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps, True)
+    
     app = QApplication(sys.argv)
-    # The application window is only created if the dependency check succeeds
+    
     window = WhisperGUI()
-    # If the setup was cancelled, window.executable_path would be None and the
-    # QTimer would have scheduled a close(). We only show if it's a valid window.
+    
     if window.executable_path:
         window.show()
         sys.exit(app.exec())
     else:
-        # Exit gracefully if setup was cancelled
+        logging.info("Exiting application because dependencies are not met.")
         sys.exit(0)
 
 
