@@ -7,6 +7,7 @@ import requests
 import threading
 import logging
 import subprocess
+import tempfile
 from pathlib import Path
 from PyQt6.QtWidgets import (QProgressBar, QGridLayout, QDialog, QSplitter, QWidget, 
                              QHBoxLayout, QVBoxLayout, QLabel, QComboBox, QTabWidget, 
@@ -37,12 +38,14 @@ def resource_path(relative_path):
     try:
         # PyInstaller creates a temp folder and stores path in _MEIPASS
         base_path = sys._MEIPASS
-    except Exception:
+        # In PyInstaller, resources are in a 'resources' subdirectory
+        return os.path.join(base_path, "resources", relative_path)
+    except AttributeError:
         # Fallback for normal execution
-        base_path = os.path.abspath(".")
-    
-    # In this new structure, resources are in a 'resources' subdirectory
-    return os.path.join(base_path, "resources", relative_path)
+        # When running from src/, resources are in the parent directory
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        base_path = os.path.dirname(script_dir)  # Go up one level from src/
+        return os.path.join(base_path, "resources", relative_path)
 
 
 class YouTubeDownloader(QThread):
@@ -155,7 +158,7 @@ class DownloadManager(QDialog):
 
     def start_download(self):
         self.details_label.setText("Starting download...")
-        self.worker_thread = threading.Thread(target=self.download_worker)
+        self.worker_thread = threading.Thread(target=self.download_worker, daemon=True)
         self.worker_thread.start()
 
     def download_worker(self):
@@ -190,11 +193,12 @@ class DownloadManager(QDialog):
         self.status_label.setText("Extracting files...")
         self.progress_bar.setValue(0)
         self.details_label.setText("Preparing to extract...")
-        self.worker_thread = threading.Thread(target=self.extraction_worker)
+        self.worker_thread = threading.Thread(target=self.extraction_worker, daemon=True)
         self.worker_thread.start()
 
     def extraction_worker(self):
-        extract_dir = "temp_extract"
+        # Use secure temporary directory instead of hardcoded name
+        extract_dir = tempfile.mkdtemp(prefix="whisper_extract_")
         try:
             logging.info("--- Starting Extraction ---")
             if os.path.exists(extract_dir):
@@ -335,10 +339,13 @@ class WhisperGUI(QMainWindow):
         
         self.executable_path = None
         self.executable_name = None
-        self.bin_dir = os.path.join(os.getcwd(), "bin")
+        # Use script directory instead of current working directory
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        self.bin_dir = os.path.join(script_dir, "bin")
         
         self.output_buffer = ""
         self.last_line_was_overwrite = False
+        self.transcription_completed_successfully = False
         
         if not self.check_and_setup_dependencies():
             QTimer.singleShot(0, self.close)
@@ -347,6 +354,9 @@ class WhisperGUI(QMainWindow):
         self.init_ui()
         self.load_settings()
         self.setup_realtime_saving()
+        
+        # Check yt-dlp version after UI is ready
+        QTimer.singleShot(1000, self.check_yt_dlp_version)
 
     def check_and_setup_dependencies(self):
         if sys.platform == "win32":
@@ -509,8 +519,9 @@ class WhisperGUI(QMainWindow):
         self.language_combo.addItems(languages)
         self.language_combo.setEditable(True)
         self.language_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        # --- THIS IS THE CORRECTED LINE ---
-        self.language_combo.completer().setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        # Safe completer access with null check
+        if completer := self.language_combo.completer():
+            completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
         layout.addRow("Language:", self.language_combo)
         self.compute_combo = QComboBox()
         self.compute_combo.addItems(['default', 'auto', 'int8', 'int8_float16', 'int8_float32', 'int8_bfloat16', 'int16', 'float16', 'float32', 'bfloat16'])
@@ -677,6 +688,20 @@ class WhisperGUI(QMainWindow):
         # Save theme change immediately
         self.save_settings_to_file()
 
+    def check_for_transcription_success(self, text):
+        """Check if the output indicates successful transcription completion"""
+        success_indicators = [
+            "Operation finished in:",
+            "Subtitles are written to",
+            "Transcription speed:",
+            "audio seconds/s"
+        ]
+        
+        for indicator in success_indicators:
+            if indicator in text:
+                self.transcription_completed_successfully = True
+                break
+
     def get_system_theme(self):
         """Detect system theme preference"""
         try:
@@ -691,6 +716,90 @@ class WhisperGUI(QMainWindow):
         except Exception as e:
             logging.warning(f"Could not detect system theme: {e}")
             return "dark"  # Default fallback
+
+    def check_yt_dlp_version(self):
+        """Check if yt-dlp needs updating and prompt user"""
+        try:
+            import yt_dlp
+            
+            # Get current version
+            current_version = yt_dlp.version.__version__
+            logging.info(f"Current yt-dlp version: {current_version}")
+            
+            # Check for latest version (with timeout to avoid blocking)
+            try:
+                response = requests.get("https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest", timeout=5)
+                if response.status_code == 200:
+                    latest_data = response.json()
+                    latest_version = latest_data["tag_name"]
+                    
+                    if current_version != latest_version:
+                        reply = QMessageBox.question(
+                            self, "yt-dlp Update Available",
+                            f"Your yt-dlp version ({current_version}) is outdated.\n"
+                            f"Latest version is {latest_version}.\n\n"
+                            "Would you like to update it now?\n"
+                            "(This may fix 403 unauthorized errors for video downloads)",
+                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                            QMessageBox.StandardButton.Yes
+                        )
+                        
+                        if reply == QMessageBox.StandardButton.Yes:
+                            self.update_yt_dlp()
+                    else:
+                        logging.info("yt-dlp is up to date")
+                else:
+                    logging.warning("Could not check for yt-dlp updates")
+            except requests.RequestException as e:
+                logging.warning(f"Failed to check yt-dlp version: {e}")
+                
+        except ImportError:
+            logging.error("yt-dlp not found")
+        except Exception as e:
+            logging.error(f"Error checking yt-dlp version: {e}")
+
+    def update_yt_dlp(self):
+        """Update yt-dlp using pip"""
+        try:
+            # Show progress dialog
+            progress = QMessageBox(self)
+            progress.setWindowTitle("Updating yt-dlp")
+            progress.setText("Updating yt-dlp, please wait...")
+            progress.setStandardButtons(QMessageBox.StandardButton.NoButton)
+            progress.show()
+            
+            # Process events to show the dialog
+            from PyQt6.QtCore import QCoreApplication
+            QCoreApplication.processEvents()
+            
+            # Update yt-dlp
+            result = subprocess.run([
+                sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"
+            ], capture_output=True, text=True, timeout=60)
+            
+            progress.close()
+            
+            if result.returncode == 0:
+                QMessageBox.information(
+                    self, "Update Successful", 
+                    "yt-dlp has been updated successfully!\n"
+                    "The new version will be used for future downloads."
+                )
+                logging.info("yt-dlp updated successfully")
+            else:
+                QMessageBox.warning(
+                    self, "Update Failed",
+                    f"Failed to update yt-dlp:\n{result.stderr or result.stdout}"
+                )
+                logging.error(f"yt-dlp update failed: {result.stderr}")
+                
+        except subprocess.TimeoutExpired:
+            progress.close()
+            QMessageBox.warning(self, "Update Timeout", "yt-dlp update timed out. Please try again later.")
+        except Exception as e:
+            progress.close()
+            QMessageBox.critical(self, "Update Error", f"An error occurred while updating yt-dlp:\n{str(e)}")
+            logging.error(f"yt-dlp update error: {e}")
 
     def setup_realtime_saving(self):
         """Connect UI elements to save settings in real-time"""
@@ -790,8 +899,13 @@ class WhisperGUI(QMainWindow):
 
     def build_command(self, input_file):
         if not self.executable_path or not os.path.exists(self.executable_path):
-             QMessageBox.critical(self, "Error", f"Core executable not found at: {self.executable_path}. Please restart the application to run the setup.")
-             return None
+            QMessageBox.critical(self, "Error", f"Core executable not found at: {self.executable_path}. Please restart the application to run the setup.")
+            return None
+        
+        # Check if executable has proper permissions
+        if not os.access(self.executable_path, os.X_OK):
+            QMessageBox.critical(self, "Error", f"Executable at {self.executable_path} does not have execute permissions.")
+            return None
         if not input_file or not os.path.exists(input_file):
             QMessageBox.warning(self, "Warning", f"Input file not found: {input_file}")
             return None
@@ -840,6 +954,7 @@ class WhisperGUI(QMainWindow):
         self.stop_requested = False
         self.output_buffer = ""
         self.last_line_was_overwrite = False
+        self.transcription_completed_successfully = False
 
         active_tab = self.tabs.currentWidget()
         if active_tab == self.file_tab:
@@ -896,10 +1011,12 @@ class WhisperGUI(QMainWindow):
 
     def handle_stdout(self):
         data = self.process.readAllStandardOutput().data().decode('utf-8', errors='ignore')
+        self.check_for_transcription_success(data)
         self._append_text_to_console(data)
 
     def handle_stderr(self):
         data = self.process.readAllStandardError().data().decode('utf-8', errors='ignore')
+        self.check_for_transcription_success(data)
         self._append_text_to_console(data)
 
     def _append_text_to_console(self, text_chunk, is_html=False):
@@ -957,7 +1074,8 @@ class WhisperGUI(QMainWindow):
         self._append_text_to_console("="*50 + "\n")
         if self.stop_requested:
             self._append_text_to_console("Process stopped by user.\n")
-        elif exit_code == 0:
+        elif exit_code == 0 or self.transcription_completed_successfully:
+            # Consider it successful if exit code is 0 OR we detected success indicators
             self._append_text_to_console("Process completed successfully.\n")
         else:
             status_str = "Crashed" if exit_status == QProcess.ExitStatus.CrashExit else "Failed"
@@ -970,6 +1088,11 @@ class WhisperGUI(QMainWindow):
         self.stop_requested = False
         
     def on_process_error(self, error):
+        # Don't show crash errors if we already detected successful transcription
+        if error == QProcess.ProcessError.Crashed and self.transcription_completed_successfully:
+            logging.info("Process crashed after successful transcription completion - ignoring crash error")
+            return
+            
         error_map = {
             QProcess.ProcessError.FailedToStart: "Failed to start: The process failed to start. Check if the executable exists, has the correct permissions, and if all required libraries are available.",
             QProcess.ProcessError.Crashed: "Crashed: The process crashed some time after starting.",
@@ -980,7 +1103,7 @@ class WhisperGUI(QMainWindow):
         }
         error_message = error_map.get(error, "An unspecified error occurred.")
         logging.error(f"QProcess ErrorOccurred: {error_message}")
-        self._append_text_to_console(f"{'='*50}\nPROCESS STARTUP ERROR:\n{error_message}\n{'='*50}\n")
+        self._append_text_to_console(f"{'='*50}\nPROCESS ERROR:\n{error_message}\n{'='*50}\n")
 
     def download_and_transcribe(self):
         url = self.youtube_url.text()
@@ -1041,12 +1164,27 @@ class WhisperGUI(QMainWindow):
         super().closeEvent(event)
 
     def save_settings_to_file(self):
-        """Save current settings dictionary to file"""
+        """Save current settings dictionary to file atomically"""
         try:
-            with open(self.settings_file, "w") as f:
+            # Write to temporary file first for atomic operation
+            temp_file = self.settings_file + ".tmp"
+            with open(temp_file, "w") as f:
                 json.dump(self.settings, f, indent=4)
+            
+            # Atomic rename operation
+            if os.path.exists(temp_file):
+                if os.path.exists(self.settings_file):
+                    os.remove(self.settings_file)
+                os.rename(temp_file, self.settings_file)
         except Exception as e:
             logging.error(f"Failed to save settings: {e}")
+            # Clean up temp file if it exists
+            temp_file = self.settings_file + ".tmp"
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
 
     def save_settings(self):
         """Collect all current settings and save to file"""
@@ -1109,7 +1247,14 @@ class WhisperGUI(QMainWindow):
         self.apply_theme(theme)
 
         if geometry_hex := self.settings.get("geometry"):
-            self.restoreGeometry(QByteArray.fromHex(bytes(geometry_hex, 'utf-8')))
+            try:
+                # Validate hex string before using it
+                if isinstance(geometry_hex, str) and all(c in '0123456789abcdefABCDEF' for c in geometry_hex):
+                    self.restoreGeometry(QByteArray.fromHex(bytes(geometry_hex, 'utf-8')))
+                else:
+                    logging.warning("Invalid geometry data in settings")
+            except Exception as e:
+                logging.warning(f"Failed to restore window geometry: {e}")
         if splitter_sizes := self.settings.get("splitter_sizes"):
             self.main_splitter.setSizes(splitter_sizes)
 
