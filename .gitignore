@@ -1,5 +1,7 @@
 output/
 build/
 dist/
+logs/
+__pycache__
 faster-whisper-xxl-gui.spec
 settings.json

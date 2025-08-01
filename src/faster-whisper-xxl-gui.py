@@ -346,6 +346,7 @@ class WhisperGUI(QMainWindow):
 
         self.init_ui()
         self.load_settings()
+        self.setup_realtime_saving()
 
     def check_and_setup_dependencies(self):
         if sys.platform == "win32":
@@ -370,10 +371,12 @@ class WhisperGUI(QMainWindow):
 
         path_in_system = shutil.which(self.executable_name)
         if path_in_system:
-            logging.info(f"Found executable in system PATH: {path_in_system}, but will prefer local 'bin' setup.")
+            self.executable_path = path_in_system
+            logging.info(f"Found executable in system PATH: {path_in_system}")
+            return True
 
         reply = QMessageBox.question(self, "Download Required Files?",
-                                f"The core components (e.g., '{self.executable_name}') were not found in the 'bin' directory.\n\n"
+                                f"The core components (e.g., '{self.executable_name}') were not found in the 'bin' directory or system PATH.\n\n"
                                 "Would you like to download and set them up automatically? (Approx. 1.4 GB)\n\n"
                                 "This is a one-time setup.",
                                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -521,7 +524,7 @@ class WhisperGUI(QMainWindow):
         grid_layout = QGridLayout()
         grid_layout.setHorizontalSpacing(40)
         grid_layout.setVerticalSpacing(10)
-        formats = ['json', 'vtt', 'srt', 'lrc', 'txt', 'text', 'tsv', 'all']
+        formats = ['json', 'vtt', 'srt', 'lrc', 'txt', 'tsv', 'all']
         num_rows = 4
         for i, fmt in enumerate(formats):
             checkbox = QCheckBox(fmt)
@@ -656,7 +659,9 @@ class WhisperGUI(QMainWindow):
     def apply_theme(self, theme_name):
         self.settings["theme"] = theme_name.lower()
         qss_path = ""
-        if theme_name.lower() == "dark":
+        if theme_name.lower() == "light":
+            qss_path = resource_path("light_theme.qss")
+        elif theme_name.lower() == "dark":
             qss_path = resource_path("dark_theme.qss")
         elif theme_name.lower() == "amoled":
             qss_path = resource_path("amoled_theme.qss")
@@ -668,6 +673,103 @@ class WhisperGUI(QMainWindow):
             self.setStyleSheet("") 
             if qss_path: 
                 logging.warning(f"Theme file not found: {qss_path}")
+        
+        # Save theme change immediately
+        self.save_settings_to_file()
+
+    def get_system_theme(self):
+        """Detect system theme preference"""
+        try:
+            # Try to detect system theme using Qt's palette
+            palette = QApplication.palette()
+            bg_color = palette.color(QPalette.ColorRole.Window)
+            # If background is dark (low lightness), system is in dark mode
+            if bg_color.lightness() < 128:
+                return "dark"
+            else:
+                return "light"
+        except Exception as e:
+            logging.warning(f"Could not detect system theme: {e}")
+            return "dark"  # Default fallback
+
+    def setup_realtime_saving(self):
+        """Connect UI elements to save settings in real-time"""
+        # Connect combo boxes
+        self.model_combo.currentTextChanged.connect(self.save_combo_setting)
+        self.task_combo.currentTextChanged.connect(self.save_combo_setting)
+        self.language_combo.currentTextChanged.connect(self.save_combo_setting)
+        self.compute_combo.currentTextChanged.connect(self.save_combo_setting)
+        self.device_combo.currentTextChanged.connect(self.save_combo_setting)
+        self.vad_method.currentTextChanged.connect(self.save_combo_setting)
+        
+        # Connect spin boxes
+        self.temperature.valueChanged.connect(self.save_spinbox_setting)
+        self.beam_size.valueChanged.connect(self.save_spinbox_setting)
+        self.best_of.valueChanged.connect(self.save_spinbox_setting)
+        self.patience.valueChanged.connect(self.save_spinbox_setting)
+        self.vad_threshold.valueChanged.connect(self.save_spinbox_setting)
+        self.vad_min_speech.valueChanged.connect(self.save_spinbox_setting)
+        self.ff_tempo.valueChanged.connect(self.save_spinbox_setting)
+        
+        # Connect text fields
+        self.output_dir.textChanged.connect(self.save_text_setting)
+        self.initial_prompt.textChanged.connect(self.save_text_setting)
+        
+        # Connect checkboxes (they'll save when toggled)
+        for checkbox in self.findChildren(QCheckBox):
+            if checkbox.objectName():
+                checkbox.toggled.connect(self.save_checkbox_setting)
+        
+        # Connect output format checkboxes
+        for fmt, checkbox in self.output_format_checkboxes.items():
+            checkbox.toggled.connect(self.save_output_format_setting)
+        
+        # Connect splitter movement
+        self.main_splitter.splitterMoved.connect(self.save_splitter_setting)
+
+    def save_combo_setting(self):
+        """Save combo box settings immediately"""
+        self.settings["model"] = self.model_combo.currentText()
+        self.settings["task"] = self.task_combo.currentText()
+        self.settings["language"] = self.language_combo.currentText()
+        self.settings["compute_type"] = self.compute_combo.currentText()
+        self.settings["device"] = self.device_combo.currentText()
+        self.settings["vad_method"] = self.vad_method.currentText()
+        self.save_settings_to_file()
+
+    def save_spinbox_setting(self):
+        """Save spinbox settings immediately"""
+        self.settings["temperature"] = self.temperature.value()
+        self.settings["beam_size"] = self.beam_size.value()
+        self.settings["best_of"] = self.best_of.value()
+        self.settings["patience"] = self.patience.value()
+        self.settings["vad_threshold"] = self.vad_threshold.value()
+        self.settings["vad_min_speech"] = self.vad_min_speech.value()
+        self.settings["ff_tempo"] = self.ff_tempo.value()
+        self.save_settings_to_file()
+
+    def save_text_setting(self):
+        """Save text field settings immediately"""
+        self.settings["output_dir"] = self.output_dir.text()
+        self.settings["initial_prompt"] = self.initial_prompt.toPlainText()
+        self.save_settings_to_file()
+
+    def save_checkbox_setting(self):
+        """Save checkbox settings immediately"""
+        checkbox_settings = {cb.objectName(): cb.isChecked() for cb in self.findChildren(QCheckBox) if cb.objectName()}
+        self.settings["checkboxes"] = checkbox_settings
+        self.save_settings_to_file()
+
+    def save_output_format_setting(self):
+        """Save output format settings immediately"""
+        output_formats = [fmt for fmt, cb in self.output_format_checkboxes.items() if cb.isChecked()]
+        self.settings["output_formats"] = output_formats
+        self.save_settings_to_file()
+
+    def save_splitter_setting(self):
+        """Save splitter position immediately"""
+        self.settings["splitter_sizes"] = self.main_splitter.sizes()
+        self.save_settings_to_file()
 
     def browse_file(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select Audio/Video File", "", "Audio/Video Files (*.mp3 *.wav *.m4a *.mp4 *.avi *.mov *.mkv);;All Files (*.*)")
@@ -765,7 +867,7 @@ class WhisperGUI(QMainWindow):
         display_command = ' '.join(quoted_command_parts)
         
         logging.info(f"Starting QProcess with command: {command}")
-        self._append_text_to_console(f"<b>Running command:</b><br><pre>{display_command}</pre><hr>", is_html=True)
+        self._append_text_to_console(f"Running command:\n{display_command}\n" + "="*50 + "\n")
 
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -782,13 +884,13 @@ class WhisperGUI(QMainWindow):
     def stop_processing(self):
         self.stop_requested = True
         if self.downloader and self.downloader.isRunning():
-            self._append_text_to_console("\n<b style='color:#ff6b6b;'>Requesting download cancellation...</b>\n", is_html=True)
+            self._append_text_to_console("\nRequesting download cancellation...\n")
             self.downloader.stop()
         if self.process and self.process.state() == QProcess.ProcessState.Running:
-            self._append_text_to_console("\n<b style='color:#ff6b6b;'>Terminating process...</b>\n", is_html=True)
+            self._append_text_to_console("\nTerminating process...\n")
             self.process.terminate()
             if not self.process.waitForFinished(2000):
-                self._append_text_to_console("<b style='color:#ff6b6b;'>Process did not terminate gracefully, killing it.</b>\n", is_html=True)
+                self._append_text_to_console("Process did not terminate gracefully, killing it.\n")
                 self.process.kill()
 
 
@@ -835,6 +937,7 @@ class WhisperGUI(QMainWindow):
             cursor.insertText(line)
 
             if line_ending == '\n':
+                cursor.insertText('\n')  # Explicitly add newline to ensure proper line breaks
                 self.last_line_was_overwrite = False
             else: # line_ending == '\r'
                 self.last_line_was_overwrite = True
@@ -851,14 +954,14 @@ class WhisperGUI(QMainWindow):
         if self.last_line_was_overwrite:
             self.output_text.append("")
         
-        self.output_text.insertHtml("<hr>")
+        self._append_text_to_console("="*50 + "\n")
         if self.stop_requested:
-            self._append_text_to_console("<b>Process stopped by user.</b>", is_html=True)
+            self._append_text_to_console("Process stopped by user.\n")
         elif exit_code == 0:
-            self._append_text_to_console("<b>Process completed successfully.</b>", is_html=True)
+            self._append_text_to_console("Process completed successfully.\n")
         else:
             status_str = "Crashed" if exit_status == QProcess.ExitStatus.CrashExit else "Failed"
-            self._append_text_to_console(f"<b style='color: red;'>Process {status_str} with exit code {exit_code}.</b>", is_html=True)
+            self._append_text_to_console(f"Process {status_str} with exit code {exit_code}.\n")
         
         self.run_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
@@ -877,7 +980,7 @@ class WhisperGUI(QMainWindow):
         }
         error_message = error_map.get(error, "An unspecified error occurred.")
         logging.error(f"QProcess ErrorOccurred: {error_message}")
-        self._append_text_to_console(f"<hr><b style='color: red;'>PROCESS STARTUP ERROR:</b><br>{error_message}<hr>", is_html=True)
+        self._append_text_to_console(f"{'='*50}\nPROCESS STARTUP ERROR:\n{error_message}\n{'='*50}\n")
 
     def download_and_transcribe(self):
         url = self.youtube_url.text()
@@ -891,21 +994,30 @@ class WhisperGUI(QMainWindow):
         self.downloader = YouTubeDownloader(url, output_path, audio_only)
         self.downloader.finished.connect(self.on_download_finished)
         self.downloader.error.connect(self.on_download_error)
-        self.downloader.progress.connect(lambda text: self._append_text_to_console(text + "\n"))
+        self.downloader.progress.connect(self.handle_download_progress)
         
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         
         self.output_text.clear()
-        self._append_text_to_console(f"<b>Starting download from:</b> {url}\n<hr>", is_html=True)
+        self._append_text_to_console(f"Starting download from: {url}\n" + "="*50 + "\n")
         self.downloader.start()
+
+    def handle_download_progress(self, text):
+        """Handle yt-dlp download progress - use carriage return for same-line updates"""
+        if "Downloading:" in text:
+            # Use \r for progress updates to overwrite the same line
+            self._append_text_to_console(text + "\r")
+        else:
+            # Use \n for other messages (like "Download finished")
+            self._append_text_to_console(text + "\n")
 
     def on_download_finished(self, file_path):
         if self.stop_requested:
             self.on_finished(0, QProcess.ExitStatus.NormalExit) 
             return
 
-        self._append_text_to_console(f"<b>Download finished, output file:</b><br>{file_path}\n<hr>", is_html=True)
+        self._append_text_to_console(f"Download finished, output file:\n{file_path}\n" + "="*50 + "\n")
         self.run_transcription(input_file=file_path)
 
     def on_download_error(self, error_message):
@@ -913,7 +1025,7 @@ class WhisperGUI(QMainWindow):
             self.on_finished(0, QProcess.ExitStatus.NormalExit)
             return
 
-        self._append_text_to_console(f"<b style='color: red;'>YouTube Download Error:</b><br>{error_message}\n", is_html=True)
+        self._append_text_to_console(f"YouTube Download Error:\n{error_message}\n")
         self.run_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.downloader = None
@@ -928,7 +1040,16 @@ class WhisperGUI(QMainWindow):
         
         super().closeEvent(event)
 
+    def save_settings_to_file(self):
+        """Save current settings dictionary to file"""
+        try:
+            with open(self.settings_file, "w") as f:
+                json.dump(self.settings, f, indent=4)
+        except Exception as e:
+            logging.error(f"Failed to save settings: {e}")
+
     def save_settings(self):
+        """Collect all current settings and save to file"""
         self.settings["geometry"] = self.saveGeometry().data().hex()
         self.settings["splitter_sizes"] = self.main_splitter.sizes()
         self.settings["output_dir"] = self.output_dir.text()
@@ -943,17 +1064,19 @@ class WhisperGUI(QMainWindow):
         self.settings["patience"] = self.patience.value()
         self.settings["initial_prompt"] = self.initial_prompt.toPlainText()
         
+        # Save VAD settings
+        self.settings["vad_method"] = self.vad_method.currentText()
+        self.settings["vad_threshold"] = self.vad_threshold.value()
+        self.settings["vad_min_speech"] = self.vad_min_speech.value()
+        self.settings["ff_tempo"] = self.ff_tempo.value()
+        
         checkbox_settings = {cb.objectName(): cb.isChecked() for cb in self.findChildren(QCheckBox) if cb.objectName()}
         self.settings["checkboxes"] = checkbox_settings
 
         output_formats = [fmt for fmt, cb in self.output_format_checkboxes.items() if cb.isChecked()]
         self.settings["output_formats"] = output_formats
         
-        try:
-            with open(self.settings_file, "w") as f:
-                json.dump(self.settings, f, indent=4)
-        except Exception as e:
-            logging.error(f"Failed to save settings: {e}")
+        self.save_settings_to_file()
 
     def load_settings(self):
         try:
@@ -966,9 +1089,22 @@ class WhisperGUI(QMainWindow):
             logging.warning(f"Could not load settings file: {e}. Using defaults.")
             self.settings = {}
 
-        theme = self.settings.get("theme", "dark")
+        # Get system theme if no theme is saved
+        if "theme" not in self.settings:
+            system_theme = self.get_system_theme()
+            theme = system_theme
+        else:
+            theme = self.settings.get("theme", "dark")
+        
         self.theme_combo.blockSignals(True)
-        self.theme_combo.setCurrentText(theme.capitalize())
+        # Map theme names to dropdown display names
+        theme_display_map = {
+            "light": "Light",
+            "dark": "Dark", 
+            "amoled": "AMOLED"
+        }
+        display_name = theme_display_map.get(theme.lower(), "Dark")
+        self.theme_combo.setCurrentText(display_name)
         self.theme_combo.blockSignals(False)
         self.apply_theme(theme)
 
@@ -988,6 +1124,12 @@ class WhisperGUI(QMainWindow):
         self.best_of.setValue(self.settings.get("best_of", 5))
         self.patience.setValue(self.settings.get("patience", 1.0))
         self.initial_prompt.setPlainText(self.settings.get("initial_prompt", ""))
+        
+        # Load VAD settings
+        self.vad_method.setCurrentText(self.settings.get("vad_method", "silero_v4_fw"))
+        self.vad_threshold.setValue(self.settings.get("vad_threshold", 0.5))
+        self.vad_min_speech.setValue(self.settings.get("vad_min_speech", 250))
+        self.ff_tempo.setValue(self.settings.get("ff_tempo", 1.0))
 
         all_checkboxes = {cb.objectName(): cb for cb in self.findChildren(QCheckBox) if cb.objectName()}
         checkbox_settings = self.settings.get("checkboxes", {})
