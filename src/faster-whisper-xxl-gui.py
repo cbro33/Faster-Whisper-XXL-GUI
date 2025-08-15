@@ -458,6 +458,760 @@ def resource_path(relative_path):
         return os.path.join(base_path, "resources", relative_path)
 
 
+def try_pytorch_detection():
+    """ Try PyTorch detection with detailed diagnostics """
+    try:
+        import torch
+        
+        # Check if CUDA is available
+        cuda_available = torch.cuda.is_available()
+        
+        if cuda_available:
+            device_count = torch.cuda.device_count()
+            if device_count > 0:
+                gpu_name = torch.cuda.get_device_name(0)
+                props = torch.cuda.get_device_properties(0)
+                memory_gb = props.total_memory / (1024**3)
+                cuda_version = torch.version.cuda
+                
+                return {
+                    "success": True,
+                    "gpu_info": {
+                        "has_cuda": True,
+                        "gpu_memory_gb": memory_gb,
+                        "gpu_name": gpu_name,
+                        "cuda_version": cuda_version,
+                        "recommended_device": "cuda",
+                        "detection_method": "pytorch"
+                    }
+                }
+        
+        return {
+            "success": False,
+            "error": f"PyTorch installed but CUDA not available (cuda_available={cuda_available})"
+        }
+        
+    except ImportError:
+        return {
+            "success": False,
+            "error": "PyTorch not installed"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"PyTorch error: {str(e)}"
+        }
+
+
+def try_nvml_detection():
+    """ Try NVIDIA-ML library detection """
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        
+        device_count = pynvml.nvmlDeviceGetCount()
+        if device_count > 0:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            name = pynvml.nvmlDeviceGetName(handle)
+            if isinstance(name, bytes):
+                name = name.decode('utf-8')
+            memory_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            memory_gb = memory_info.total / (1024**3)
+            
+            # Try to get CUDA version
+            try:
+                cuda_version = pynvml.nvmlSystemGetCudaDriverVersion()
+                cuda_version_str = f"{cuda_version // 1000}.{(cuda_version % 1000) // 10}"
+            except:
+                cuda_version_str = "Available"
+            
+            return {
+                "success": True,
+                "gpu_info": {
+                    "has_cuda": True,
+                    "gpu_memory_gb": memory_gb,
+                    "gpu_name": name,
+                    "cuda_version": cuda_version_str,
+                    "recommended_device": "cuda",
+                    "detection_method": "nvml"
+                }
+            }
+        
+        return {
+            "success": False,
+            "error": "NVML: No GPUs found"
+        }
+        
+    except ImportError:
+        return {
+            "success": False,
+            "error": "nvidia-ml-py not installed"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"NVML error: {str(e)}"
+        }
+
+
+def try_nvidia_smi_detection():
+    """ Try nvidia-smi command-line detection """
+    try:
+        import subprocess
+        result = subprocess.run(['nvidia-smi', '--query-gpu=name,memory.total', '--format=csv,noheader,nounits'], 
+                              capture_output=True, text=True, timeout=10)
+        
+        if result.returncode == 0 and result.stdout.strip():
+            lines = result.stdout.strip().split('\n')
+            if lines:
+                parts = lines[0].split(', ')
+                if len(parts) >= 2:
+                    gpu_name = parts[0].strip()
+                    memory_mb = float(parts[1].strip())
+                    memory_gb = memory_mb / 1024
+                    
+                    return {
+                        "success": True,
+                        "gpu_info": {
+                            "has_cuda": True,
+                            "gpu_memory_gb": memory_gb,
+                            "gpu_name": gpu_name,
+                            "cuda_version": "Available",
+                            "recommended_device": "cuda",
+                            "detection_method": "nvidia-smi"
+                        }
+                    }
+        
+        return {
+            "success": False,
+            "error": f"nvidia-smi failed: {result.stderr or 'No output'}"
+        }
+        
+    except FileNotFoundError:
+        return {
+            "success": False,
+            "error": "nvidia-smi command not found"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"nvidia-smi error: {str(e)}"
+        }
+
+
+def try_platform_detection():
+    """ Try platform-specific GPU detection """
+    try:
+        if sys.platform == "win32":
+            # Windows: Try WMI detection
+            try:
+                import subprocess
+                result = subprocess.run(['wmic', 'path', 'win32_VideoController', 'get', 'name'], 
+                                      capture_output=True, text=True, timeout=10)
+                if result.returncode == 0 and 'nvidia' in result.stdout.lower():
+                    # Found NVIDIA GPU, but can't get memory info this way
+                    lines = result.stdout.strip().split('\n')
+                    for line in lines:
+                        if line.strip() and 'nvidia' in line.lower():
+                            gpu_name = line.strip()
+                            return {
+                                "success": True,
+                                "gpu_info": {
+                                    "has_cuda": True,
+                                    "gpu_memory_gb": 4.0,  # Conservative estimate
+                                    "gpu_name": gpu_name,
+                                    "cuda_version": "Unknown",
+                                    "recommended_device": "cuda",
+                                    "detection_method": "windows-wmic"
+                                }
+                            }
+            except:
+                pass
+        
+        return {
+            "success": False,
+            "error": "No platform-specific detection available"
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Platform detection error: {str(e)}"
+        }
+
+
+def try_intel_gpu_detection():
+    """ Detect Intel integrated and dedicated GPUs """
+    try:
+        if sys.platform == "win32":
+            # Windows: WMI query for Intel graphics
+            result = subprocess.run(['wmic', 'path', 'win32_VideoController', 'where', 
+                                   'name like "%Intel%"', 'get', 'name,AdapterRAM'], 
+                                  capture_output=True, text=True, timeout=10)
+            
+            if result.returncode == 0 and result.stdout.strip():
+                lines = result.stdout.strip().split('\n')
+                for line in lines[1:]:  # Skip header
+                    if line.strip() and 'intel' in line.lower():
+                        parts = line.strip().split()
+                        if len(parts) >= 2:
+                            # Extract GPU name and memory
+                            gpu_name = ' '.join(parts[:-1]) if len(parts) > 1 else line.strip()
+                            try:
+                                memory_bytes = int(parts[-1]) if parts[-1].isdigit() else 0
+                                memory_gb = memory_bytes / (1024**3) if memory_bytes > 0 else 2.0  # Default estimate
+                            except:
+                                memory_gb = 2.0  # Conservative estimate for integrated
+                            
+                            return {
+                                "success": True,
+                                "gpu_info": {
+                                    "has_cuda": False,
+                                    "gpu_memory_gb": memory_gb,
+                                    "gpu_name": gpu_name,
+                                    "cuda_version": None,
+                                    "recommended_device": "cpu",
+                                    "detection_method": "intel-wmic",
+                                    "gpu_vendor": "intel"
+                                }
+                            }
+        
+        elif sys.platform == "linux":
+            # Linux: Try lspci for Intel graphics
+            result = subprocess.run(['lspci', '-nn'], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                lines = result.stdout.lower()
+                if 'intel' in lines and ('vga' in lines or '3d' in lines):
+                    # Found Intel GPU in lspci
+                    for line in result.stdout.split('\n'):
+                        if 'intel' in line.lower() and ('vga' in line.lower() or '3d' in line.lower()):
+                            gpu_name = line.split(': ')[-1].strip() if ': ' in line else "Intel Graphics"
+                            return {
+                                "success": True,
+                                "gpu_info": {
+                                    "has_cuda": False,
+                                    "gpu_memory_gb": 2.0,  # Conservative estimate
+                                    "gpu_name": gpu_name,
+                                    "cuda_version": None,
+                                    "recommended_device": "cpu",
+                                    "detection_method": "intel-lspci",
+                                    "gpu_vendor": "intel"
+                                }
+                            }
+        
+        return {
+            "success": False,
+            "error": "No Intel GPU found"
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Intel detection error: {str(e)}"
+        }
+
+
+def try_amd_gpu_detection():
+    """ Detect AMD integrated and dedicated GPUs """
+    try:
+        if sys.platform == "win32":
+            # Windows: WMI query for AMD graphics
+            result = subprocess.run(['wmic', 'path', 'win32_VideoController', 'where', 
+                                   'name like "%AMD%" or name like "%Radeon%"', 
+                                   'get', 'name,AdapterRAM'], 
+                                  capture_output=True, text=True, timeout=10)
+            
+            if result.returncode == 0 and result.stdout.strip():
+                lines = result.stdout.strip().split('\n')
+                for line in lines[1:]:  # Skip header
+                    if line.strip() and ('amd' in line.lower() or 'radeon' in line.lower()):
+                        parts = line.strip().split()
+                        if len(parts) >= 2:
+                            # Extract GPU name and memory
+                            gpu_name = ' '.join(parts[:-1]) if len(parts) > 1 else line.strip()
+                            try:
+                                memory_bytes = int(parts[-1]) if parts[-1].isdigit() else 0
+                                memory_gb = memory_bytes / (1024**3) if memory_bytes > 0 else 4.0  # Default estimate
+                            except:
+                                memory_gb = 4.0  # Conservative estimate
+                            
+                            return {
+                                "success": True,
+                                "gpu_info": {
+                                    "has_cuda": False,
+                                    "gpu_memory_gb": memory_gb,
+                                    "gpu_name": gpu_name,
+                                    "cuda_version": None,
+                                    "recommended_device": "cpu",
+                                    "detection_method": "amd-wmic",
+                                    "gpu_vendor": "amd"
+                                }
+                            }
+        
+        elif sys.platform == "linux":
+            # Linux: Try lspci for AMD graphics
+            result = subprocess.run(['lspci', '-nn'], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                lines = result.stdout.lower()
+                if ('amd' in lines or 'radeon' in lines) and ('vga' in lines or '3d' in lines):
+                    # Found AMD GPU in lspci
+                    for line in result.stdout.split('\n'):
+                        if ('amd' in line.lower() or 'radeon' in line.lower()) and ('vga' in line.lower() or '3d' in line.lower()):
+                            gpu_name = line.split(': ')[-1].strip() if ': ' in line else "AMD Radeon Graphics"
+                            return {
+                                "success": True,
+                                "gpu_info": {
+                                    "has_cuda": False,
+                                    "gpu_memory_gb": 4.0,  # Conservative estimate
+                                    "gpu_name": gpu_name,
+                                    "cuda_version": None,
+                                    "recommended_device": "cpu",
+                                    "detection_method": "amd-lspci",
+                                    "gpu_vendor": "amd"
+                                }
+                            }
+        
+        return {
+            "success": False,
+            "error": "No AMD GPU found"
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"AMD detection error: {str(e)}"
+        }
+
+
+def try_universal_gpu_detection():
+    """ Universal GPU detection using platform APIs """
+    try:
+        gpu_list = []
+        
+        if sys.platform == "win32":
+            # Windows: WMI query for all GPUs
+            result = subprocess.run(['wmic', 'path', 'win32_VideoController', 
+                                   'get', 'name,AdapterRAM'], 
+                                  capture_output=True, text=True, timeout=10)
+            
+            if result.returncode == 0 and result.stdout.strip():
+                lines = result.stdout.strip().split('\n')
+                for line in lines[1:]:  # Skip header
+                    if line.strip():
+                        parts = line.strip().split()
+                        if len(parts) >= 1:
+                            gpu_name = ' '.join(parts[:-1]) if len(parts) > 1 else parts[0]
+                            try:
+                                memory_bytes = int(parts[-1]) if len(parts) > 1 and parts[-1].isdigit() else 0
+                                memory_gb = memory_bytes / (1024**3) if memory_bytes > 0 else 2.0
+                            except:
+                                memory_gb = 2.0
+                            
+                            # Determine vendor and capabilities
+                            vendor = "unknown"
+                            has_cuda = False
+                            if 'nvidia' in gpu_name.lower():
+                                vendor = "nvidia"
+                                has_cuda = True
+                            elif 'intel' in gpu_name.lower():
+                                vendor = "intel"
+                            elif 'amd' in gpu_name.lower() or 'radeon' in gpu_name.lower():
+                                vendor = "amd"
+                            
+                            gpu_list.append({
+                                "has_cuda": has_cuda,
+                                "gpu_memory_gb": memory_gb,
+                                "gpu_name": gpu_name,
+                                "cuda_version": "Available" if has_cuda else None,
+                                "recommended_device": "cuda" if has_cuda else "cpu",
+                                "detection_method": "universal-wmic",
+                                "gpu_vendor": vendor
+                            })
+        
+        elif sys.platform == "linux":
+            # Linux: lspci for all graphics devices
+            result = subprocess.run(['lspci', '-nn'], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if 'vga' in line.lower() or '3d' in line.lower():
+                        gpu_name = line.split(': ')[-1].strip() if ': ' in line else "Graphics Device"
+                        
+                        # Determine vendor
+                        vendor = "unknown"
+                        has_cuda = False
+                        memory_gb = 2.0
+                        
+                        if 'nvidia' in gpu_name.lower():
+                            vendor = "nvidia"
+                            has_cuda = True
+                            memory_gb = 4.0
+                        elif 'intel' in gpu_name.lower():
+                            vendor = "intel"
+                            memory_gb = 2.0
+                        elif 'amd' in gpu_name.lower() or 'radeon' in gpu_name.lower():
+                            vendor = "amd"
+                            memory_gb = 4.0
+                        
+                        gpu_list.append({
+                            "has_cuda": has_cuda,
+                            "gpu_memory_gb": memory_gb,
+                            "gpu_name": gpu_name,
+                            "cuda_version": "Available" if has_cuda else None,
+                            "recommended_device": "cuda" if has_cuda else "cpu",
+                            "detection_method": "universal-lspci",
+                            "gpu_vendor": vendor
+                        })
+        
+        if gpu_list:
+            return {
+                "success": True,
+                "gpu_list": gpu_list
+            }
+        else:
+            return {
+                "success": False,
+                "error": "No GPUs found via universal detection"
+            }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Universal detection error: {str(e)}"
+        }
+
+
+def assess_gpu_capabilities(gpu_info):
+    """ Assess GPU capabilities for AI workloads """
+    gpu_name = gpu_info["gpu_name"].lower()
+    memory_gb = gpu_info.get("gpu_memory_gb", 0)
+    vendor = gpu_info.get("gpu_vendor", "unknown")
+    
+    # NVIDIA GPUs - CUDA support
+    if vendor == "nvidia" or "nvidia" in gpu_name or "geforce" in gpu_name or "rtx" in gpu_name:
+        if any(x in gpu_name for x in ["rtx 50", "rtx 40"]):  # High-end modern
+            return {
+                "tier": "high-end", 
+                "ai_capable": True, 
+                "recommended_device": "cuda",
+                "recommended_model": "large-v2",
+                "recommended_compute": "float16"
+            }
+        elif any(x in gpu_name for x in ["rtx 30", "rtx 20"]):  # Mid-high
+            return {
+                "tier": "mid-high", 
+                "ai_capable": True, 
+                "recommended_device": "cuda",
+                "recommended_model": "large-v2" if memory_gb >= 6 else "medium",
+                "recommended_compute": "int8_float16"
+            }
+        elif "gtx" in gpu_name:  # Older, limited CUDA
+            return {
+                "tier": "legacy", 
+                "ai_capable": True, 
+                "recommended_device": "cuda",
+                "recommended_model": "medium",
+                "recommended_compute": "int8"
+            }
+    
+    # Intel GPUs
+    elif vendor == "intel" or "intel" in gpu_name:
+        if "arc" in gpu_name:  # Intel Arc dedicated
+            return {
+                "tier": "mid-range", 
+                "ai_capable": False, 
+                "recommended_device": "cpu",
+                "recommended_model": "medium",
+                "recommended_compute": "int8"
+            }
+        elif any(x in gpu_name for x in ["iris xe", "iris plus"]):  # Better integrated
+            return {
+                "tier": "integrated-good", 
+                "ai_capable": False, 
+                "recommended_device": "cpu",
+                "recommended_model": "base",
+                "recommended_compute": "int8"
+            }
+        else:  # Basic integrated (UHD, HD)
+            return {
+                "tier": "integrated-basic", 
+                "ai_capable": False, 
+                "recommended_device": "cpu",
+                "recommended_model": "base",
+                "recommended_compute": "int8"
+            }
+    
+    # AMD GPUs
+    elif vendor == "amd" or "amd" in gpu_name or "radeon" in gpu_name:
+        if any(x in gpu_name for x in ["rx 7000", "rx 6000"]):  # Modern high-end
+            return {
+                "tier": "high-end", 
+                "ai_capable": False, 
+                "recommended_device": "cpu",
+                "recommended_model": "large-v2",  # Usually paired with good CPU
+                "recommended_compute": "int8"
+            }
+        elif any(x in gpu_name for x in ["rx 5000", "rx 500"]):  # Mid-range
+            return {
+                "tier": "mid-range", 
+                "ai_capable": False, 
+                "recommended_device": "cpu",
+                "recommended_model": "medium",
+                "recommended_compute": "int8"
+            }
+        else:  # Integrated or older
+            return {
+                "tier": "integrated-good", 
+                "ai_capable": False, 
+                "recommended_device": "cpu",
+                "recommended_model": "base",
+                "recommended_compute": "int8"
+            }
+    
+    # Unknown GPU
+    return {
+        "tier": "unknown", 
+        "ai_capable": False, 
+        "recommended_device": "cpu",
+        "recommended_model": "base",
+        "recommended_compute": "int8"
+    }
+
+
+def select_best_gpu_for_ai(gpu_list):
+    """ Select the best GPU for AI workloads from detected GPUs """
+    if not gpu_list:
+        return {
+            "has_cuda": False,
+            "gpu_memory_gb": 0,
+            "gpu_name": "None",
+            "cuda_version": None,
+            "recommended_device": "cpu",
+            "detection_method": "none",
+            "detection_details": ["No GPUs detected"]
+        }
+    
+    # Priority: CUDA-capable > High memory > Dedicated > Integrated
+    best_gpu = None
+    best_score = -1
+    
+    for gpu in gpu_list:
+        score = 0
+        capabilities = assess_gpu_capabilities(gpu)
+        
+        # CUDA support gets highest priority
+        if gpu.get("has_cuda", False):
+            score += 1000
+        
+        # Memory amount
+        score += gpu.get("gpu_memory_gb", 0) * 10
+        
+        # GPU tier scoring
+        tier_scores = {
+            "high-end": 100,
+            "mid-high": 80,
+            "mid-range": 60,
+            "legacy": 40,
+            "integrated-good": 20,
+            "integrated-basic": 10,
+            "unknown": 5
+        }
+        score += tier_scores.get(capabilities["tier"], 0)
+        
+        if score > best_score:
+            best_score = score
+            best_gpu = gpu
+    
+    # Add capability assessment to the best GPU
+    if best_gpu:
+        capabilities = assess_gpu_capabilities(best_gpu)
+        best_gpu.update(capabilities)
+    
+    return best_gpu
+
+
+def detect_gpu_info():
+    """ Comprehensive multi-vendor GPU detection with intelligent selection """
+    all_detected_gpus = []
+    detection_details = []
+    
+    # Phase 1: NVIDIA GPU Detection (CUDA-capable, highest priority)
+    logging.info("Phase 1: Trying NVIDIA GPU detection methods...")
+    
+    # Method 1: PyTorch detection (most reliable for CUDA)
+    logging.info("Trying PyTorch GPU detection...")
+    pytorch_result = try_pytorch_detection()
+    if pytorch_result["success"]:
+        logging.info(f"NVIDIA GPU detected via PyTorch: {pytorch_result['gpu_info']['gpu_name']}")
+        all_detected_gpus.append(pytorch_result["gpu_info"])
+    else:
+        detection_details.append(f"PyTorch: {pytorch_result['error']}")
+        logging.info(f"PyTorch detection failed: {pytorch_result['error']}")
+    
+    # Method 2: NVML detection
+    if not all_detected_gpus:  # Only try if PyTorch didn't find anything
+        logging.info("Trying NVML GPU detection...")
+        nvml_result = try_nvml_detection()
+        if nvml_result["success"]:
+            logging.info(f"NVIDIA GPU detected via NVML: {nvml_result['gpu_info']['gpu_name']}")
+            all_detected_gpus.append(nvml_result["gpu_info"])
+        else:
+            detection_details.append(f"NVML: {nvml_result['error']}")
+            logging.info(f"NVML detection failed: {nvml_result['error']}")
+    
+    # Method 3: nvidia-smi detection
+    if not all_detected_gpus:  # Only try if no NVIDIA GPU found yet
+        logging.info("Trying nvidia-smi GPU detection...")
+        smi_result = try_nvidia_smi_detection()
+        if smi_result["success"]:
+            logging.info(f"NVIDIA GPU detected via nvidia-smi: {smi_result['gpu_info']['gpu_name']}")
+            all_detected_gpus.append(smi_result["gpu_info"])
+        else:
+            detection_details.append(f"nvidia-smi: {smi_result['error']}")
+            logging.info(f"nvidia-smi detection failed: {smi_result['error']}")
+    
+    # Phase 2: Intel GPU Detection
+    if not all_detected_gpus:  # Only if no NVIDIA GPU found
+        logging.info("Phase 2: Trying Intel GPU detection...")
+        intel_result = try_intel_gpu_detection()
+        if intel_result["success"]:
+            logging.info(f"Intel GPU detected: {intel_result['gpu_info']['gpu_name']}")
+            all_detected_gpus.append(intel_result["gpu_info"])
+        else:
+            detection_details.append(f"Intel: {intel_result['error']}")
+            logging.info(f"Intel detection failed: {intel_result['error']}")
+    
+    # Phase 3: AMD GPU Detection
+    if not all_detected_gpus:  # Only if no NVIDIA or Intel GPU found
+        logging.info("Phase 3: Trying AMD GPU detection...")
+        amd_result = try_amd_gpu_detection()
+        if amd_result["success"]:
+            logging.info(f"AMD GPU detected: {amd_result['gpu_info']['gpu_name']}")
+            all_detected_gpus.append(amd_result["gpu_info"])
+        else:
+            detection_details.append(f"AMD: {amd_result['error']}")
+            logging.info(f"AMD detection failed: {amd_result['error']}")
+    
+    # Phase 4: Universal Detection (fallback for any remaining GPUs)
+    if not all_detected_gpus:
+        logging.info("Phase 4: Trying universal GPU detection...")
+        universal_result = try_universal_gpu_detection()
+        if universal_result["success"]:
+            logging.info(f"GPUs detected via universal method: {len(universal_result['gpu_list'])} GPU(s)")
+            all_detected_gpus.extend(universal_result["gpu_list"])
+        else:
+            detection_details.append(f"Universal: {universal_result['error']}")
+            logging.info(f"Universal detection failed: {universal_result['error']}")
+    
+    # Select best GPU from all detected GPUs
+    if all_detected_gpus:
+        best_gpu = select_best_gpu_for_ai(all_detected_gpus)
+        if best_gpu:
+            best_gpu["detection_details"] = detection_details
+            logging.info(f"Selected best GPU: {best_gpu['gpu_name']} (method: {best_gpu.get('detection_method', 'unknown')})")
+            return best_gpu
+    
+    # No GPUs found - return CPU fallback
+    logging.warning("No GPUs detected by any method")
+    return {
+        "has_cuda": False,
+        "gpu_memory_gb": 0,
+        "gpu_name": "None",
+        "cuda_version": None,
+        "recommended_device": "cpu",
+        "detection_method": "none",
+        "detection_details": detection_details
+    }
+
+
+def detect_system_info():
+    """ Detect system RAM and CPU info """
+    system_info = {
+        "ram_gb": 8,  # fallback
+        "cpu_cores": 4,  # fallback
+        "os_platform": sys.platform
+    }
+    
+    try:
+        import psutil
+        system_info["ram_gb"] = psutil.virtual_memory().total / (1024**3)
+        system_info["cpu_cores"] = psutil.cpu_count(logical=False) or psutil.cpu_count()
+    except ImportError:
+        logging.info("psutil not available for system detection, using fallback values")
+        # Try alternative methods
+        try:
+            import multiprocessing
+            system_info["cpu_cores"] = multiprocessing.cpu_count()
+        except:
+            pass
+    except Exception as e:
+        logging.warning(f"Error detecting system info: {e}")
+    
+    return system_info
+
+
+def detect_hardware_capabilities():
+    """ Comprehensive hardware detection """
+    gpu_info = detect_gpu_info()
+    system_info = detect_system_info()
+    
+    import time
+    return {
+        **gpu_info,
+        **system_info,
+        "detection_timestamp": time.time()
+    }
+
+
+def get_recommended_settings(hardware_info):
+    """ Generate optimal settings based on hardware """
+    recommendations = {}
+    
+    # Device Selection
+    if hardware_info["has_cuda"] and hardware_info["gpu_memory_gb"] >= 4:
+        recommendations["device"] = "cuda"
+    else:
+        recommendations["device"] = "cpu"
+    
+    # Compute Type Based on Hardware
+    if hardware_info["has_cuda"]:
+        if hardware_info["gpu_memory_gb"] >= 8:
+            recommendations["compute_type"] = "float16"  # Best quality
+        elif hardware_info["gpu_memory_gb"] >= 4:
+            recommendations["compute_type"] = "int8_float16"  # Good balance
+        else:
+            recommendations["compute_type"] = "int8"  # Memory limited
+    else:
+        # CPU optimizations
+        if hardware_info["ram_gb"] >= 16:
+            recommendations["compute_type"] = "int8"  # Faster on CPU
+        else:
+            recommendations["compute_type"] = "int8"  # Memory conservative
+    
+    # Model Size Recommendations (large-v2 is the best quality model)
+    if hardware_info["has_cuda"] and hardware_info["gpu_memory_gb"] >= 6:
+        recommendations["model"] = "large-v2"  # BEST quality model
+    elif hardware_info["has_cuda"] and hardware_info["gpu_memory_gb"] >= 4:
+        recommendations["model"] = "medium"   # Good balance for mid-range GPU
+    elif hardware_info["ram_gb"] >= 8:
+        recommendations["model"] = "medium"   # CPU with sufficient RAM
+    else:
+        recommendations["model"] = "base"     # Memory-limited systems
+    
+    # Beam Size Based on Memory
+    if hardware_info["gpu_memory_gb"] >= 8 or hardware_info["ram_gb"] >= 16:
+        recommendations["beam_size"] = 5  # Default
+    else:
+        recommendations["beam_size"] = 3  # More memory efficient
+    
+    # VAD Method Based on Hardware
+    if hardware_info["has_cuda"] and hardware_info["gpu_memory_gb"] >= 4:
+        recommendations["vad_method"] = "pyannote_v3"  # Best accuracy with CUDA
+    else:
+        recommendations["vad_method"] = "silero_v4_fw"  # CPU friendly
+    
+    return recommendations
+
+
 class YouTubeDownloader(QThread):
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
@@ -877,6 +1631,171 @@ class DownloadManager(QDialog):
         super().reject()
 
 
+class HardwareOptimizationDialog(QDialog):
+    """Dialog for showing hardware detection results and optimization recommendations"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Hardware Optimization")
+        self.setModal(True)
+        self.setMinimumSize(500, 400)
+        
+        # Detect hardware
+        self.hardware_info = detect_hardware_capabilities()
+        self.recommendations = get_recommended_settings(self.hardware_info)
+        self.user_accepted = False
+        
+        self.init_ui()
+        
+        # Set always on top flag
+        stay_on_top_flag = get_window_stays_on_top_flag()
+        if stay_on_top_flag is not None:
+            try:
+                self.setWindowFlags(self.windowFlags() | stay_on_top_flag)
+            except Exception as e:
+                logging.warning(f"Could not set always-on-top flag: {e}")
+    
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # Title
+        title_label = QLabel("Hardware Optimization")
+        title_label.setStyleSheet("font-size: 16px; font-weight: bold; margin-bottom: 10px;")
+        layout.addWidget(title_label)
+        
+        # Hardware detection results
+        hw_group = QGroupBox("Detected Hardware")
+        hw_layout = QVBoxLayout(hw_group)
+        
+        # GPU info with detection details
+        gpu_layout = QHBoxLayout()
+        if self.hardware_info["has_cuda"]:
+            detection_method = self.hardware_info.get("detection_method", "unknown")
+            gpu_text = f"✅ GPU: {self.hardware_info['gpu_name']} ({self.hardware_info['gpu_memory_gb']:.1f}GB VRAM)"
+            if detection_method != "unknown":
+                gpu_text += f" [Detected via: {detection_method}]"
+            gpu_label = QLabel(gpu_text)
+        else:
+            gpu_text = "⚠️ GPU: No CUDA-compatible GPU detected"
+            gpu_label = QLabel(gpu_text)
+            
+            # Add "Show Details" button for failed detection
+            if self.hardware_info.get("detection_details"):
+                self.details_button = QPushButton("Show Details")
+                self.details_button.clicked.connect(self.show_detection_details)
+                gpu_layout.addWidget(gpu_label)
+                gpu_layout.addWidget(self.details_button)
+                gpu_layout.addStretch()
+                hw_layout.addLayout(gpu_layout)
+            else:
+                hw_layout.addWidget(gpu_label)
+        
+        if self.hardware_info["has_cuda"]:
+            hw_layout.addWidget(gpu_label)
+        
+        # RAM info
+        ram_text = f"✅ System RAM: {self.hardware_info['ram_gb']:.1f}GB"
+        ram_label = QLabel(ram_text)
+        hw_layout.addWidget(ram_label)
+        
+        # CPU info
+        cpu_text = f"✅ CPU: {self.hardware_info['cpu_cores']} cores detected"
+        cpu_label = QLabel(cpu_text)
+        hw_layout.addWidget(cpu_label)
+        
+        layout.addWidget(hw_group)
+        
+        # Recommendations
+        rec_group = QGroupBox("Recommended Settings")
+        rec_layout = QFormLayout(rec_group)
+        
+        # Device recommendation
+        device_text = self.recommendations["device"].upper()
+        if device_text == "CUDA":
+            device_text += " (faster processing)"
+        else:
+            device_text += " (most compatible)"
+        rec_layout.addRow("Device:", QLabel(device_text))
+        
+        # Model recommendation
+        model_text = self.recommendations["model"]
+        if model_text == "large-v2":
+            model_text += " (highest quality)"
+        elif model_text == "medium":
+            model_text += " (good balance)"
+        else:
+            model_text += " (fastest)"
+        rec_layout.addRow("Model:", QLabel(model_text))
+        
+        # Compute type
+        compute_text = self.recommendations["compute_type"]
+        if compute_text == "float16":
+            compute_text += " (best quality)"
+        elif compute_text == "int8_float16":
+            compute_text += " (balanced)"
+        else:
+            compute_text += " (memory efficient)"
+        rec_layout.addRow("Compute Type:", QLabel(compute_text))
+        
+        # VAD method
+        vad_text = self.recommendations["vad_method"]
+        if "pyannote" in vad_text:
+            vad_text += " (best accuracy)"
+        else:
+            vad_text += " (CPU friendly)"
+        rec_layout.addRow("VAD Method:", QLabel(vad_text))
+        
+        layout.addWidget(rec_group)
+        
+        # Note about large-v2
+        note_label = QLabel("Note: large-v2 provides the best transcription quality")
+        note_label.setStyleSheet("color: #666; font-style: italic; margin: 10px 0;")
+        layout.addWidget(note_label)
+        
+        # Buttons
+        button_layout = QHBoxLayout()
+        
+        self.apply_button = QPushButton("Apply Recommendations")
+        self.apply_button.clicked.connect(self.accept_recommendations)
+        self.apply_button.setDefault(True)
+        
+        self.skip_button = QPushButton("Use Defaults")
+        self.skip_button.clicked.connect(self.reject)
+        
+        self.customize_button = QPushButton("Customize Later")
+        self.customize_button.clicked.connect(self.reject)
+        
+        button_layout.addWidget(self.apply_button)
+        button_layout.addWidget(self.customize_button)
+        button_layout.addWidget(self.skip_button)
+        
+        layout.addLayout(button_layout)
+    
+    def accept_recommendations(self):
+        self.user_accepted = True
+        self.accept()
+    
+    def show_detection_details(self):
+        """ Show detailed GPU detection troubleshooting information """
+        details_text = "GPU Detection Failed - Troubleshooting Information\n\n"
+        
+        if self.hardware_info.get("detection_details"):
+            details_text += "Detection Results:\n"
+            for detail in self.hardware_info["detection_details"]:
+                details_text += f"• {detail}\n"
+        
+        details_text += "\nPossible Solutions:\n"
+        details_text += "• Install PyTorch with CUDA support\n"
+        details_text += "  pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121\n\n"
+        details_text += "• Update NVIDIA drivers from nvidia.com\n\n"
+        details_text += "• Install CUDA Toolkit (if not included with drivers)\n\n"
+        details_text += "• Check if GPU is properly connected and powered\n\n"
+        details_text += "• Restart computer after driver installation\n\n"
+        details_text += "The application will use CPU mode for now, which is slower but still functional."
+        
+        show_setup_information(self, "GPU Detection Details", details_text)
+
+
 class WhisperGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -913,6 +1832,9 @@ class WhisperGUI(QMainWindow):
         self.init_ui()
         self.load_settings()
         self.setup_realtime_saving()
+        
+        # Check for hardware optimization on first run
+        QTimer.singleShot(500, self.check_hardware_optimization)
         
         # Check yt-dlp version after UI is ready (only if not already checked this session)
         if not self.yt_dlp_update_checked:
@@ -973,6 +1895,9 @@ class WhisperGUI(QMainWindow):
         self.setWindowTitle("Faster Whisper XXL GUI")
         self.setGeometry(100, 100, 1200, 800)
         self.setMinimumSize(1000, 600)
+
+        # Create menu bar
+        self.create_menu_bar()
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -1495,6 +2420,224 @@ class WhisperGUI(QMainWindow):
         finally:
             # Always reset the update flag
             self.yt_dlp_update_in_progress = False
+
+    def check_hardware_optimization(self):
+        """ Check if hardware optimization should be offered """
+        try:
+            # Only offer on first run or when explicitly requested
+            if not self.settings.get("hardware_optimized", False):
+                reply = show_setup_question(
+                    self, "Hardware Optimization",
+                    "Would you like to optimize settings based on your hardware?\n\n"
+                    "This will detect your GPU, RAM, and CPU to recommend optimal settings for the best performance.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes
+                )
+                
+                if reply == QMessageBox.StandardButton.Yes:
+                    self.show_hardware_optimization_dialog()
+                else:
+                    # Mark as completed even if declined so we don't ask again
+                    self.settings["hardware_optimized"] = True
+                    self.save_settings_to_file()
+        except Exception as e:
+            logging.error(f"Error in hardware optimization check: {e}")
+
+    def show_hardware_optimization_dialog(self):
+        """ Show hardware optimization dialog and apply recommendations """
+        try:
+            dialog = HardwareOptimizationDialog(self)
+            result = dialog.exec()
+            
+            if result == QDialog.DialogCode.Accepted and dialog.user_accepted:
+                # Apply the recommendations
+                self.apply_hardware_recommendations(dialog.recommendations, dialog.hardware_info)
+                
+                # Mark as optimized
+                self.settings["hardware_optimized"] = True
+                self.settings["hardware_info"] = dialog.hardware_info
+                self.settings["optimization_applied"] = dialog.recommendations
+                self.save_settings_to_file()
+                
+                # Show confirmation
+                show_setup_information(
+                    self, "Optimization Applied", 
+                    "Hardware-optimized settings have been applied!\n\n"
+                    "You can always re-optimize later from the Help menu."
+                )
+            else:
+                # Mark as completed even if not applied
+                self.settings["hardware_optimized"] = True
+                self.save_settings_to_file()
+                
+        except Exception as e:
+            logging.error(f"Error showing hardware optimization dialog: {e}")
+
+    def apply_hardware_recommendations(self, recommendations, hardware_info):
+        """ Apply hardware recommendations to the UI """
+        try:
+            # Block signals temporarily to prevent multiple saves
+            self.blockSignals(True)
+            
+            # Apply device setting
+            if "device" in recommendations:
+                device_text = recommendations["device"].upper()
+                index = self.device_combo.findText(device_text)
+                if index >= 0:
+                    self.device_combo.setCurrentIndex(index)
+            
+            # Apply model setting
+            if "model" in recommendations:
+                model_text = recommendations["model"]
+                index = self.model_combo.findText(model_text)
+                if index >= 0:
+                    self.model_combo.setCurrentIndex(index)
+            
+            # Apply compute type setting
+            if "compute_type" in recommendations:
+                compute_text = recommendations["compute_type"]
+                index = self.compute_combo.findText(compute_text)
+                if index >= 0:
+                    self.compute_combo.setCurrentIndex(index)
+            
+            # Apply beam size
+            if "beam_size" in recommendations:
+                self.beam_size.setValue(recommendations["beam_size"])
+            
+            # Apply VAD method
+            if "vad_method" in recommendations:
+                vad_text = recommendations["vad_method"]
+                index = self.vad_method.findText(vad_text)
+                if index >= 0:
+                    self.vad_method.setCurrentIndex(index)
+            
+            # Re-enable signals
+            self.blockSignals(False)
+            
+            # Save settings
+            self.save_settings_to_file()
+            
+            logging.info(f"Applied hardware recommendations: {recommendations}")
+            
+        except Exception as e:
+            self.blockSignals(False)
+            logging.error(f"Error applying hardware recommendations: {e}")
+
+    def create_menu_bar(self):
+        """ Create menu bar with hardware optimization option """
+        try:
+            menubar = self.menuBar()
+            
+            # GPU menu
+            hardware_menu = menubar.addMenu('Hardware Settings')
+            
+            # Hardware optimization action
+            optimize_action = hardware_menu.addAction('Optimize Hardware Settings')
+            optimize_action.triggered.connect(self.force_hardware_optimization)
+            
+            # View hardware info action
+            view_hw_action = hardware_menu.addAction('View Hardware Info')
+            view_hw_action.triggered.connect(self.show_hardware_info)
+            
+            # Separator
+            hardware_menu.addSeparator()
+            
+            # Diagnose GPU detection action
+            diagnose_action = hardware_menu.addAction('Diagnose GPU Detection')
+            diagnose_action.triggered.connect(self.diagnose_gpu_detection)
+            
+        except Exception as e:
+            logging.error(f"Error creating menu bar: {e}")
+
+    def force_hardware_optimization(self):
+        """ Force hardware optimization dialog to show """
+        try:
+            self.show_hardware_optimization_dialog()
+        except Exception as e:
+            logging.error(f"Error in forced hardware optimization: {e}")
+
+    def show_hardware_info(self):
+        """ Show current hardware information """
+        try:
+            hardware_info = detect_hardware_capabilities()
+            
+            # Format hardware info for display
+            info_text = "Current Hardware Information:\n\n"
+            
+            if hardware_info["has_cuda"]:
+                info_text += f"GPU: {hardware_info['gpu_name']} ({hardware_info['gpu_memory_gb']:.1f}GB VRAM)\n"
+                info_text += f"CUDA Version: {hardware_info['cuda_version']}\n"
+            else:
+                info_text += "GPU: No CUDA-compatible GPU detected\n"
+            
+            info_text += f"System RAM: {hardware_info['ram_gb']:.1f}GB\n"
+            info_text += f"CPU Cores: {hardware_info['cpu_cores']}\n"
+            info_text += f"Platform: {hardware_info['os_platform']}\n\n"
+            
+            # Show applied optimization if available
+            if self.settings.get("hardware_optimized", False):
+                info_text += "Hardware Optimization: Applied\n"
+                applied = self.settings.get("optimization_applied", {})
+                if applied:
+                    info_text += f"Current Settings:\n"
+                    info_text += f"• Device: {applied.get('device', 'N/A')}\n"
+                    info_text += f"• Model: {applied.get('model', 'N/A')}\n"
+                    info_text += f"• Compute Type: {applied.get('compute_type', 'N/A')}\n"
+            else:
+                info_text += "Hardware Optimization: Not applied\n"
+            
+            show_setup_information(self, "Hardware Information", info_text)
+            
+        except Exception as e:
+            logging.error(f"Error showing hardware info: {e}")
+            show_setup_critical(self, "Error", f"Could not retrieve hardware information: {e}")
+
+    def diagnose_gpu_detection(self):
+        """ Run comprehensive GPU detection diagnostics """
+        try:
+            # Run full detection and get all details
+            hardware_info = detect_hardware_capabilities()
+            
+            # Format comprehensive diagnostic information
+            diag_text = "GPU Detection Diagnostics\n\n"
+            
+            if hardware_info["has_cuda"]:
+                # Successful detection
+                diag_text += f"✅ SUCCESS: GPU detected via {hardware_info.get('detection_method', 'unknown')}\n\n"
+                diag_text += f"GPU Name: {hardware_info['gpu_name']}\n"
+                diag_text += f"VRAM: {hardware_info['gpu_memory_gb']:.1f}GB\n"
+                diag_text += f"CUDA Version: {hardware_info['cuda_version']}\n\n"
+                diag_text += "Your GPU is properly detected and CUDA acceleration is available."
+            else:
+                # Failed detection - show all attempted methods
+                diag_text += "❌ FAILED: No CUDA-compatible GPU detected\n\n"
+                
+                if hardware_info.get("detection_details"):
+                    diag_text += "Detection attempts:\n"
+                    for detail in hardware_info["detection_details"]:
+                        diag_text += f"• {detail}\n"
+                    diag_text += "\n"
+                
+                diag_text += "Troubleshooting steps:\n"
+                diag_text += "1. Install PyTorch with CUDA support:\n"
+                diag_text += "   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121\n\n"
+                diag_text += "2. Update NVIDIA drivers from nvidia.com\n\n"
+                diag_text += "3. Verify NVIDIA GPU is detected by Windows:\n"
+                diag_text += "   - Open Device Manager\n"
+                diag_text += "   - Check 'Display adapters' section\n"
+                diag_text += "   - Look for NVIDIA GPU (no yellow warning icons)\n\n"
+                diag_text += "4. Test nvidia-smi command:\n"
+                diag_text += "   - Open Command Prompt\n"
+                diag_text += "   - Run: nvidia-smi\n"
+                diag_text += "   - Should show GPU information\n\n"
+                diag_text += "5. Restart computer after driver installation\n\n"
+                diag_text += "CPU mode will be used until GPU is properly detected."
+            
+            show_setup_information(self, "GPU Detection Diagnostics", diag_text)
+            
+        except Exception as e:
+            logging.error(f"Error in GPU diagnostics: {e}")
+            show_setup_critical(self, "Diagnostic Error", f"Could not run GPU diagnostics: {e}")
 
     def setup_realtime_saving(self):
         """Connect UI elements to save settings in real-time"""
