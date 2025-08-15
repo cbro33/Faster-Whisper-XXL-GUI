@@ -18,9 +18,419 @@ from PyQt6.QtCore import pyqtSignal, QThread, Qt, QTimer, QProcess, QByteArray
 from PyQt6.QtGui import QIcon, QPalette, QColor, QTextCursor, QFont
 import yt_dlp
 
+
+def get_app_directory():
+    """ Get the application's base directory consistently, whether running from source or as executable """
+    try:
+        # Check if running as PyInstaller executable
+        if getattr(sys, 'frozen', False):
+            # Running as PyInstaller executable - use directory where .exe is located
+            return os.path.dirname(sys.executable)
+        else:
+            # Running from source - use parent directory of src/
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            return os.path.dirname(script_dir)  # Go up one level from src/
+    except Exception as e:
+        # Fallback to current working directory if all else fails
+        print(f"Warning: Could not determine app directory: {e}, using current working directory")
+        return os.getcwd()
+
+
+def get_settings_directory():
+    """ Get a writable, persistent directory for settings across all execution modes """
+    try:
+        if sys.platform == "win32":
+            # Windows: Use %APPDATA%\FasterWhisperXXL\
+            appdata = os.environ.get('APPDATA')
+            if appdata:
+                settings_dir = os.path.join(appdata, "FasterWhisperXXL")
+            else:
+                # Fallback to user profile
+                settings_dir = os.path.join(os.path.expanduser("~"), ".faster-whisper-xxl")
+        else:
+            # Linux/Mac: Use ~/.faster-whisper-xxl/
+            settings_dir = os.path.join(os.path.expanduser("~"), ".faster-whisper-xxl")
+        
+        # Create directory if it doesn't exist
+        os.makedirs(settings_dir, exist_ok=True)
+        return settings_dir
+    except Exception as e:
+        logging.warning(f"Could not create settings directory: {e}, using app directory")
+        # Final fallback to app directory (if writable)
+        return get_app_directory()
+
+
+def get_portable_settings_directory():
+    """ Get settings directory that stays with the application (portable) """
+    try:
+        if getattr(sys, 'frozen', False):
+            # Running as exe - use same directory as .exe
+            return os.path.dirname(sys.executable)
+        else:
+            # Running from source - use src/ directory
+            return os.path.dirname(os.path.abspath(__file__))
+    except Exception as e:
+        logging.warning(f"Could not determine portable settings directory: {e}")
+        return os.getcwd()
+
+
+def create_always_on_top_message_box(parent, icon, title, text, buttons=None, default_button=None):
+    """ Create a message box that always stays on top """
+    msg = QMessageBox(parent)
+    msg.setIcon(icon)
+    msg.setWindowTitle(title)
+    msg.setText(text)
+    
+    # Set always on top flag with compatibility
+    stay_on_top_flag = get_window_stays_on_top_flag()
+    if stay_on_top_flag is not None:
+        try:
+            msg.setWindowFlags(msg.windowFlags() | stay_on_top_flag)
+        except Exception as e:
+            logging.warning(f"Could not set always-on-top flag: {e}")
+    
+    if buttons:
+        msg.setStandardButtons(buttons)
+    if default_button:
+        msg.setDefaultButton(default_button)
+    
+    # Ensure dialog appears on top and is activated
+    msg.activateWindow()
+    msg.raise_()
+    
+    return msg
+
+
+def show_setup_critical(parent, title, text):
+    """ Show critical error dialog for setup that stays on top """
+    msg = create_always_on_top_message_box(parent, QMessageBox.Icon.Critical, title, text)
+    return msg.exec()
+
+
+def show_setup_warning(parent, title, text):
+    """ Show warning dialog for setup that stays on top """
+    msg = create_always_on_top_message_box(parent, QMessageBox.Icon.Warning, title, text)
+    return msg.exec()
+
+
+def show_setup_information(parent, title, text):
+    """ Show information dialog for setup that stays on top """
+    msg = create_always_on_top_message_box(parent, QMessageBox.Icon.Information, title, text)
+    
+    # Prevent event cascading by temporarily blocking further processing
+    if hasattr(parent, 'blockSignals'):
+        parent.blockSignals(True)
+    
+    try:
+        result = msg.exec()
+        # Small delay to prevent immediate event cascading
+        from PyQt6.QtCore import QCoreApplication
+        QCoreApplication.processEvents()
+        return result
+    finally:
+        if hasattr(parent, 'blockSignals'):
+            parent.blockSignals(False)
+
+
+def show_setup_question(parent, title, text, buttons, default_button=None):
+    """ Show question dialog for setup that stays on top """
+    msg = create_always_on_top_message_box(parent, QMessageBox.Icon.Question, title, text, buttons, default_button)
+    return msg.exec()
+
+
+def get_execution_environment():
+    """ Detect how the application is running and what update capabilities are available """
+    try:
+        # Check if running as PyInstaller executable
+        is_frozen = getattr(sys, 'frozen', False)
+        
+        if not is_frozen:
+            # Running from source - can always update
+            return "source"
+        
+        # Running as exe - check if system Python is available
+        python_commands = ["python", "python3", "py"]
+        
+        for cmd in python_commands:
+            try:
+                # Check if Python command exists and has pip
+                result = subprocess.run([cmd, "-m", "pip", "--version"], 
+                                      capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    return "exe_with_python"
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                continue
+        
+        # No usable Python found
+        return "exe_no_python"
+        
+    except Exception as e:
+        logging.warning(f"Could not determine execution environment: {e}")
+        return "unknown"
+
+
+def can_update_yt_dlp():
+    """ Check if yt-dlp can be updated in the current environment """
+    env = get_execution_environment()
+    return env in ["source", "exe_with_python"]
+
+
+def get_update_command():
+    """ Get the appropriate command to update yt-dlp based on environment """
+    env = get_execution_environment()
+    
+    if env == "source":
+        return [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"]
+    elif env == "exe_with_python":
+        # Find the best Python command to use
+        python_commands = ["python", "python3", "py"]
+        for cmd in python_commands:
+            try:
+                result = subprocess.run([cmd, "-m", "pip", "--version"], 
+                                      capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    return [cmd, "-m", "pip", "install", "--upgrade", "yt-dlp"]
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+                continue
+    
+    return None
+
+
+def show_yt_dlp_unavailable(parent):
+    """ Show informative dialog for exe users who can't update yt-dlp """
+    msg = create_always_on_top_message_box(
+        parent, 
+        QMessageBox.Icon.Information,
+        "yt-dlp Update Not Available",
+        "Your system doesn't have Python installed, so yt-dlp cannot be updated automatically.\n\n"
+        "To update yt-dlp, you have these options:\n\n"
+        "• Install Python from python.org and restart this application\n"
+        "• Download a newer version of this application (may include updated yt-dlp)\n"
+        "• Continue using the current version (may have limitations with some videos)\n\n"
+        "Would you like to open the Python download page?",
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        QMessageBox.StandardButton.No
+    )
+    
+    reply = msg.exec()
+    if reply == QMessageBox.StandardButton.Yes:
+        import webbrowser
+        webbrowser.open("https://python.org/downloads/")
+
+
+def get_ytdlp_installation_info():
+    """ Detect which yt-dlp installation is actually being used """
+    try:
+        import yt_dlp
+        current_version = yt_dlp.version.__version__
+        
+        # Get the location of the yt-dlp module
+        ytdlp_path = yt_dlp.__file__
+        
+        # Determine if it's bundled with exe or system installation
+        env = get_execution_environment()
+        is_frozen = getattr(sys, 'frozen', False)
+        
+        if is_frozen:
+            # If running as exe, check if yt-dlp is bundled or from system
+            exe_dir = os.path.dirname(sys.executable)
+            if ytdlp_path.startswith(exe_dir):
+                installation_type = "bundled"
+            else:
+                installation_type = "system"
+        else:
+            installation_type = "development"
+        
+        return {
+            "version": current_version,
+            "path": ytdlp_path,
+            "installation_type": installation_type,
+            "environment": env
+        }
+    except ImportError:
+        return {
+            "version": None,
+            "path": None,
+            "installation_type": "missing",
+            "environment": get_execution_environment()
+        }
+
+
+def load_ytdlp_update_status():
+    """ Load persistent yt-dlp update tracking data """
+    try:
+        portable_dir = get_portable_settings_directory()
+        update_file = os.path.join(portable_dir, "ytdlp_updates.json")
+        
+        if os.path.exists(update_file):
+            with open(update_file, "r") as f:
+                return json.load(f)
+        else:
+            # Initialize default structure
+            return {
+                "ytdlp_updates": {
+                    "source": {},
+                    "exe_with_python": {},
+                    "exe_no_python": {}
+                }
+            }
+    except Exception as e:
+        logging.warning(f"Could not load yt-dlp update status: {e}")
+        return {
+            "ytdlp_updates": {
+                "source": {},
+                "exe_with_python": {},
+                "exe_no_python": {}
+            }
+        }
+
+
+def save_ytdlp_update_status(data):
+    """ Save persistent yt-dlp update tracking data """
+    try:
+        portable_dir = get_portable_settings_directory()
+        update_file = os.path.join(portable_dir, "ytdlp_updates.json")
+        
+        with open(update_file, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logging.error(f"Could not save yt-dlp update status: {e}")
+
+
+def is_within_update_cooldown(last_update_timestamp, cooldown_hours=24):
+    """ Check if we're within the cooldown period since last successful update """
+    if not last_update_timestamp:
+        return False
+    
+    import time
+    current_time = time.time()
+    cooldown_seconds = cooldown_hours * 3600
+    
+    return (current_time - last_update_timestamp) < cooldown_seconds
+
+
+def should_check_ytdlp_update():
+    """ Determine if we should check for yt-dlp updates based on persistent tracking """
+    try:
+        # Get current installation info
+        install_info = get_ytdlp_installation_info()
+        env = install_info["environment"]
+        current_version = install_info["version"]
+        
+        if not current_version:
+            return True  # yt-dlp not found, should check
+        
+        # Load persistent update status
+        update_data = load_ytdlp_update_status()
+        env_data = update_data["ytdlp_updates"].get(env, {})
+        
+        # Check if we recently updated successfully
+        last_updated_version = env_data.get("last_updated_version")
+        last_update_timestamp = env_data.get("last_update_timestamp")
+        
+        # If we have a record of updating to the current version recently, skip
+        if (last_updated_version == current_version and 
+            is_within_update_cooldown(last_update_timestamp)):
+            logging.info(f"yt-dlp update skipped: recently updated to {current_version} in {env} mode")
+            return False
+        
+        # For bundled exe installations, be more conservative
+        if install_info["installation_type"] == "bundled":
+            # Check if we already informed user about bundled version recently
+            last_check = env_data.get("last_bundled_check_timestamp")
+            if is_within_update_cooldown(last_check, cooldown_hours=72):  # 3 day cooldown for bundled
+                logging.info("Bundled yt-dlp update check skipped: recently informed user")
+                return False
+        
+        return True
+        
+    except Exception as e:
+        logging.error(f"Error checking if should update yt-dlp: {e}")
+        return True  # Default to checking if unsure
+
+
+def record_ytdlp_update_success(updated_version):
+    """ Record a successful yt-dlp update """
+    try:
+        import time
+        
+        # Get current environment
+        env = get_execution_environment()
+        
+        # Load existing data
+        update_data = load_ytdlp_update_status()
+        
+        # Update the data for current environment
+        if env not in update_data["ytdlp_updates"]:
+            update_data["ytdlp_updates"][env] = {}
+        
+        update_data["ytdlp_updates"][env].update({
+            "last_updated_version": updated_version,
+            "last_update_timestamp": time.time()
+        })
+        
+        # Save the updated data
+        save_ytdlp_update_status(update_data)
+        
+        logging.info(f"Recorded successful yt-dlp update to {updated_version} in {env} mode")
+        
+    except Exception as e:
+        logging.error(f"Could not record yt-dlp update success: {e}")
+
+
+def record_ytdlp_bundled_check():
+    """ Record that we checked/informed about bundled yt-dlp """
+    try:
+        import time
+        
+        # Get current environment  
+        env = get_execution_environment()
+        
+        # Load existing data
+        update_data = load_ytdlp_update_status()
+        
+        # Update the data for current environment
+        if env not in update_data["ytdlp_updates"]:
+            update_data["ytdlp_updates"][env] = {}
+        
+        update_data["ytdlp_updates"][env]["last_bundled_check_timestamp"] = time.time()
+        
+        # Save the updated data
+        save_ytdlp_update_status(update_data)
+        
+        logging.info(f"Recorded bundled yt-dlp check in {env} mode")
+        
+    except Exception as e:
+        logging.error(f"Could not record bundled yt-dlp check: {e}")
+
+
+def get_window_stays_on_top_flag():
+    """ Get WindowStaysOnTopHint flag with PyQt6 version compatibility """
+    try:
+        # Try newer PyQt6 style
+        return Qt.WindowType.WindowStaysOnTopHint
+    except AttributeError:
+        try:
+            # Try original style  
+            return Qt.WindowFlag.WindowStaysOnTopHint
+        except AttributeError:
+            try:
+                # Try direct access
+                return Qt.WindowStaysOnTopHint
+            except AttributeError:
+                try:
+                    # Try explicit import
+                    from PyQt6.QtCore import Qt as QtCore
+                    return QtCore.WindowStaysOnTopHint
+                except (AttributeError, ImportError):
+                    # Fallback - return None to skip the flag
+                    logging.warning("Could not find WindowStaysOnTopHint flag, dialogs won't stay on top")
+                    return None
+
+
 # --- Setup Logging ---
 # Create a dedicated logs directory
-log_dir = os.path.join(os.getcwd(), "logs")
+log_dir = os.path.join(get_app_directory(), "logs")
 os.makedirs(log_dir, exist_ok=True)
 log_file = os.path.join(log_dir, "debug_log.txt")
 
@@ -117,6 +527,136 @@ class YouTubeDownloader(QThread):
         self.stop_requested = True
 
 
+class YtDlpUpdateWorker(QThread):
+    """Thread worker for updating yt-dlp without blocking the main UI"""
+    finished = pyqtSignal(bool, str)  # success, message
+    progress = pyqtSignal(str)  # progress message
+    
+    def __init__(self, update_command, environment):
+        super().__init__()
+        self.update_command = update_command
+        self.environment = environment
+        self.stop_requested = False
+        
+    def run(self):
+        try:
+            logging.info(f"Starting yt-dlp update with command: {' '.join(self.update_command)}")
+            self.progress.emit("Initializing update...")
+            
+            if self.stop_requested:
+                self.finished.emit(False, "Update cancelled by user")
+                return
+            
+            self.progress.emit("Downloading latest yt-dlp version...")
+            
+            # Run the update command with timeout protection
+            result = subprocess.run(
+                self.update_command, 
+                capture_output=True, 
+                text=True, 
+                timeout=60  # 60 second timeout
+            )
+            
+            if self.stop_requested:
+                self.finished.emit(False, "Update cancelled by user")
+                return
+            
+            if result.returncode == 0:
+                success_msg = "yt-dlp has been updated successfully!\nThe new version will be used for future downloads."
+                if self.environment == "exe_with_python":
+                    success_msg += "\n\nNote: The update was applied to your system Python installation."
+                
+                logging.info("yt-dlp updated successfully via thread")
+                self.finished.emit(True, success_msg)
+            else:
+                error_msg = f"Failed to update yt-dlp:\n{result.stderr or result.stdout}"
+                if self.environment == "exe_with_python":
+                    error_msg += "\n\nTry running the update command as administrator or check your Python installation."
+                
+                logging.error(f"yt-dlp update failed via thread: {result.stderr}")
+                self.finished.emit(False, error_msg)
+                
+        except subprocess.TimeoutExpired:
+            logging.warning("yt-dlp update timed out via thread")
+            self.finished.emit(False, "yt-dlp update timed out. Please try again later.\nThis may happen if you have a slow internet connection.")
+        except Exception as e:
+            logging.error(f"yt-dlp update error via thread: {e}")
+            self.finished.emit(False, f"An error occurred while updating yt-dlp:\n{str(e)}")
+    
+    def stop(self):
+        """Request the update to stop"""
+        self.stop_requested = True
+
+
+class UpdateProgressDialog(QDialog):
+    """Progress dialog for yt-dlp updates with cancellation support"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Updating yt-dlp")
+        self.setModal(True)
+        self.setMinimumSize(400, 150)
+        
+        # Make dialog stay on top during update
+        stay_on_top_flag = get_window_stays_on_top_flag()
+        if stay_on_top_flag is not None:
+            try:
+                self.setWindowFlags(self.windowFlags() | stay_on_top_flag)
+            except Exception as e:
+                logging.warning(f"Could not set always-on-top flag for UpdateProgressDialog: {e}")
+        
+        self.setup_ui()
+        self.activateWindow()
+        self.raise_()
+        
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # Status label
+        self.status_label = QLabel("Preparing to update yt-dlp...", self)
+        layout.addWidget(self.status_label)
+        
+        # Progress bar (indeterminate for now)
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setRange(0, 0)  # Indeterminate progress
+        layout.addWidget(self.progress_bar)
+        
+        # Cancel button
+        self.cancel_button = QPushButton("Cancel", self)
+        self.cancel_button.clicked.connect(self.reject)
+        layout.addWidget(self.cancel_button)
+        
+        # Center the cancel button
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        button_layout.addWidget(self.cancel_button)
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
+    
+    def update_progress(self, message):
+        """Update the progress message"""
+        self.status_label.setText(message)
+        # Process events to ensure UI updates
+        from PyQt6.QtCore import QCoreApplication
+        QCoreApplication.processEvents()
+    
+    def set_completion_state(self, success, message=None):
+        """Set dialog state when update completes"""
+        if success:
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(1)
+            self.status_label.setText("Update completed successfully!")
+            self.cancel_button.setText("Close")
+        else:
+            self.progress_bar.setRange(0, 1)
+            self.progress_bar.setValue(0)
+            if message:
+                self.status_label.setText(f"Update failed: {message}")
+            else:
+                self.status_label.setText("Update failed")
+            self.cancel_button.setText("Close")
+
+
 class DownloadManager(QDialog):
     download_progress = pyqtSignal(int, int, str)
     extraction_progress = pyqtSignal(int, int, str)
@@ -136,6 +676,16 @@ class DownloadManager(QDialog):
 
         self.setWindowTitle("Setup Progress")
         self.setModal(True)
+        
+        # Make dialog stay on top during setup
+        stay_on_top_flag = get_window_stays_on_top_flag()
+        if stay_on_top_flag is not None:
+            try:
+                self.setWindowFlags(self.windowFlags() | stay_on_top_flag)
+            except Exception as e:
+                logging.warning(f"Could not set always-on-top flag for DownloadManager: {e}")
+        self.activateWindow()
+        self.raise_()
         layout = QVBoxLayout(self)
         self.status_label = QLabel(f"Downloading from: {self.url}", self)
         layout.addWidget(self.status_label)
@@ -334,14 +884,23 @@ class WhisperGUI(QMainWindow):
         self.downloader = None
         self.stop_requested = False
         self.output_format_checkboxes = {}
-        self.settings_file = "settings.json"
+        
+        # Use portable settings location (same directory as exe/source)
+        portable_dir = get_portable_settings_directory()
+        self.settings_file = os.path.join(portable_dir, "settings.json")
+        self.old_roaming_settings_file = os.path.join(get_settings_directory(), "settings.json")  # For migration FROM roaming
         self.settings = {}
+        
+        # yt-dlp update tracking to prevent multiple checks
+        self.yt_dlp_update_checked = False
+        self.yt_dlp_update_in_progress = False
+        self.yt_dlp_update_session_complete = False
         
         self.executable_path = None
         self.executable_name = None
-        # Use script directory instead of current working directory
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        self.bin_dir = os.path.join(script_dir, "bin")
+        # Use application directory for persistent bin folder location
+        app_dir = get_app_directory()
+        self.bin_dir = os.path.join(app_dir, "bin")
         
         self.output_buffer = ""
         self.last_line_was_overwrite = False
@@ -355,8 +914,9 @@ class WhisperGUI(QMainWindow):
         self.load_settings()
         self.setup_realtime_saving()
         
-        # Check yt-dlp version after UI is ready
-        QTimer.singleShot(1000, self.check_yt_dlp_version)
+        # Check yt-dlp version after UI is ready (only if not already checked this session)
+        if not self.yt_dlp_update_checked:
+            QTimer.singleShot(1000, self.check_yt_dlp_version)
 
     def check_and_setup_dependencies(self):
         if sys.platform == "win32":
@@ -368,7 +928,7 @@ class WhisperGUI(QMainWindow):
             url = "https://github.com/Purfview/whisper-standalone-win/releases/download/Faster-Whisper-XXL/Faster-Whisper-XXL_r245.4_linux.7z"
             self.files_to_check = [self.executable_name, "ffmpeg"]
         else:
-            QMessageBox.critical(self, "Unsupported OS", f"Your OS '{sys.platform}' is not supported.")
+            show_setup_critical(self, "Unsupported OS", f"Your OS '{sys.platform}' is not supported.")
             return False
 
         local_executable_path = os.path.join(self.bin_dir, self.executable_name)
@@ -385,7 +945,7 @@ class WhisperGUI(QMainWindow):
             logging.info(f"Found executable in system PATH: {path_in_system}")
             return True
 
-        reply = QMessageBox.question(self, "Download Required Files?",
+        reply = show_setup_question(self, "Download Required Files?",
                                 f"The core components (e.g., '{self.executable_name}') were not found in the 'bin' directory or system PATH.\n\n"
                                 "Would you like to download and set them up automatically? (Approx. 1.4 GB)\n\n"
                                 "This is a one-time setup.",
@@ -393,7 +953,7 @@ class WhisperGUI(QMainWindow):
                                 QMessageBox.StandardButton.Yes)
         
         if reply == QMessageBox.StandardButton.No:
-            QMessageBox.warning(self, "Setup Incomplete", "Application cannot run without the required files.")
+            show_setup_warning(self, "Setup Incomplete", "Application cannot run without the required files.")
             return False
 
         self.download_manager = DownloadManager(url, self.files_to_check, self.bin_dir, self)
@@ -401,12 +961,12 @@ class WhisperGUI(QMainWindow):
             self.executable_path = os.path.abspath(local_executable_path)
             if sys.platform != "win32" and os.path.exists(self.executable_path):
                 os.chmod(self.executable_path, 0o755)
-            QMessageBox.information(self, "Setup Complete", f"Dependencies have been installed to the '{self.bin_dir}' folder.")
+            show_setup_information(self, "Setup Complete", f"Dependencies have been installed to the '{self.bin_dir}' folder.")
             return True
         else:
             error_message = self.download_manager.error_string or "Download or extraction was cancelled or failed."
             detailed_error = f"Failed to set up dependencies: {error_message}\n\nCheck 'logs/debug_log.txt' for details."
-            QMessageBox.critical(self, "Setup Failed", detailed_error)
+            show_setup_critical(self, "Setup Failed", detailed_error)
             return False
 
     def init_ui(self):
@@ -718,13 +1278,47 @@ class WhisperGUI(QMainWindow):
             return "dark"  # Default fallback
 
     def check_yt_dlp_version(self):
-        """Check if yt-dlp needs updating and prompt user"""
+        """Check if yt-dlp needs updating and prompt user (with persistent tracking)"""
+        # Skip if update is already in progress
+        if self.yt_dlp_update_in_progress:
+            logging.info("yt-dlp update in progress, skipping version check")
+            return
+        
+        # Use persistent tracking to determine if we should check
+        if not should_check_ytdlp_update():
+            return
+        
+        # Mark as checked for this session to prevent multiple checks
+        self.yt_dlp_update_checked = True
+        
         try:
-            import yt_dlp
+            # Get current installation info
+            install_info = get_ytdlp_installation_info()
+            current_version = install_info["version"]
+            installation_type = install_info["installation_type"]
+            env = install_info["environment"]
             
-            # Get current version
-            current_version = yt_dlp.version.__version__
-            logging.info(f"Current yt-dlp version: {current_version}")
+            if not current_version:
+                logging.error("yt-dlp not found")
+                return
+            
+            logging.info(f"Current yt-dlp version: {current_version}, type: {installation_type}, env: {env}")
+            
+            # Check environment capabilities
+            can_update = can_update_yt_dlp()
+            
+            # Handle bundled installations specially
+            if installation_type == "bundled":
+                info_msg = f"Your yt-dlp version ({current_version}) is bundled with this application.\n\n"
+                info_msg += "System updates won't affect the bundled version.\n\n"
+                info_msg += "To get the latest yt-dlp features:\n"
+                info_msg += "• Download a newer version of this application\n"
+                info_msg += "• Or install Python and yt-dlp separately for auto-updates"
+                
+                show_setup_information(self, "yt-dlp Update Info", info_msg)
+                record_ytdlp_bundled_check()  # Record that we informed the user
+                self.yt_dlp_update_session_complete = True
+                return
             
             # Check for latest version (with timeout to avoid blocking)
             try:
@@ -734,72 +1328,173 @@ class WhisperGUI(QMainWindow):
                     latest_version = latest_data["tag_name"]
                     
                     if current_version != latest_version:
-                        reply = QMessageBox.question(
-                            self, "yt-dlp Update Available",
-                            f"Your yt-dlp version ({current_version}) is outdated.\n"
-                            f"Latest version is {latest_version}.\n\n"
-                            "Would you like to update it now?\n"
-                            "(This may fix 403 unauthorized errors for video downloads)",
-                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                            QMessageBox.StandardButton.Yes
-                        )
-                        
-                        if reply == QMessageBox.StandardButton.Yes:
-                            self.update_yt_dlp()
+                        if can_update:
+                            # Standard update prompt for environments that support updates
+                            update_msg = f"Your yt-dlp version ({current_version}) is outdated.\n"
+                            update_msg += f"Latest version is {latest_version}.\n\n"
+                            update_msg += "Would you like to update it now?\n"
+                            update_msg += "(This may fix 403 unauthorized errors for video downloads)"
+                            
+                            if env == "exe_with_python":
+                                update_msg += "\n\nNote: Update will use your system Python installation."
+                            
+                            reply = show_setup_question(
+                                self, "yt-dlp Update Available",
+                                update_msg,
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                QMessageBox.StandardButton.Yes
+                            )
+                            
+                            if reply == QMessageBox.StandardButton.Yes:
+                                self.update_yt_dlp()
+                            else:
+                                # User declined, record this version was offered
+                                record_ytdlp_update_success(current_version)
+                                self.yt_dlp_update_session_complete = True
+                        else:
+                            # Inform exe users without Python about the update
+                            info_msg = f"A new yt-dlp version ({latest_version}) is available.\n"
+                            info_msg += f"Your current version is {current_version}.\n\n"
+                            info_msg += "Since you're using the standalone version without Python, "
+                            info_msg += "automatic updates are not available.\n\n"
+                            info_msg += "To get the latest yt-dlp version:\n"
+                            info_msg += "• Install Python to enable automatic updates\n"
+                            info_msg += "• Or download a newer version of this application"
+                            
+                            show_setup_information(self, "yt-dlp Update Available", info_msg)
+                            record_ytdlp_bundled_check()  # Record that we informed the user
+                            self.yt_dlp_update_session_complete = True
                     else:
                         logging.info("yt-dlp is up to date")
+                        # Record successful check with current version
+                        record_ytdlp_update_success(current_version)
+                        self.yt_dlp_update_session_complete = True
                 else:
                     logging.warning("Could not check for yt-dlp updates")
             except requests.RequestException as e:
                 logging.warning(f"Failed to check yt-dlp version: {e}")
                 
-        except ImportError:
-            logging.error("yt-dlp not found")
         except Exception as e:
             logging.error(f"Error checking yt-dlp version: {e}")
 
     def update_yt_dlp(self):
-        """Update yt-dlp using pip"""
+        """Update yt-dlp using threaded non-blocking approach"""
+        # Prevent multiple simultaneous updates
+        if self.yt_dlp_update_in_progress:
+            logging.info("yt-dlp update already in progress, ignoring request")
+            return
+        
+        self.yt_dlp_update_in_progress = True
+        
         try:
-            # Show progress dialog
-            progress = QMessageBox(self)
-            progress.setWindowTitle("Updating yt-dlp")
-            progress.setText("Updating yt-dlp, please wait...")
-            progress.setStandardButtons(QMessageBox.StandardButton.NoButton)
-            progress.show()
+            # Check if update is possible in current environment
+            if not can_update_yt_dlp():
+                # Show helpful information for exe users without Python
+                show_yt_dlp_unavailable(self)
+                return
             
-            # Process events to show the dialog
-            from PyQt6.QtCore import QCoreApplication
-            QCoreApplication.processEvents()
+            # Get the appropriate update command
+            update_command = get_update_command()
+            if not update_command:
+                show_setup_critical(self, "Update Error", 
+                                  "Could not determine how to update yt-dlp in your environment.")
+                return
             
-            # Update yt-dlp
-            result = subprocess.run([
-                sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"
-            ], capture_output=True, text=True, timeout=60)
+            # Determine environment for user feedback
+            env = get_execution_environment()
             
-            progress.close()
+            # Create the progress dialog
+            self.update_progress_dialog = UpdateProgressDialog(self)
             
-            if result.returncode == 0:
-                QMessageBox.information(
-                    self, "Update Successful", 
-                    "yt-dlp has been updated successfully!\n"
-                    "The new version will be used for future downloads."
-                )
-                logging.info("yt-dlp updated successfully")
-            else:
-                QMessageBox.warning(
-                    self, "Update Failed",
-                    f"Failed to update yt-dlp:\n{result.stderr or result.stdout}"
-                )
-                logging.error(f"yt-dlp update failed: {result.stderr}")
-                
-        except subprocess.TimeoutExpired:
-            progress.close()
-            QMessageBox.warning(self, "Update Timeout", "yt-dlp update timed out. Please try again later.")
+            # Create and configure the worker thread
+            self.update_worker = YtDlpUpdateWorker(update_command, env)
+            
+            # Connect signals
+            self.update_worker.progress.connect(self.update_progress_dialog.update_progress)
+            self.update_worker.finished.connect(self.on_update_finished)
+            
+            # Connect dialog rejection (cancel) to worker stop
+            self.update_progress_dialog.rejected.connect(self.cancel_update)
+            
+            # Show the dialog and start the worker
+            self.update_progress_dialog.show()
+            self.update_worker.start()
+            
         except Exception as e:
-            progress.close()
-            QMessageBox.critical(self, "Update Error", f"An error occurred while updating yt-dlp:\n{str(e)}")
-            logging.error(f"yt-dlp update error: {e}")
+            logging.error(f"Error starting yt-dlp update: {e}")
+            show_setup_critical(self, "Update Error", 
+                              f"An error occurred while starting the yt-dlp update:\n{str(e)}")
+            self.yt_dlp_update_in_progress = False
+    
+    def cancel_update(self):
+        """Cancel the ongoing yt-dlp update"""
+        if hasattr(self, 'update_worker') and self.update_worker.isRunning():
+            logging.info("User cancelled yt-dlp update")
+            self.update_worker.stop()
+            # Wait a short time for the worker to finish
+            if not self.update_worker.wait(2000):  # 2 second timeout
+                self.update_worker.terminate()
+                self.update_worker.wait()
+        
+        self.cleanup_update_resources()
+    
+    def on_update_finished(self, success, message):
+        """Handle completion of yt-dlp update"""
+        try:
+            if hasattr(self, 'update_progress_dialog'):
+                self.update_progress_dialog.set_completion_state(success, message if not success else None)
+                
+                # Auto-close dialog after a brief delay for successful updates
+                if success:
+                    QTimer.singleShot(1500, self.update_progress_dialog.accept)
+            
+            if success:
+                show_setup_information(self, "Update Successful", message)
+                logging.info("yt-dlp updated successfully via threaded approach")
+                
+                # Record the successful update in persistent storage
+                try:
+                    # Get the new version after update
+                    import yt_dlp
+                    updated_version = yt_dlp.version.__version__
+                    record_ytdlp_update_success(updated_version)
+                    logging.info(f"Recorded successful yt-dlp update to version {updated_version}")
+                except Exception as e:
+                    logging.warning(f"Could not record update success: {e}")
+                
+                # Mark session as complete to prevent any future update checks
+                self.yt_dlp_update_session_complete = True
+                logging.info("yt-dlp update session marked as complete - no more checks this session")
+            else:
+                show_setup_warning(self, "Update Failed", message)
+                logging.error(f"yt-dlp update failed via threaded approach: {message}")
+                
+        except Exception as e:
+            logging.error(f"Error handling update completion: {e}")
+        finally:
+            self.cleanup_update_resources()
+    
+    def cleanup_update_resources(self):
+        """Clean up update-related resources"""
+        try:
+            # Clean up worker thread
+            if hasattr(self, 'update_worker'):
+                if self.update_worker.isRunning():
+                    self.update_worker.stop()
+                    self.update_worker.wait(1000)
+                self.update_worker.deleteLater()
+                delattr(self, 'update_worker')
+            
+            # Clean up progress dialog
+            if hasattr(self, 'update_progress_dialog'):
+                self.update_progress_dialog.deleteLater()
+                delattr(self, 'update_progress_dialog')
+                
+        except Exception as e:
+            logging.warning(f"Error cleaning up update resources: {e}")
+        finally:
+            # Always reset the update flag
+            self.yt_dlp_update_in_progress = False
 
     def setup_realtime_saving(self):
         """Connect UI elements to save settings in real-time"""
@@ -893,7 +1588,7 @@ class WhisperGUI(QMainWindow):
     def get_output_dir(self):
         dir_path = self.output_dir.text()
         if not dir_path:
-            dir_path = os.path.join(os.getcwd(), "output")
+            dir_path = os.path.join(get_app_directory(), "output")
         os.makedirs(dir_path, exist_ok=True)
         return dir_path
 
@@ -933,7 +1628,7 @@ class WhisperGUI(QMainWindow):
         checkboxes = {
             "--word_timestamps": self.word_timestamps, "--without_timestamps": self.without_timestamps,
             "--verbose": self.verbose, "--print_progress": self.print_progress, "--highlight_words": self.highlight_words,
-            "--vad_filter": self.vad_filter, "--ff_mp3": self.ff_mp3, "--ff_loudnorm": self.ff_loudnorm,
+            "--ff_mp3": self.ff_mp3, "--ff_loudnorm": self.ff_loudnorm,
             "--ff_speechnorm": self.ff_speechnorm,
         }
         for option, checkbox in checkboxes.items():
@@ -1218,9 +1913,26 @@ class WhisperGUI(QMainWindow):
 
     def load_settings(self):
         try:
+            # Check if portable settings file exists
             if os.path.exists(self.settings_file):
                 with open(self.settings_file, "r") as f:
                     self.settings = json.load(f)
+            # Check if roaming settings file exists and migrate it back to portable
+            elif os.path.exists(self.old_roaming_settings_file):
+                logging.info("Migrating settings from roaming folder back to portable location")
+                with open(self.old_roaming_settings_file, "r") as f:
+                    self.settings = json.load(f)
+                # Save to portable location
+                self.save_settings_to_file()
+                logging.info("Settings migrated back to portable location")
+            # Check for original settings.json in current directory  
+            elif os.path.exists("settings.json"):
+                logging.info("Found original settings.json, keeping in portable location")
+                with open("settings.json", "r") as f:
+                    self.settings = json.load(f)
+                # Save to portable location if not already there
+                if not os.path.samefile("settings.json", self.settings_file):
+                    self.save_settings_to_file()
             else:
                 self.settings = {}
         except (FileNotFoundError, json.JSONDecodeError) as e:
