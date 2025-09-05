@@ -1,6 +1,7 @@
 import sys
 import os
 import json
+import re
 import platform
 import shutil
 import requests
@@ -14,8 +15,8 @@ from PyQt6.QtWidgets import (QProgressBar, QGridLayout, QDialog, QSplitter, QWid
                              QGroupBox, QFormLayout, QLineEdit, QPushButton, QCheckBox, 
                              QTextEdit, QDoubleSpinBox, QSpinBox, QScrollArea, QMessageBox, 
                              QProgressDialog, QApplication, QMainWindow, QFileDialog, QCompleter)
-from PyQt6.QtCore import pyqtSignal, QThread, Qt, QTimer, QProcess, QByteArray
-from PyQt6.QtGui import QIcon, QPalette, QColor, QTextCursor, QFont
+from PyQt6.QtCore import pyqtSignal, QThread, Qt, QTimer, QProcess, QByteArray, QUrl
+from PyQt6.QtGui import QIcon, QPalette, QColor, QTextCursor, QFont, QDragEnterEvent, QDropEvent
 import yt_dlp
 
 
@@ -430,16 +431,11 @@ def get_window_stays_on_top_flag():
 
 # --- Setup Logging ---
 # Create a dedicated logs directory
-log_dir = os.path.join(get_app_directory(), "logs")
-os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, "debug_log.txt")
-
 logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s - %(levelname)s - %(module)s - %(message)s",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler(log_file, mode='w', encoding='utf-8'),
-        logging.StreamHandler() # Also print to console
+        logging.StreamHandler() # Only print to console
     ]
 )
 
@@ -1796,6 +1792,40 @@ class HardwareOptimizationDialog(QDialog):
         show_setup_information(self, "GPU Detection Details", details_text)
 
 
+class FileDropLineEdit(QLineEdit):
+    """Custom QLineEdit that accepts audio/video file drops"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+    
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        """Handle drag enter events - accept audio/video files"""
+        if event.mimeData().hasUrls():
+            urls = event.mimeData().urls()
+            if urls and len(urls) == 1:
+                file_path = urls[0].toLocalFile()
+                # Check if it's a supported audio/video file
+                supported_extensions = ('.mp3', '.wav', '.mp4', '.m4a', '.flac', '.aac', '.ogg', '.webm', '.mkv', '.avi', '.mov')
+                if file_path.lower().endswith(supported_extensions):
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+    
+    def dropEvent(self, event: QDropEvent):
+        """Handle file drop events - set dropped file path"""
+        if event.mimeData().hasUrls():
+            urls = event.mimeData().urls()
+            if urls and len(urls) == 1:
+                file_path = urls[0].toLocalFile()
+                supported_extensions = ('.mp3', '.wav', '.mp4', '.m4a', '.flac', '.aac', '.ogg', '.webm', '.mkv', '.avi', '.mov')
+                if file_path.lower().endswith(supported_extensions):
+                    self.setText(file_path)
+                    event.acceptProposedAction()
+                    return
+        event.ignore()
+
+
 class WhisperGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1887,7 +1917,7 @@ class WhisperGUI(QMainWindow):
             return True
         else:
             error_message = self.download_manager.error_string or "Download or extraction was cancelled or failed."
-            detailed_error = f"Failed to set up dependencies: {error_message}\n\nCheck 'logs/debug_log.txt' for details."
+            detailed_error = f"Failed to set up dependencies: {error_message}"
             show_setup_critical(self, "Setup Failed", detailed_error)
             return False
 
@@ -1964,7 +1994,7 @@ class WhisperGUI(QMainWindow):
     def setup_file_tab(self, tab):
         layout = QFormLayout(tab)
         file_input_layout = QHBoxLayout()
-        self.file_path = QLineEdit()
+        self.file_path = FileDropLineEdit()
         self.file_path.setPlaceholderText("Select or drop an audio/video file...")
         self.browse_btn = QPushButton("Browse")
         self.browse_btn.clicked.connect(self.browse_file)
@@ -2020,7 +2050,7 @@ class WhisperGUI(QMainWindow):
         grid_layout = QGridLayout()
         grid_layout.setHorizontalSpacing(40)
         grid_layout.setVerticalSpacing(10)
-        formats = ['json', 'vtt', 'srt', 'lrc', 'txt', 'tsv', 'all']
+        formats = ['json', 'vtt', 'srt', 'lrc', 'txt (with timestamps)', 'txt (sentences only)', 'tsv', 'all']
         num_rows = 4
         for i, fmt in enumerate(formats):
             checkbox = QCheckBox(fmt)
@@ -2778,7 +2808,22 @@ class WhisperGUI(QMainWindow):
             if checkbox.isChecked():
                 cmd.append(option)
         
-        selected_formats = [fmt for fmt, cb in self.output_format_checkboxes.items() if fmt != 'all' and cb.isChecked()]
+        # Map UI format names to command format names and track txt format requests
+        selected_formats = []
+        self.txt_with_timestamps_requested = False
+        self.sentences_only_requested = False
+        
+        for fmt, cb in self.output_format_checkboxes.items():
+            if fmt != 'all' and cb.isChecked():
+                if fmt == 'txt (with timestamps)':
+                    selected_formats.append('txt')
+                    self.txt_with_timestamps_requested = True
+                elif fmt == 'txt (sentences only)':
+                    selected_formats.append('txt')  # Still need txt for processing
+                    self.sentences_only_requested = True
+                else:
+                    selected_formats.append(fmt)
+        
         if not selected_formats and not self.output_format_checkboxes['all'].isChecked():
             selected_formats = ['srt']
         elif self.output_format_checkboxes['all'].isChecked():
@@ -2804,6 +2849,9 @@ class WhisperGUI(QMainWindow):
         if not input_file:
             QMessageBox.warning(self, "Warning", "Please select an input file in the 'File' tab.")
             return
+
+        # Store input file path for post-processing
+        self.current_input_file = input_file
 
         command = self.build_command(input_file)
         if not command: return
@@ -2899,6 +2947,75 @@ class WhisperGUI(QMainWindow):
         
         self.output_text.ensureCursorVisible()
 
+
+    def create_sentences_only_file(self, txt_with_timestamps, sentences_only_path):
+        """Helper method to create sentences-only file from timestamped txt"""
+        try:
+            # Check if timestamped txt file exists
+            if not os.path.exists(txt_with_timestamps):
+                self._append_text_to_console(f"Warning: Timestamped txt file not found at {txt_with_timestamps}\n")
+                return False
+            
+            # Read timestamped content
+            with open(txt_with_timestamps, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            if not content.strip():
+                self._append_text_to_console(f"Warning: Timestamped txt file is empty\n")
+                return False
+            
+            # Extract sentences using regex
+            pattern = r'\[[\d:.\->\s]+\]\s*(.*)'
+            matches = re.findall(pattern, content)
+            
+            if not matches:
+                self._append_text_to_console(f"Warning: No timestamped content found in txt file\n")
+                return False
+            
+            # Join sentences with spaces
+            sentences_text = ' '.join(match.strip() for match in matches if match.strip())
+            
+            if not sentences_text:
+                self._append_text_to_console(f"Warning: No valid sentences extracted from txt file\n")
+                return False
+            
+            # Write sentences-only file
+            with open(sentences_only_path, 'w', encoding='utf-8') as f:
+                f.write(sentences_text)
+            
+            return True
+            
+        except Exception as e:
+            self._append_text_to_console(f"Error creating sentences-only txt file: {str(e)}\n")
+            return False
+
+    def handle_txt_format_selection(self, input_file_path):
+        """Handle txt format files based on user selection"""
+        try:
+            output_dir = self.get_output_dir()
+            filename_only = os.path.splitext(os.path.basename(input_file_path))[0]
+            txt_with_timestamps = os.path.join(output_dir, filename_only + '.txt')
+            sentences_only_path = os.path.join(output_dir, filename_only + '_sentences.txt')
+            
+            # Determine what the user actually wanted
+            wants_timestamps = getattr(self, 'txt_with_timestamps_requested', False)
+            wants_sentences = getattr(self, 'sentences_only_requested', False)
+            
+            # Create sentences-only file if requested
+            if wants_sentences:
+                success = self.create_sentences_only_file(txt_with_timestamps, sentences_only_path)
+                if success:
+                    self._append_text_to_console(f"Created sentences-only txt file: {sentences_only_path}\n")
+            
+            # Clean up files based on user selection
+            if wants_sentences and not wants_timestamps:
+                # User only wants sentences-only → delete timestamped file
+                if os.path.exists(txt_with_timestamps):
+                    os.remove(txt_with_timestamps)
+            
+        except Exception as e:
+            self._append_text_to_console(f"Error handling txt format selection: {str(e)}\n")
+
     def on_finished(self, exit_code, exit_status):
         logging.info(f"QProcess finished. Exit Code: {exit_code}, Exit Status: {exit_status}")
         
@@ -2915,6 +3032,12 @@ class WhisperGUI(QMainWindow):
         elif exit_code == 0 or self.transcription_completed_successfully:
             # Consider it successful if exit code is 0 OR we detected success indicators
             self._append_text_to_console("Process completed successfully.\n")
+            
+            # Handle txt format post-processing based on user selection
+            if ((hasattr(self, 'sentences_only_requested') and self.sentences_only_requested) or
+                (hasattr(self, 'txt_with_timestamps_requested') and self.txt_with_timestamps_requested)) and \
+               hasattr(self, 'current_input_file') and self.current_input_file:
+                self.handle_txt_format_selection(self.current_input_file)
         else:
             status_str = "Crashed" if exit_status == QProcess.ExitStatus.CrashExit else "Failed"
             self._append_text_to_console(f"Process {status_str} with exit code {exit_code}.\n")
