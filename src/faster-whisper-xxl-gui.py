@@ -2120,21 +2120,6 @@ class WhisperGUI(QMainWindow):
         self.initial_prompt = QTextEdit()
         self.initial_prompt.setMaximumHeight(80)
         scroll_layout.addRow("Initial Prompt:", self.initial_prompt)
-        self.word_timestamps = QCheckBox("Word Timestamps")
-        self.word_timestamps.setObjectName("word_timestamps_checkbox")
-        scroll_layout.addRow(self.word_timestamps)
-        self.without_timestamps = QCheckBox("Without Timestamps")
-        self.without_timestamps.setObjectName("without_timestamps_checkbox")
-        scroll_layout.addRow(self.without_timestamps)
-        self.verbose = QCheckBox("Verbose")
-        self.verbose.setObjectName("verbose_checkbox")
-        scroll_layout.addRow(self.verbose)
-        self.print_progress = QCheckBox("Print Progress")
-        self.print_progress.setObjectName("print_progress_checkbox")
-        scroll_layout.addRow(self.print_progress)
-        self.highlight_words = QCheckBox("Highlight Words")
-        self.highlight_words.setObjectName("highlight_words_checkbox")
-        scroll_layout.addRow(self.highlight_words)
         scroll.setWidget(scroll_widget)
         scroll.setWidgetResizable(True)
         layout = QVBoxLayout(tab)
@@ -2163,24 +2148,6 @@ class WhisperGUI(QMainWindow):
         self.ff_mp3 = QCheckBox("Convert to MP3")
         self.ff_mp3.setObjectName("ff_mp3_checkbox")
         layout.addRow(self.ff_mp3)
-        self.ff_loudnorm = QCheckBox("Loudness Normalization")
-        self.ff_loudnorm.setObjectName("ff_loudnorm_checkbox")
-        layout.addRow(self.ff_loudnorm)
-        self.ff_speechnorm = QCheckBox("Speech Normalization")
-        self.ff_speechnorm.setObjectName("ff_speechnorm_checkbox")
-        layout.addRow(self.ff_speechnorm)
-        self.ff_tempo = QDoubleSpinBox()
-        self.ff_tempo.setRange(0.5, 2.0)
-        self.ff_tempo.setSingleStep(0.1)
-        self.ff_tempo.setDecimals(1)
-        self.ff_tempo.setEnabled(False)
-        self.tempo_checkbox = QCheckBox("Adjust Tempo")
-        self.tempo_checkbox.setObjectName("tempo_checkbox")
-        self.tempo_checkbox.toggled.connect(self.ff_tempo.setEnabled)
-        tempo_layout = QHBoxLayout()
-        tempo_layout.addWidget(self.tempo_checkbox)
-        tempo_layout.addWidget(self.ff_tempo)
-        layout.addRow("Tempo:", tempo_layout)
 
     def apply_theme(self, theme_name):
         self.settings["theme"] = theme_name.lower()
@@ -2686,7 +2653,6 @@ class WhisperGUI(QMainWindow):
         self.patience.valueChanged.connect(self.save_spinbox_setting)
         self.vad_threshold.valueChanged.connect(self.save_spinbox_setting)
         self.vad_min_speech.valueChanged.connect(self.save_spinbox_setting)
-        self.ff_tempo.valueChanged.connect(self.save_spinbox_setting)
         
         # Connect text fields
         self.output_dir.textChanged.connect(self.save_text_setting)
@@ -2722,7 +2688,6 @@ class WhisperGUI(QMainWindow):
         self.settings["patience"] = self.patience.value()
         self.settings["vad_threshold"] = self.vad_threshold.value()
         self.settings["vad_min_speech"] = self.vad_min_speech.value()
-        self.settings["ff_tempo"] = self.ff_tempo.value()
         self.save_settings_to_file()
 
     def save_text_setting(self):
@@ -2792,17 +2757,14 @@ class WhisperGUI(QMainWindow):
             "--vad_method": self.vad_method.currentText() if self.vad_filter.isChecked() else None,
             "--vad_threshold": str(self.vad_threshold.value()) if self.vad_filter.isChecked() else None,
             "--vad_min_speech_duration_ms": str(self.vad_min_speech.value()) if self.vad_filter.isChecked() else None,
-            "--ff_tempo": str(self.ff_tempo.value()) if self.tempo_checkbox.isChecked() else None,
         }
         for option, value in options.items():
             if value is not None:
                 cmd.extend([option, value])
-        
+
+        # Handle other checkboxes that don't need argument values
         checkboxes = {
-            "--word_timestamps": self.word_timestamps, "--without_timestamps": self.without_timestamps,
-            "--verbose": self.verbose, "--print_progress": self.print_progress, "--highlight_words": self.highlight_words,
-            "--ff_mp3": self.ff_mp3, "--ff_loudnorm": self.ff_loudnorm,
-            "--ff_speechnorm": self.ff_speechnorm,
+            "--ff_mp3": self.ff_mp3,
         }
         for option, checkbox in checkboxes.items():
             if checkbox.isChecked():
@@ -2894,6 +2856,30 @@ class WhisperGUI(QMainWindow):
                 self._append_text_to_console("Process did not terminate gracefully, killing it.\n")
                 self.process.kill()
 
+
+    def _filter_verbose_output(self, data):
+        """Filter verbose output to show only transcription and key status lines"""
+        lines = data.split('\n')
+        filtered_lines = []
+
+        for line in lines:
+            # Show transcription lines (format: [00:00.000 --> 00:02.560] text)
+            if re.match(r'^\[\d+:\d+\.\d+ --> \d+:\d+\.\d+\]', line):
+                filtered_lines.append(line)
+            # Show key status messages
+            elif any(keyword in line for keyword in [
+                'Standalone Faster-Whisper-XXL',
+                'Starting to process:',
+                'Detected language',
+                'Processing segment at',
+                'Transcription speed:',
+                'Operation finished in:',
+                'Subtitles are written to'
+            ]):
+                filtered_lines.append(line)
+            # Skip verbose technical output (ctranslate2 logs, GPU info, etc.)
+
+        return '\n'.join(filtered_lines) if filtered_lines else ''
 
     def handle_stdout(self):
         data = self.process.readAllStandardOutput().data().decode('utf-8', errors='ignore')
@@ -3167,7 +3153,6 @@ class WhisperGUI(QMainWindow):
         self.settings["vad_method"] = self.vad_method.currentText()
         self.settings["vad_threshold"] = self.vad_threshold.value()
         self.settings["vad_min_speech"] = self.vad_min_speech.value()
-        self.settings["ff_tempo"] = self.ff_tempo.value()
         
         checkbox_settings = {cb.objectName(): cb.isChecked() for cb in self.findChildren(QCheckBox) if cb.objectName()}
         self.settings["checkboxes"] = checkbox_settings
@@ -3252,7 +3237,6 @@ class WhisperGUI(QMainWindow):
         self.vad_method.setCurrentText(self.settings.get("vad_method", "silero_v4_fw"))
         self.vad_threshold.setValue(self.settings.get("vad_threshold", 0.5))
         self.vad_min_speech.setValue(self.settings.get("vad_min_speech", 250))
-        self.ff_tempo.setValue(self.settings.get("ff_tempo", 1.0))
 
         all_checkboxes = {cb.objectName(): cb for cb in self.findChildren(QCheckBox) if cb.objectName()}
         checkbox_settings = self.settings.get("checkboxes", {})
