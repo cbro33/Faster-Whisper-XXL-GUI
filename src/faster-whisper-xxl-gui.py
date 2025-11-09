@@ -229,7 +229,7 @@ def detect_faster_whisper_binary_version(executable_path):
     candidate_commands = [[executable_path, "--version"], [executable_path, "-V"]]
     for command in candidate_commands:
         try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+            result = run_hidden_subprocess(command, capture_output=True, text=True, timeout=5)
         except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired, OSError):
             continue
         if result.returncode == 0:
@@ -237,6 +237,92 @@ def detect_faster_whisper_binary_version(executable_path):
             if output:
                 return output.splitlines()[0]
     return None
+
+
+def _apply_windows_hidden_process_kwargs(kwargs):
+    if os.name != "nt":
+        return kwargs
+    kw = dict(kwargs)
+    startupinfo = kw.get("startupinfo")
+    startinfo_class = getattr(subprocess, "STARTUPINFO", None)
+    if startinfo_class and startupinfo is None:
+        startupinfo = startinfo_class()
+    if startupinfo is not None:
+        startupinfo.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0)
+        startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+        kw["startupinfo"] = startupinfo
+    kw["creationflags"] = kw.get("creationflags", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    return kw
+
+
+def run_hidden_subprocess(command, **kwargs):
+    merged_kwargs = _apply_windows_hidden_process_kwargs(kwargs)
+    return subprocess.run(command, **merged_kwargs)
+
+
+def popen_hidden_subprocess(command, **kwargs):
+    merged_kwargs = _apply_windows_hidden_process_kwargs(kwargs)
+    return subprocess.Popen(command, **merged_kwargs)
+
+
+def format_path_for_display(path):
+    if not path:
+        return ""
+    try:
+        normalized = os.path.abspath(path)
+    except Exception:
+        normalized = str(path)
+    return normalized.replace("\\", "/")
+
+
+def normalize_path_signature(path):
+    if not path:
+        return None
+    try:
+        normalized = os.path.realpath(os.path.abspath(path))
+    except Exception:
+        normalized = str(path)
+    normalized = normalized.replace("\\", "/").lower()
+    return normalized
+
+
+def get_executable_fallback_path():
+    if getattr(sys, 'frozen', False):
+        return sys.executable or os.path.abspath(sys.argv[0])
+    return sys.executable
+
+
+def get_python_info_script_path():
+    global PYTHON_INFO_SCRIPT_PATH
+    if PYTHON_INFO_SCRIPT_PATH and os.path.exists(PYTHON_INFO_SCRIPT_PATH):
+        return PYTHON_INFO_SCRIPT_PATH
+    try:
+        fd, path = tempfile.mkstemp(prefix="fw_python_probe_", suffix=".py")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(PYTHON_INFO_SCRIPT)
+        PYTHON_INFO_SCRIPT_PATH = path
+    except Exception as exc:
+        logging.error(f"Could not create python probe script: {exc}")
+        raise
+    return PYTHON_INFO_SCRIPT_PATH
+
+
+def _log_python_probe(entry):
+    try:
+        command_key = tuple(entry.get("command", []))
+        if command_key in PYTHON_PROBE_LOG:
+            PYTHON_PROBE_LOG[command_key].update(entry)
+        else:
+            if len(PYTHON_PROBE_LOG) >= PYTHON_PROBE_LOG_MAX:
+                oldest_key = next(iter(PYTHON_PROBE_LOG.keys()))
+                PYTHON_PROBE_LOG.pop(oldest_key, None)
+            PYTHON_PROBE_LOG[command_key] = entry
+    except Exception:
+        pass
+
+
+def get_python_probe_log():
+    return list(PYTHON_PROBE_LOG.values())
 
 
 _YT_DLP_RELEASE_CACHE = {
@@ -308,6 +394,10 @@ def evaluate_yt_dlp_version_status(current_version):
     }
 
 
+PYTHON_PROBE_LOG = {}
+PYTHON_PROBE_LOG_MAX = 25
+
+
 def create_always_on_top_message_box(parent, icon, title, text, buttons=None, default_button=None):
     """ Create a message box that always stays on top """
     msg = QMessageBox(parent)
@@ -372,21 +462,27 @@ def show_setup_question(parent, title, text, buttons, default_button=None):
     return msg.exec()
 
 
-PYTHON_INFO_SCRIPT = (
-    "import json, sys, importlib.util\n"
-    "info = {\n"
-    "    'version': sys.version.split()[0],\n"
-    "    'executable': sys.executable,\n"
-    "    'has_pip': importlib.util.find_spec(\\\"pip\\\") is not None,\n"
-    "    'can_bootstrap_pip': False\n"
-    "}\n"
-    "try:\n"
-    "    import ensurepip\n"
-    "    info['can_bootstrap_pip'] = True\n"
-    "except Exception:\n"
-    "    pass\n"
-    "print(json.dumps(info))\n"
-)
+PYTHON_INFO_SCRIPT = """import json
+import sys
+import importlib.util
+
+info = {
+    'version': sys.version.split()[0],
+    'executable': sys.executable,
+    'has_pip': importlib.util.find_spec("pip") is not None,
+    'can_bootstrap_pip': False
+}
+
+try:
+    import ensurepip
+    info['can_bootstrap_pip'] = True
+except Exception:
+    pass
+
+print(json.dumps(info))
+"""
+
+PYTHON_INFO_SCRIPT_PATH = None
 
 
 def _extract_json_line(raw_output):
@@ -404,22 +500,44 @@ def _extract_json_line(raw_output):
 
 
 def _probe_python_command(command_tokens):
+    script_path = get_python_info_script_path()
     try:
-        result = subprocess.run(
-            command_tokens + ["-c", PYTHON_INFO_SCRIPT],
+        result = run_hidden_subprocess(
+            command_tokens + [script_path],
             capture_output=True,
             text=True,
             timeout=10
         )
-    except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired):
+    except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired) as exc:
+        _log_python_probe({
+            "command": command_tokens,
+            "status": "error",
+            "detail": str(exc)
+        })
         return None
 
     if result.returncode != 0:
+        _log_python_probe({
+            "command": command_tokens,
+            "status": "error",
+            "detail": result.stderr or result.stdout or f"Exit code {result.returncode}"
+        })
         return None
 
     info = _extract_json_line(result.stdout or result.stderr)
     if not info:
+        _log_python_probe({
+            "command": command_tokens,
+            "status": "error",
+            "detail": "Could not parse probe output"
+        })
         return None
+
+    _log_python_probe({
+        "command": command_tokens,
+        "status": "success",
+        "detail": info.get("version")
+    })
 
     return {
         "command": tuple(command_tokens),
@@ -449,14 +567,9 @@ def _build_python_command_candidates():
             candidates.append([path])
 
     if sys.platform.startswith("win"):
-        candidates.extend([
-            ["py", "-3"],
-            ["py", "-3.12"],
-            ["py", "-3.11"],
-            ["py"],
-            ["python"],
-            ["python3"]
-        ])
+        candidates.extend(
+            _build_windows_python_candidates()
+        )
     else:
         candidates.extend([
             ["python3"],
@@ -475,6 +588,103 @@ def _build_python_command_candidates():
         seen.add(key)
         unique.append(cmd)
     return unique
+
+
+def _build_windows_python_candidates():
+    base_candidates = [
+        ["py", "-3"],
+        ["py", "-3.12"],
+        ["py", "-3.11"],
+        ["py", "-3.10"],
+        ["py"],
+        ["python"],
+        ["python3"]
+    ]
+
+    discovered_paths = set()
+
+    for discovered in discover_python_via_py_launcher():
+        discovered_paths.add(discovered)
+
+    for discovered in discover_python_standard_locations():
+        discovered_paths.add(discovered)
+
+    for path in sorted(discovered_paths):
+        base_candidates.append([path])
+
+    return base_candidates
+
+
+def discover_python_via_py_launcher():
+    if os.name != "nt":
+        return []
+    paths = []
+    try:
+        result = run_hidden_subprocess(["py", "-0p"], capture_output=True, text=True, timeout=5)
+        if result.returncode != 0:
+            _log_python_probe({
+                "command": ["py", "-0p"],
+                "status": "error",
+                "detail": result.stderr or result.stdout
+            })
+            return []
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line or line.startswith("Installed Pythons"):
+                continue
+            if line.startswith("-"):
+                parts = line.split()
+                potential_path = parts[-1]
+                if potential_path.lower().endswith("python.exe") and os.path.exists(potential_path):
+                    paths.append(potential_path)
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        _log_python_probe({
+            "command": ["py", "-0p"],
+            "status": "exception",
+            "detail": str(exc)
+        })
+    return paths
+
+
+def discover_python_standard_locations():
+    if os.name != "nt":
+        return []
+    potential_paths = []
+    env_vars = {
+        "LOCALAPPDATA": os.environ.get("LOCALAPPDATA"),
+        "PROGRAMFILES": os.environ.get("PROGRAMFILES"),
+        "PROGRAMFILES(X86)": os.environ.get("PROGRAMFILES(X86)"),
+    }
+
+    search_roots = []
+    for key, base in env_vars.items():
+        if not base:
+            continue
+        search_roots.append(os.path.join(base, "Programs", "Python"))
+        search_roots.append(os.path.join(base, "Python"))
+
+    for root in search_roots:
+        if not root or not os.path.isdir(root):
+            continue
+        try:
+            for entry in os.listdir(root):
+                full_path = os.path.join(root, entry, "python.exe")
+                if os.path.exists(full_path):
+                    potential_paths.append(full_path)
+        except PermissionError:
+            continue
+
+    # Also check system root for py.exe specifically
+    system_root = os.environ.get("SystemRoot")
+    if system_root:
+        for sub in ("py.exe", os.path.join("System32", "py.exe")):
+            candidate = os.path.join(system_root, sub)
+            if os.path.exists(candidate):
+                potential_paths.append(candidate)
+
+    return potential_paths
 
 
 @lru_cache(maxsize=1)
@@ -504,11 +714,16 @@ def get_current_python_runtime_info():
         has_pip = importlib.util.find_spec("pip") is not None
     except Exception:
         has_pip = False
+    if getattr(sys, 'frozen', False):
+        display = "Bundled Interpreter"
+    else:
+        display = sys.executable or "current_python"
+    executable_path = get_executable_fallback_path()
     return {
-        "command": (sys.executable,),
-        "display_name": sys.executable,
+        "command": (display or "" ,),
+        "display_name": display,
         "version": platform.python_version(),
-        "executable": sys.executable,
+        "executable": executable_path,
         "has_pip": has_pip,
         "can_bootstrap_pip": True
     }
@@ -521,15 +736,50 @@ def enumerate_python_runtimes():
         info = _probe_python_command(candidate)
         if info:
             runtimes.append(info)
-    deduped = []
-    seen = set()
+    aggregated = {}
+    order = []
     for runtime in runtimes:
-        key = (runtime["display_name"], runtime.get("version"))
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(runtime)
+        executable = runtime.get("executable") or runtime.get("display_name") or "unknown"
+        normalized = normalize_path_signature(executable)
+        if not normalized:
+            normalized = executable.lower()
+        entry = aggregated.get(normalized)
+        if not entry:
+            entry = runtime.copy()
+            entry["commands"] = set()
+            aggregated[normalized] = entry
+            order.append(normalized)
+        command_label = build_command_label(runtime.get("command"))
+        if command_label:
+            entry["commands"].add(command_label)
+        elif runtime.get("display_name"):
+            entry["commands"].add(runtime.get("display_name"))
+        if not entry.get("executable") and runtime.get("executable"):
+            entry["executable"] = runtime["executable"]
+        if not entry.get("version") and runtime.get("version"):
+            entry["version"] = runtime["version"]
+        if runtime.get("has_pip"):
+            entry["has_pip"] = True
+        if runtime.get("can_bootstrap_pip"):
+            entry["can_bootstrap_pip"] = True
+    deduped = []
+    for key in order:
+        entry = aggregated[key]
+        entry["commands"] = sorted(cmd for cmd in entry["commands"] if cmd)
+        deduped.append(entry)
     return deduped
+
+
+def build_command_label(command_tokens):
+    if not command_tokens:
+        return None
+    first = command_tokens[0]
+    if os.path.isabs(first):
+        first = os.path.basename(first)
+    label = first
+    if len(command_tokens) > 1:
+        label += f" {command_tokens[1]}"
+    return label
 
 
 def get_execution_environment():
@@ -986,8 +1236,7 @@ def try_nvml_detection():
 def try_nvidia_smi_detection():
     """ Try nvidia-smi command-line detection """
     try:
-        import subprocess
-        result = subprocess.run(['nvidia-smi', '--query-gpu=name,memory.total', '--format=csv,noheader,nounits'], 
+        result = run_hidden_subprocess(['nvidia-smi', '--query-gpu=name,memory.total', '--format=csv,noheader,nounits'], 
                               capture_output=True, text=True, timeout=10)
         
         if result.returncode == 0 and result.stdout.strip():
@@ -1034,8 +1283,7 @@ def try_platform_detection():
         if sys.platform == "win32":
             # Windows: Try WMI detection
             try:
-                import subprocess
-                result = subprocess.run(['wmic', 'path', 'win32_VideoController', 'get', 'name'], 
+                result = run_hidden_subprocess(['wmic', 'path', 'win32_VideoController', 'get', 'name'], 
                                       capture_output=True, text=True, timeout=10)
                 if result.returncode == 0 and 'nvidia' in result.stdout.lower():
                     # Found NVIDIA GPU, but can't get memory info this way
@@ -1074,7 +1322,7 @@ def try_intel_gpu_detection():
     try:
         if sys.platform == "win32":
             # Windows: WMI query for Intel graphics
-            result = subprocess.run(['wmic', 'path', 'win32_VideoController', 'where', 
+            result = run_hidden_subprocess(['wmic', 'path', 'win32_VideoController', 'where', 
                                    'name like "%Intel%"', 'get', 'name,AdapterRAM'], 
                                   capture_output=True, text=True, timeout=10)
             
@@ -1107,7 +1355,7 @@ def try_intel_gpu_detection():
         
         elif sys.platform == "linux":
             # Linux: Try lspci for Intel graphics
-            result = subprocess.run(['lspci', '-nn'], capture_output=True, text=True, timeout=5)
+            result = run_hidden_subprocess(['lspci', '-nn'], capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
                 lines = result.stdout.lower()
                 if 'intel' in lines and ('vga' in lines or '3d' in lines):
@@ -1145,7 +1393,7 @@ def try_amd_gpu_detection():
     try:
         if sys.platform == "win32":
             # Windows: WMI query for AMD graphics
-            result = subprocess.run(['wmic', 'path', 'win32_VideoController', 'where', 
+            result = run_hidden_subprocess(['wmic', 'path', 'win32_VideoController', 'where', 
                                    'name like "%AMD%" or name like "%Radeon%"', 
                                    'get', 'name,AdapterRAM'], 
                                   capture_output=True, text=True, timeout=10)
@@ -1179,7 +1427,7 @@ def try_amd_gpu_detection():
         
         elif sys.platform == "linux":
             # Linux: Try lspci for AMD graphics
-            result = subprocess.run(['lspci', '-nn'], capture_output=True, text=True, timeout=5)
+            result = run_hidden_subprocess(['lspci', '-nn'], capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
                 lines = result.stdout.lower()
                 if ('amd' in lines or 'radeon' in lines) and ('vga' in lines or '3d' in lines):
@@ -1219,7 +1467,7 @@ def try_universal_gpu_detection():
         
         if sys.platform == "win32":
             # Windows: WMI query for all GPUs
-            result = subprocess.run(['wmic', 'path', 'win32_VideoController', 
+            result = run_hidden_subprocess(['wmic', 'path', 'win32_VideoController', 
                                    'get', 'name,AdapterRAM'], 
                                   capture_output=True, text=True, timeout=10)
             
@@ -1259,7 +1507,7 @@ def try_universal_gpu_detection():
         
         elif sys.platform == "linux":
             # Linux: lspci for all graphics devices
-            result = subprocess.run(['lspci', '-nn'], capture_output=True, text=True, timeout=5)
+            result = run_hidden_subprocess(['lspci', '-nn'], capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
                 for line in result.stdout.split('\n'):
                     if 'vga' in line.lower() or '3d' in line.lower():
@@ -1782,7 +2030,7 @@ class YtDlpUpdateWorker(QThread):
         if not command:
             return False, "", "", "Internal error: missing update command."
         try:
-            self.current_process = subprocess.Popen(
+            self.current_process = popen_hidden_subprocess(
                 command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -2017,7 +2265,7 @@ class DownloadManager(QDialog):
             self.extraction_progress.emit(0, 0, "Extracting archive using 7-Zip... (This may take a moment)")
             command = [sevenzip_executable, 'x', self.archive_path, f'-o{extract_dir}', '-y']
             logging.info(f"Executing command: {' '.join(command)}")
-            result = subprocess.run(command, capture_output=True, text=True, encoding='utf-8', errors='replace')
+            result = run_hidden_subprocess(command, capture_output=True, text=True, encoding='utf-8', errors='replace')
             if result.returncode != 0:
                 logging.error(f"7-Zip failed with code {result.returncode}\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}")
                 raise RuntimeError(f"7-Zip extraction failed. Error: {result.stderr or result.stdout}")
@@ -3075,12 +3323,12 @@ class WhisperGUI(QMainWindow):
             mode = "Standalone Executable" if getattr(sys, 'frozen', False) else "Source (Python)"
             info_lines.append(f"Application Mode: {mode}")
             info_lines.append(f"Execution Environment: {execution_env}")
-            info_lines.append(f"App Directory: {get_app_directory()}")
+            info_lines.append(f"App Directory: {format_path_for_display(get_app_directory())}")
             info_lines.append("")
 
             info_lines.append("Current Python Process:")
             info_lines.append(f"• Version: {platform.python_version()} ({platform.python_implementation()})")
-            info_lines.append(f"• Executable: {sys.executable}")
+            info_lines.append(f"• Executable: {format_path_for_display(get_executable_fallback_path())}")
 
             runtimes = enumerate_python_runtimes()
             info_lines.append("")
@@ -3088,11 +3336,20 @@ class WhisperGUI(QMainWindow):
             if runtimes:
                 for runtime in runtimes:
                     pip_state = "pip available" if runtime.get("has_pip") else "pip missing"
+                    commands = runtime.get("commands") or []
+                    if commands:
+                        cmd_summary = ", ".join(commands[:2])
+                        if len(commands) > 2:
+                            cmd_summary += " …"
+                        cmd_summary = f" via {cmd_summary}"
+                    else:
+                        cmd_summary = ""
                     info_lines.append(
-                        f"• {runtime['display_name']} -> Python {runtime.get('version', 'unknown')} ({pip_state})"
+                        f"• Python {runtime.get('version', 'unknown')} ({pip_state}{cmd_summary})"
                     )
-                    if runtime.get("executable"):
-                        info_lines.append(f"  Executable: {runtime['executable']}")
+                    display_path = format_path_for_display(runtime.get("executable"))
+                    if display_path:
+                        info_lines.append(f"  Executable: {display_path}")
             else:
                 info_lines.append("• None detected")
 
@@ -3108,13 +3365,27 @@ class WhisperGUI(QMainWindow):
                     f"• Selected Interpreter: {python_info.get('display_name')} (Python {python_info.get('version')})"
                 )
             if plan.get("target_directory"):
-                info_lines.append(f"• Target Directory: {plan['target_directory']}")
+                info_lines.append(f"• Target Directory: {format_path_for_display(plan['target_directory'])}")
+
+            probe_log = get_python_probe_log()
+            failures = [entry for entry in probe_log if entry.get("status") != "success"]
+            if plan.get("status") != "ready" and failures:
+                info_lines.append("")
+                info_lines.append("Python Probe Diagnostics (failed commands):")
+                for entry in failures[:5]:
+                    detail = entry.get("detail")
+                    if detail and len(detail) > 200:
+                        detail = detail[:200] + "…"
+                    cmd_label = " ".join(entry.get("command", [])) or "(unknown)"
+                    info_lines.append(
+                        f"• {cmd_label}: {entry.get('status')}" + (f" ({detail})" if detail else "")
+                    )
 
             ytdlp_info = get_ytdlp_installation_info()
             info_lines.append("")
             info_lines.append("yt-dlp Module:")
             info_lines.append(f"• Version: {ytdlp_info.get('version') or 'Not found'}")
-            info_lines.append(f"• Location: {ytdlp_info.get('path') or 'Unknown'}")
+            info_lines.append(f"• Location: {format_path_for_display(ytdlp_info.get('path')) or 'Unknown'}")
             info_lines.append(f"• Source: {ytdlp_info.get('installation_type')}")
 
             version_status = evaluate_yt_dlp_version_status(ytdlp_info.get('version'))
@@ -3137,7 +3408,7 @@ class WhisperGUI(QMainWindow):
             info_lines.append("Faster Whisper XXL Binary:")
             if self.executable_path and os.path.exists(self.executable_path):
                 fw_version = detect_faster_whisper_binary_version(self.executable_path)
-                info_lines.append(f"• Path: {self.executable_path}")
+                info_lines.append(f"• Path: {format_path_for_display(self.executable_path)}")
                 info_lines.append(f"• Version: {fw_version or 'Not reported'}")
             else:
                 info_lines.append("• Executable path not initialized yet")
