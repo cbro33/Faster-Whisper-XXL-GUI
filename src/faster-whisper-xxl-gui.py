@@ -9,6 +9,9 @@ import threading
 import logging
 import subprocess
 import tempfile
+import importlib.util
+import time
+from functools import lru_cache
 from pathlib import Path
 from PyQt6.QtWidgets import (QProgressBar, QGridLayout, QDialog, QSplitter, QWidget, 
                              QHBoxLayout, QVBoxLayout, QLabel, QComboBox, QTabWidget, 
@@ -75,6 +78,236 @@ def get_portable_settings_directory():
         return os.getcwd()
 
 
+EXTERNAL_MODULE_DIR_NAME = "python_modules"
+
+
+def get_external_python_modules_path():
+    """Return (and create) the directory where we can drop updated python packages"""
+    try:
+        settings_dir = get_settings_directory()
+        external_dir = os.path.join(settings_dir, EXTERNAL_MODULE_DIR_NAME)
+        os.makedirs(external_dir, exist_ok=True)
+        return external_dir
+    except Exception as e:
+        logging.warning(f"Could not prepare external python module directory: {e}")
+        return None
+
+
+EXTERNAL_PYTHON_MODULES_PATH = get_external_python_modules_path()
+if EXTERNAL_PYTHON_MODULES_PATH and EXTERNAL_PYTHON_MODULES_PATH not in sys.path:
+    sys.path.insert(0, EXTERNAL_PYTHON_MODULES_PATH)
+
+
+def find_external_yt_dlp_path():
+    """Return the path of an updated yt-dlp package if installed externally"""
+    if not EXTERNAL_PYTHON_MODULES_PATH:
+        return None
+    candidate = os.path.join(EXTERNAL_PYTHON_MODULES_PATH, "yt_dlp")
+    if os.path.isdir(candidate):
+        return candidate
+    return None
+
+
+def read_package_version(package_dir):
+    """Read __version__ from a package directory without importing it"""
+    version_file = os.path.join(package_dir, "version.py")
+    if not os.path.exists(version_file):
+        return None
+    try:
+        with open(version_file, "r", encoding="utf-8") as handle:
+            contents = handle.read()
+        match = re.search(r"__version__\s*=\s*['\"]([^'\"]+)", contents)
+        if match:
+            return match.group(1).strip()
+    except Exception as exc:
+        logging.debug(f"Could not read package version from {version_file}: {exc}")
+    return None
+
+
+def parse_version_tuple(version_str):
+    """Convert yt-dlp version string (YYYY.MM.DD) into a comparable tuple"""
+    if not version_str:
+        return ()
+    try:
+        parts = [int(p) for p in re.findall(r"\d+", version_str)]
+        return tuple(parts)
+    except Exception:
+        return ()
+
+
+def _load_module_from_path(module_name, package_dir):
+    """Load a Python package from a specific directory"""
+    init_path = os.path.join(package_dir, "__init__.py")
+    if not os.path.exists(init_path):
+        raise FileNotFoundError(f"{module_name} package does not contain __init__.py at {package_dir}")
+    spec = importlib.util.spec_from_file_location(
+        module_name,
+        init_path,
+        submodule_search_locations=[package_dir]
+    )
+    module = importlib.util.module_from_spec(spec)
+    previous = sys.modules.get(module_name)
+    try:
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)  # type: ignore[union-attr]
+    except Exception:
+        if previous is not None:
+            sys.modules[module_name] = previous
+        else:
+            sys.modules.pop(module_name, None)
+        raise
+    return module
+
+
+def maybe_use_external_yt_dlp(bundled_module):
+    """Prefer externally installed yt-dlp builds when available"""
+    external_path = find_external_yt_dlp_path()
+    if not external_path:
+        if bundled_module:
+            bundled_module.__fwhisper_source__ = "bundled" if getattr(sys, 'frozen', False) else "system"
+        return bundled_module
+
+    external_version = read_package_version(external_path)
+    bundled_version = None
+    if bundled_module is not None:
+        bundled_version = getattr(getattr(bundled_module, "version", None), "__version__", None)
+
+    try:
+        if (not bundled_version or not external_version or
+                parse_version_tuple(external_version) >= parse_version_tuple(bundled_version)):
+            external_module = _load_module_from_path("yt_dlp", external_path)
+            external_module.__fwhisper_source__ = "external"
+            external_module.__fwhisper_source_path__ = external_path
+            logging.info(f"Using external yt-dlp from {external_path} (version {external_version})")
+            return external_module
+    except Exception as exc:
+        logging.warning(f"Failed to load external yt-dlp: {exc}")
+
+    if bundled_module:
+        bundled_module.__fwhisper_source__ = "bundled" if getattr(sys, 'frozen', False) else "system"
+    return bundled_module
+
+
+def reload_external_yt_dlp_if_available():
+    """Reload yt-dlp from the external directory after an update"""
+    external_path = find_external_yt_dlp_path()
+    if not external_path:
+        return None
+    try:
+        module = _load_module_from_path("yt_dlp", external_path)
+        module.__fwhisper_source__ = "external"
+        module.__fwhisper_source_path__ = external_path
+        globals()["yt_dlp"] = module
+        return module
+    except Exception as exc:
+        logging.warning(f"Could not reload yt-dlp from {external_path}: {exc}")
+        return None
+
+
+# Prefer an externally updated yt-dlp if we already have one cached locally
+yt_dlp = maybe_use_external_yt_dlp(yt_dlp)
+
+
+def refresh_yt_dlp_module_after_update():
+    """Reload yt-dlp so the running session can use the updated build"""
+    if getattr(sys, 'frozen', False):
+        return reload_external_yt_dlp_if_available()
+    try:
+        import importlib
+        module = importlib.reload(yt_dlp)
+        globals()["yt_dlp"] = module
+        return module
+    except Exception as exc:
+        logging.warning(f"Could not reload yt-dlp module after update: {exc}")
+        return None
+
+
+def detect_faster_whisper_binary_version(executable_path):
+    """Best-effort detection of the bundled faster-whisper executable version"""
+    if not executable_path or not os.path.exists(executable_path):
+        return None
+    candidate_commands = [[executable_path, "--version"], [executable_path, "-V"]]
+    for command in candidate_commands:
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+        except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired, OSError):
+            continue
+        if result.returncode == 0:
+            output = (result.stdout or result.stderr or "").strip()
+            if output:
+                return output.splitlines()[0]
+    return None
+
+
+_YT_DLP_RELEASE_CACHE = {
+    "timestamp": 0,
+    "releases": None
+}
+
+
+def fetch_yt_dlp_releases(max_releases=30, cache_seconds=600):
+    """Fetch recent yt-dlp releases (cached to avoid spamming the API)"""
+    now = time.time()
+    if (_YT_DLP_RELEASE_CACHE["releases"] and
+            now - _YT_DLP_RELEASE_CACHE["timestamp"] < cache_seconds):
+        return _YT_DLP_RELEASE_CACHE["releases"]
+    try:
+        response = requests.get(
+            "https://api.github.com/repos/yt-dlp/yt-dlp/releases",
+            params={"per_page": max_releases},
+            timeout=5
+        )
+        if response.status_code == 200:
+            releases = response.json()
+            _YT_DLP_RELEASE_CACHE["timestamp"] = now
+            _YT_DLP_RELEASE_CACHE["releases"] = releases
+            return releases
+    except requests.RequestException as exc:
+        logging.debug(f"Could not fetch yt-dlp releases: {exc}")
+    return _YT_DLP_RELEASE_CACHE["releases"] or []
+
+
+def evaluate_yt_dlp_version_status(current_version):
+    """Compare current yt-dlp version with upstream releases"""
+    releases = fetch_yt_dlp_releases()
+    release_tags = [rel.get("tag_name") for rel in releases if rel.get("tag_name")]
+    latest_version = release_tags[0] if release_tags else None
+
+    if not current_version:
+        return {
+            "status": "unknown",
+            "latest_version": latest_version,
+            "releases_behind": None
+        }
+
+    if not latest_version:
+        return {
+            "status": "unknown",
+            "latest_version": None,
+            "releases_behind": None
+        }
+
+    if parse_version_tuple(current_version) == parse_version_tuple(latest_version):
+        return {
+            "status": "up_to_date",
+            "latest_version": latest_version,
+            "releases_behind": 0
+        }
+
+    releases_behind = None
+    for idx, version in enumerate(release_tags):
+        if parse_version_tuple(version) == parse_version_tuple(current_version):
+            releases_behind = idx
+            break
+
+    status = "behind" if releases_behind is not None else "unknown"
+    return {
+        "status": status,
+        "latest_version": latest_version,
+        "releases_behind": releases_behind
+    }
+
+
 def create_always_on_top_message_box(parent, icon, title, text, buttons=None, default_button=None):
     """ Create a message box that always stays on top """
     msg = QMessageBox(parent)
@@ -139,6 +372,166 @@ def show_setup_question(parent, title, text, buttons, default_button=None):
     return msg.exec()
 
 
+PYTHON_INFO_SCRIPT = (
+    "import json, sys, importlib.util\n"
+    "info = {\n"
+    "    'version': sys.version.split()[0],\n"
+    "    'executable': sys.executable,\n"
+    "    'has_pip': importlib.util.find_spec(\\\"pip\\\") is not None,\n"
+    "    'can_bootstrap_pip': False\n"
+    "}\n"
+    "try:\n"
+    "    import ensurepip\n"
+    "    info['can_bootstrap_pip'] = True\n"
+    "except Exception:\n"
+    "    pass\n"
+    "print(json.dumps(info))\n"
+)
+
+
+def _extract_json_line(raw_output):
+    if not raw_output:
+        return None
+    lines = raw_output.strip().splitlines()
+    for line in reversed(lines):
+        line = line.strip()
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
+def _probe_python_command(command_tokens):
+    try:
+        result = subprocess.run(
+            command_tokens + ["-c", PYTHON_INFO_SCRIPT],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+    except (FileNotFoundError, PermissionError, subprocess.TimeoutExpired):
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    info = _extract_json_line(result.stdout or result.stderr)
+    if not info:
+        return None
+
+    return {
+        "command": tuple(command_tokens),
+        "display_name": " ".join(command_tokens),
+        "version": info.get("version"),
+        "executable": info.get("executable"),
+        "has_pip": bool(info.get("has_pip")),
+        "can_bootstrap_pip": bool(info.get("can_bootstrap_pip"))
+    }
+
+
+def _build_python_command_candidates():
+    candidates = []
+    env_override = os.environ.get("FWXXL_PYTHON")
+    if env_override:
+        candidates.append([env_override])
+
+    # Allow users to drop a portable python next to the application
+    possible_local = [
+        os.path.join(get_app_directory(), "python.exe"),
+        os.path.join(get_app_directory(), "python", "python.exe"),
+        os.path.join(get_app_directory(), "python3"),
+        os.path.join(get_app_directory(), "python", "python3"),
+    ]
+    for path in possible_local:
+        if os.path.exists(path):
+            candidates.append([path])
+
+    if sys.platform.startswith("win"):
+        candidates.extend([
+            ["py", "-3"],
+            ["py", "-3.12"],
+            ["py", "-3.11"],
+            ["py"],
+            ["python"],
+            ["python3"]
+        ])
+    else:
+        candidates.extend([
+            ["python3"],
+            ["python"],
+            ["python3.12"],
+            ["python3.11"],
+            ["python3.10"]
+        ])
+
+    unique = []
+    seen = set()
+    for cmd in candidates:
+        key = tuple(cmd)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(cmd)
+    return unique
+
+
+@lru_cache(maxsize=1)
+def detect_python_runtime():
+    """Detect a usable Python interpreter (for frozen builds)"""
+    candidates = _build_python_command_candidates()
+    detected = []
+    for candidate in candidates:
+        info = _probe_python_command(candidate)
+        if not info:
+            continue
+        detected.append(info)
+        if info.get("has_pip"):
+            return info
+    return detected[0] if detected else None
+
+
+def refresh_python_detection_cache():
+    try:
+        detect_python_runtime.cache_clear()
+    except AttributeError:
+        pass
+
+
+def get_current_python_runtime_info():
+    try:
+        has_pip = importlib.util.find_spec("pip") is not None
+    except Exception:
+        has_pip = False
+    return {
+        "command": (sys.executable,),
+        "display_name": sys.executable,
+        "version": platform.python_version(),
+        "executable": sys.executable,
+        "has_pip": has_pip,
+        "can_bootstrap_pip": True
+    }
+
+
+def enumerate_python_runtimes():
+    """Return every Python interpreter we can successfully probe"""
+    runtimes = [get_current_python_runtime_info()]
+    for candidate in _build_python_command_candidates():
+        info = _probe_python_command(candidate)
+        if info:
+            runtimes.append(info)
+    deduped = []
+    seen = set()
+    for runtime in runtimes:
+        key = (runtime["display_name"], runtime.get("version"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(runtime)
+    return deduped
+
+
 def get_execution_environment():
     """ Detect how the application is running and what update capabilities are available """
     try:
@@ -149,20 +542,9 @@ def get_execution_environment():
             # Running from source - can always update
             return "source"
         
-        # Running as exe - check if system Python is available
-        python_commands = ["python", "python3", "py"]
-        
-        for cmd in python_commands:
-            try:
-                # Check if Python command exists and has pip
-                result = subprocess.run([cmd, "-m", "pip", "--version"], 
-                                      capture_output=True, text=True, timeout=5)
-                if result.returncode == 0:
-                    return "exe_with_python"
-            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-                continue
-        
-        # No usable Python found
+        python_info = detect_python_runtime()
+        if python_info:
+            return "exe_with_python"
         return "exe_no_python"
         
     except Exception as e:
@@ -172,49 +554,131 @@ def get_execution_environment():
 
 def can_update_yt_dlp():
     """ Check if yt-dlp can be updated in the current environment """
-    env = get_execution_environment()
-    return env in ["source", "exe_with_python"]
+    plan = get_python_update_plan()
+    return plan.get("status") == "ready"
 
 
-def get_update_command():
-    """ Get the appropriate command to update yt-dlp based on environment """
-    env = get_execution_environment()
-    
-    if env == "source":
-        return [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"]
-    elif env == "exe_with_python":
-        # Find the best Python command to use
-        python_commands = ["python", "python3", "py"]
-        for cmd in python_commands:
-            try:
-                result = subprocess.run([cmd, "-m", "pip", "--version"], 
-                                      capture_output=True, text=True, timeout=5)
-                if result.returncode == 0:
-                    return [cmd, "-m", "pip", "install", "--upgrade", "yt-dlp"]
-            except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-                continue
-    
-    return None
+def get_python_update_plan():
+    """Build a structured plan (and diagnostics) for updating yt-dlp"""
+    plan = {
+        "environment": get_execution_environment(),
+        "status": "ready"
+    }
+    try:
+        if plan["environment"] == "source":
+            python_info = {
+                "command": (sys.executable,),
+                "display_name": sys.executable,
+                "version": platform.python_version(),
+                "has_pip": True,
+                "can_bootstrap_pip": True
+            }
+            plan.update({
+                "python_info": python_info,
+                "pre_commands": [],
+                "update_command": [sys.executable, "-m", "pip", "install", "--upgrade", "yt-dlp"]
+            })
+            return plan
+
+        if plan["environment"] == "exe_no_python":
+            plan["status"] = "missing_python"
+            plan["status_detail"] = "Python was not found on PATH."
+            return plan
+
+        python_info = detect_python_runtime()
+        if not python_info:
+            plan["status"] = "missing_python"
+            plan["status_detail"] = "Python was not found on PATH."
+            return plan
+        plan["python_info"] = python_info
+        plan["pre_commands"] = []
+
+        if not python_info.get("has_pip"):
+            if python_info.get("can_bootstrap_pip"):
+                plan["pre_commands"].append({
+                    "command": list(python_info["command"]) + ["-m", "ensurepip", "--upgrade"],
+                    "description": "Installing pip in the detected Python installation...",
+                    "refresh_python_cache": True
+                })
+            else:
+                plan["status"] = "pip_missing"
+                plan["status_detail"] = "Pip is missing in the detected Python installation."
+                return plan
+
+        target_dir = None
+        if getattr(sys, 'frozen', False):
+            target_dir = get_external_python_modules_path()
+            if not target_dir:
+                plan["status"] = "target_unwritable"
+                plan["status_detail"] = "Could not create a writable folder for updated packages."
+                return plan
+            plan["target_directory"] = target_dir
+
+        update_command = list(python_info["command"]) + ["-m", "pip", "install", "--upgrade"]
+        if target_dir:
+            update_command.extend(["--target", target_dir, "--no-warn-script-location"])
+        update_command.append("yt-dlp")
+
+        plan["update_command"] = update_command
+        return plan
+    except Exception as exc:
+        logging.error(f"Could not build yt-dlp update plan: {exc}")
+        plan["status"] = "error"
+        plan["status_detail"] = str(exc)
+        return plan
 
 
-def show_yt_dlp_unavailable(parent):
-    """ Show informative dialog for exe users who can't update yt-dlp """
+def show_yt_dlp_unavailable(parent, reason="python_missing", plan=None):
+    """ Show informative dialog when automatic updates are not possible """
+    if reason == "pip_missing":
+        python_info = plan.get("python_info") if plan else None
+        python_label = python_info.get("display_name") if python_info else "Python"
+        extra = f"Detected interpreter: {python_label}"
+        text = (
+            "Python was detected, but pip is missing so yt-dlp cannot be updated automatically.\n\n"
+            "To fix this, run `python -m ensurepip --upgrade` for the interpreter above (or reinstall Python with pip),"
+            " then restart this application.\n\n"
+            f"{extra}\n"
+            "Would you like to open the Python download page?"
+        )
+        buttons = QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        default = QMessageBox.StandardButton.No
+        icon = QMessageBox.Icon.Warning
+    elif reason == "target_unwritable":
+        target_dir = plan.get("target_directory") if plan else None
+        text = (
+            "We could not prepare a writable folder for updated yt-dlp files, so the update was aborted.\n\n"
+            "Please ensure you have write permissions to the application settings directory"
+        )
+        if target_dir:
+            text += f"\nTarget directory: {target_dir}"
+        buttons = QMessageBox.StandardButton.Ok
+        default = QMessageBox.StandardButton.Ok
+        icon = QMessageBox.Icon.Critical
+    else:
+        text = (
+            "Your system doesn't have Python installed, so yt-dlp cannot be updated automatically.\n\n"
+            "To update yt-dlp, you have these options:\n\n"
+            "• Install Python from python.org and restart this application\n"
+            "• Download a newer version of this application (may include updated yt-dlp)\n"
+            "• Continue using the current version (may have limitations with some videos)\n\n"
+            "Would you like to open the Python download page?"
+        )
+        buttons = QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        default = QMessageBox.StandardButton.No
+        icon = QMessageBox.Icon.Information
+
     msg = create_always_on_top_message_box(
-        parent, 
-        QMessageBox.Icon.Information,
+        parent,
+        icon,
         "yt-dlp Update Not Available",
-        "Your system doesn't have Python installed, so yt-dlp cannot be updated automatically.\n\n"
-        "To update yt-dlp, you have these options:\n\n"
-        "• Install Python from python.org and restart this application\n"
-        "• Download a newer version of this application (may include updated yt-dlp)\n"
-        "• Continue using the current version (may have limitations with some videos)\n\n"
-        "Would you like to open the Python download page?",
-        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        QMessageBox.StandardButton.No
+        text,
+        buttons,
+        default
     )
-    
+
     reply = msg.exec()
-    if reply == QMessageBox.StandardButton.Yes:
+    if buttons != QMessageBox.StandardButton.Ok and reply == QMessageBox.StandardButton.Yes:
         import webbrowser
         webbrowser.open("https://python.org/downloads/")
 
@@ -222,31 +686,34 @@ def show_yt_dlp_unavailable(parent):
 def get_ytdlp_installation_info():
     """ Detect which yt-dlp installation is actually being used """
     try:
-        import yt_dlp
         current_version = yt_dlp.version.__version__
-        
-        # Get the location of the yt-dlp module
-        ytdlp_path = yt_dlp.__file__
-        
-        # Determine if it's bundled with exe or system installation
+        ytdlp_path = os.path.abspath(getattr(yt_dlp, "__file__", ""))
         env = get_execution_environment()
         is_frozen = getattr(sys, 'frozen', False)
-        
+
+        installation_type = "development"
+        source_tag = getattr(yt_dlp, "__fwhisper_source__", None)
+        bundle_base = getattr(sys, "_MEIPASS", None)
+        external_path = find_external_yt_dlp_path()
+
         if is_frozen:
-            # If running as exe, check if yt-dlp is bundled or from system
-            exe_dir = os.path.dirname(sys.executable)
-            if ytdlp_path.startswith(exe_dir):
+            if source_tag == "external" or (external_path and ytdlp_path.startswith(external_path)):
+                installation_type = "external_override"
+            elif bundle_base and ytdlp_path.startswith(os.path.abspath(bundle_base)):
+                installation_type = "bundled"
+            elif os.path.dirname(sys.executable) and ytdlp_path.startswith(os.path.dirname(sys.executable)):
                 installation_type = "bundled"
             else:
                 installation_type = "system"
         else:
             installation_type = "development"
-        
+
         return {
             "version": current_version,
             "path": ytdlp_path,
             "installation_type": installation_type,
-            "environment": env
+            "environment": env,
+            "source": source_tag or installation_type
         }
     except ImportError:
         return {
@@ -335,14 +802,6 @@ def should_check_ytdlp_update():
             logging.info(f"yt-dlp update skipped: recently updated to {current_version} in {env} mode")
             return False
         
-        # For bundled exe installations, be more conservative
-        if install_info["installation_type"] == "bundled":
-            # Check if we already informed user about bundled version recently
-            last_check = env_data.get("last_bundled_check_timestamp")
-            if is_within_update_cooldown(last_check, cooldown_hours=72):  # 3 day cooldown for bundled
-                logging.info("Bundled yt-dlp update check skipped: recently informed user")
-                return False
-        
         return True
         
     except Exception as e:
@@ -377,32 +836,6 @@ def record_ytdlp_update_success(updated_version):
         
     except Exception as e:
         logging.error(f"Could not record yt-dlp update success: {e}")
-
-
-def record_ytdlp_bundled_check():
-    """ Record that we checked/informed about bundled yt-dlp """
-    try:
-        import time
-        
-        # Get current environment  
-        env = get_execution_environment()
-        
-        # Load existing data
-        update_data = load_ytdlp_update_status()
-        
-        # Update the data for current environment
-        if env not in update_data["ytdlp_updates"]:
-            update_data["ytdlp_updates"][env] = {}
-        
-        update_data["ytdlp_updates"][env]["last_bundled_check_timestamp"] = time.time()
-        
-        # Save the updated data
-        save_ytdlp_update_status(update_data)
-        
-        logging.info(f"Recorded bundled yt-dlp check in {env} mode")
-        
-    except Exception as e:
-        logging.error(f"Could not record bundled yt-dlp check: {e}")
 
 
 def get_window_stays_on_top_flag():
@@ -1281,61 +1714,117 @@ class YtDlpUpdateWorker(QThread):
     """Thread worker for updating yt-dlp without blocking the main UI"""
     finished = pyqtSignal(bool, str)  # success, message
     progress = pyqtSignal(str)  # progress message
-    
-    def __init__(self, update_command, environment):
+
+    def __init__(self, update_plan):
         super().__init__()
-        self.update_command = update_command
-        self.environment = environment
+        self.update_plan = update_plan
         self.stop_requested = False
-        
+        self.current_process = None
+
     def run(self):
         try:
-            logging.info(f"Starting yt-dlp update with command: {' '.join(self.update_command)}")
-            self.progress.emit("Initializing update...")
-            
-            if self.stop_requested:
-                self.finished.emit(False, "Update cancelled by user")
-                return
-            
-            self.progress.emit("Downloading latest yt-dlp version...")
-            
-            # Run the update command with timeout protection
-            result = subprocess.run(
-                self.update_command, 
-                capture_output=True, 
-                text=True, 
-                timeout=60  # 60 second timeout
+            steps = self._build_steps()
+            total_steps = len(steps)
+            for index, step in enumerate(steps, 1):
+                if self.stop_requested:
+                    self.finished.emit(False, "Update cancelled by user")
+                    return
+                description = step.get("description", "Running command...")
+                self.progress.emit(f"{description} ({index}/{total_steps})")
+                success, stdout, stderr, message = self._run_command(
+                    step.get("command"),
+                    step.get("timeout", 300)
+                )
+                if not success:
+                    if not message:
+                        snippet = (stderr or stdout or "").strip()
+                        message = snippet or "An unknown error occurred while updating yt-dlp."
+                    self.finished.emit(False, message)
+                    return
+                if step.get("refresh_python_cache"):
+                    refresh_python_detection_cache()
+
+            python_info = self.update_plan.get("python_info")
+            target_dir = self.update_plan.get("target_directory")
+            success_msg = "yt-dlp has been updated successfully!\nThe new version will be used for future downloads."
+            if python_info:
+                success_msg += (
+                    f"\n\nPython: {python_info.get('display_name')} "
+                    f"(version {python_info.get('version')})"
+                )
+            if target_dir:
+                success_msg += f"\nUpdated files were placed in:\n{target_dir}"
+
+            logging.info("yt-dlp updated successfully via thread")
+            self.finished.emit(True, success_msg)
+        except Exception as exc:
+            logging.error(f"yt-dlp update error via thread: {exc}")
+            self.finished.emit(False, f"An error occurred while updating yt-dlp:\n{exc}")
+
+    def _build_steps(self):
+        steps = []
+        for pre in self.update_plan.get("pre_commands", []):
+            steps.append({
+                "command": pre.get("command"),
+                "description": pre.get("description", "Preparing environment..."),
+                "timeout": pre.get("timeout", 180),
+                "refresh_python_cache": pre.get("refresh_python_cache", False)
+            })
+        steps.append({
+            "command": self.update_plan.get("update_command"),
+            "description": "Downloading and installing the latest yt-dlp...",
+            "timeout": self.update_plan.get("timeout", 300),
+            "refresh_python_cache": True
+        })
+        return steps
+
+    def _run_command(self, command, timeout):
+        if not command:
+            return False, "", "", "Internal error: missing update command."
+        try:
+            self.current_process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
             )
-            
-            if self.stop_requested:
-                self.finished.emit(False, "Update cancelled by user")
-                return
-            
-            if result.returncode == 0:
-                success_msg = "yt-dlp has been updated successfully!\nThe new version will be used for future downloads."
-                if self.environment == "exe_with_python":
-                    success_msg += "\n\nNote: The update was applied to your system Python installation."
-                
-                logging.info("yt-dlp updated successfully via thread")
-                self.finished.emit(True, success_msg)
-            else:
-                error_msg = f"Failed to update yt-dlp:\n{result.stderr or result.stdout}"
-                if self.environment == "exe_with_python":
-                    error_msg += "\n\nTry running the update command as administrator or check your Python installation."
-                
-                logging.error(f"yt-dlp update failed via thread: {result.stderr}")
-                self.finished.emit(False, error_msg)
-                
+            stdout, stderr = self.current_process.communicate(timeout=timeout)
+            return_code = self.current_process.returncode
         except subprocess.TimeoutExpired:
-            logging.warning("yt-dlp update timed out via thread")
-            self.finished.emit(False, "yt-dlp update timed out. Please try again later.\nThis may happen if you have a slow internet connection.")
-        except Exception as e:
-            logging.error(f"yt-dlp update error via thread: {e}")
-            self.finished.emit(False, f"An error occurred while updating yt-dlp:\n{str(e)}")
-    
+            if self.current_process:
+                self.current_process.kill()
+                stdout, stderr = self.current_process.communicate()
+            else:
+                stdout = stderr = ""
+            return False, stdout, stderr, "Command timed out. Please check your internet connection and try again."
+        except FileNotFoundError as exc:
+            return False, "", "", f"Command not found: {command[0]} ({exc})."
+        except Exception as exc:
+            return False, "", "", str(exc)
+        finally:
+            self.current_process = None
+
+        if self.stop_requested:
+            return False, stdout, stderr, "Update cancelled by user"
+
+        if return_code != 0:
+            snippet_source = (stderr or stdout or "").strip().splitlines()
+            snippet = "\n".join(snippet_source[-10:]) if snippet_source else "Command returned a non-zero exit code."
+            return False, stdout, stderr, snippet
+
+        return True, stdout, stderr, ""
+
     def stop(self):
         """Request the update to stop"""
         self.stop_requested = True
+        if self.current_process and self.current_process.poll() is None:
+            try:
+                self.current_process.terminate()
+            except Exception:
+                try:
+                    self.current_process.kill()
+                except Exception:
+                    pass
 
 
 class UpdateProgressDialog(QDialog):
@@ -2217,32 +2706,19 @@ class WhisperGUI(QMainWindow):
             # Get current installation info
             install_info = get_ytdlp_installation_info()
             current_version = install_info["version"]
-            installation_type = install_info["installation_type"]
             env = install_info["environment"]
             
             if not current_version:
                 logging.error("yt-dlp not found")
                 return
             
-            logging.info(f"Current yt-dlp version: {current_version}, type: {installation_type}, env: {env}")
+            logging.info(
+                f"Current yt-dlp version: {current_version}, type: {install_info['installation_type']}, env: {env}"
+            )
+
+            plan = get_python_update_plan()
+            plan_status = plan.get("status")
             
-            # Check environment capabilities
-            can_update = can_update_yt_dlp()
-            
-            # Handle bundled installations specially
-            if installation_type == "bundled":
-                info_msg = f"Your yt-dlp version ({current_version}) is bundled with this application.\n\n"
-                info_msg += "System updates won't affect the bundled version.\n\n"
-                info_msg += "To get the latest yt-dlp features:\n"
-                info_msg += "• Download a newer version of this application\n"
-                info_msg += "• Or install Python and yt-dlp separately for auto-updates"
-                
-                show_setup_information(self, "yt-dlp Update Info", info_msg)
-                record_ytdlp_bundled_check()  # Record that we informed the user
-                self.yt_dlp_update_session_complete = True
-                return
-            
-            # Check for latest version (with timeout to avoid blocking)
             try:
                 response = requests.get("https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest", timeout=5)
                 if response.status_code == 200:
@@ -2250,45 +2726,39 @@ class WhisperGUI(QMainWindow):
                     latest_version = latest_data["tag_name"]
                     
                     if current_version != latest_version:
-                        if can_update:
-                            # Standard update prompt for environments that support updates
-                            update_msg = f"Your yt-dlp version ({current_version}) is outdated.\n"
-                            update_msg += f"Latest version is {latest_version}.\n\n"
-                            update_msg += "Would you like to update it now?\n"
-                            update_msg += "(This may fix 403 unauthorized errors for video downloads)"
-                            
-                            if env == "exe_with_python":
-                                update_msg += "\n\nNote: Update will use your system Python installation."
-                            
+                        if plan_status == "ready":
+                            update_msg = (
+                                f"Your yt-dlp version ({current_version}) is outdated.\n"
+                                f"Latest version is {latest_version}.\n\n"
+                                "Would you like to update it now?\n"
+                                "(This may fix 403 unauthorized errors for video downloads.)"
+                            )
+                            python_info = plan.get("python_info")
+                            target_dir = plan.get("target_directory")
+                            if python_info and env == "exe_with_python":
+                                update_msg += (
+                                    f"\n\nDetected Python: {python_info.get('display_name')} "
+                                    f"(version {python_info.get('version')})."
+                                )
+                            if target_dir:
+                                update_msg += f"\nUpdated files will be stored in:\n{target_dir}"
+
                             reply = show_setup_question(
                                 self, "yt-dlp Update Available",
                                 update_msg,
                                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                 QMessageBox.StandardButton.Yes
                             )
-                            
+
                             if reply == QMessageBox.StandardButton.Yes:
                                 self.update_yt_dlp()
                             else:
-                                # User declined, record this version was offered
-                                record_ytdlp_update_success(current_version)
                                 self.yt_dlp_update_session_complete = True
                         else:
-                            # Inform exe users without Python about the update
-                            info_msg = f"A new yt-dlp version ({latest_version}) is available.\n"
-                            info_msg += f"Your current version is {current_version}.\n\n"
-                            info_msg += "Since you're using the standalone version without Python, "
-                            info_msg += "automatic updates are not available.\n\n"
-                            info_msg += "To get the latest yt-dlp version:\n"
-                            info_msg += "• Install Python to enable automatic updates\n"
-                            info_msg += "• Or download a newer version of this application"
-                            
-                            show_setup_information(self, "yt-dlp Update Available", info_msg)
-                            record_ytdlp_bundled_check()  # Record that we informed the user
+                            self.handle_update_plan_blockers(plan)
                             self.yt_dlp_update_session_complete = True
                     else:
                         logging.info("yt-dlp is up to date")
-                        # Record successful check with current version
                         record_ytdlp_update_success(current_version)
                         self.yt_dlp_update_session_complete = True
                 else:
@@ -2299,6 +2769,22 @@ class WhisperGUI(QMainWindow):
         except Exception as e:
             logging.error(f"Error checking yt-dlp version: {e}")
 
+    def handle_update_plan_blockers(self, plan):
+        """Show contextual guidance when we cannot update yt-dlp automatically"""
+        status = plan.get("status") if plan else None
+        if status == "pip_missing":
+            show_yt_dlp_unavailable(self, "pip_missing", plan)
+        elif status == "target_unwritable":
+            show_yt_dlp_unavailable(self, "target_unwritable", plan)
+        elif status == "missing_python":
+            show_yt_dlp_unavailable(self, "python_missing", plan)
+        elif status == "error":
+            detail = plan.get("status_detail", "An unknown error occurred.")
+            show_setup_warning(self, "yt-dlp Update", f"Cannot prepare the update:\n{detail}")
+        else:
+            detail = plan.get("status_detail", "Automatic updates are currently unavailable.")
+            show_setup_warning(self, "yt-dlp Update", detail)
+
     def update_yt_dlp(self):
         """Update yt-dlp using threaded non-blocking approach"""
         # Prevent multiple simultaneous updates
@@ -2306,39 +2792,27 @@ class WhisperGUI(QMainWindow):
             logging.info("yt-dlp update already in progress, ignoring request")
             return
         
+        plan = get_python_update_plan()
+        if plan.get("status") != "ready":
+            self.handle_update_plan_blockers(plan)
+            return
+        
         self.yt_dlp_update_in_progress = True
         
         try:
-            # Check if update is possible in current environment
-            if not can_update_yt_dlp():
-                # Show helpful information for exe users without Python
-                show_yt_dlp_unavailable(self)
-                return
-            
-            # Get the appropriate update command
-            update_command = get_update_command()
-            if not update_command:
-                show_setup_critical(self, "Update Error", 
-                                  "Could not determine how to update yt-dlp in your environment.")
-                return
-            
-            # Determine environment for user feedback
-            env = get_execution_environment()
-            
-            # Create the progress dialog
             self.update_progress_dialog = UpdateProgressDialog(self)
-            
-            # Create and configure the worker thread
-            self.update_worker = YtDlpUpdateWorker(update_command, env)
-            
-            # Connect signals
+            python_info = plan.get("python_info")
+            if python_info:
+                self.update_progress_dialog.update_progress(
+                    f"Using {python_info.get('display_name')} to update yt-dlp..."
+                )
+
+            logging.info("Starting yt-dlp update with command: %s", " ".join(plan["update_command"]))
+            self.update_worker = YtDlpUpdateWorker(plan)
             self.update_worker.progress.connect(self.update_progress_dialog.update_progress)
             self.update_worker.finished.connect(self.on_update_finished)
-            
-            # Connect dialog rejection (cancel) to worker stop
             self.update_progress_dialog.rejected.connect(self.cancel_update)
             
-            # Show the dialog and start the worker
             self.update_progress_dialog.show()
             self.update_worker.start()
             
@@ -2376,11 +2850,11 @@ class WhisperGUI(QMainWindow):
                 
                 # Record the successful update in persistent storage
                 try:
-                    # Get the new version after update
-                    import yt_dlp
-                    updated_version = yt_dlp.version.__version__
-                    record_ytdlp_update_success(updated_version)
-                    logging.info(f"Recorded successful yt-dlp update to version {updated_version}")
+                    updated_module = refresh_yt_dlp_module_after_update() or yt_dlp
+                    updated_version = getattr(getattr(updated_module, "version", None), "__version__", None)
+                    if updated_version:
+                        record_ytdlp_update_success(updated_version)
+                        logging.info(f"Recorded successful yt-dlp update to version {updated_version}")
                 except Exception as e:
                     logging.warning(f"Could not record update success: {e}")
                 
@@ -2542,7 +3016,11 @@ class WhisperGUI(QMainWindow):
             # Diagnose GPU detection action
             diagnose_action = hardware_menu.addAction('Diagnose GPU Detection')
             diagnose_action.triggered.connect(self.diagnose_gpu_detection)
-            
+
+            software_menu = menubar.addMenu('Software Information')
+            view_software_action = software_menu.addAction('View Software Information')
+            view_software_action.triggered.connect(self.show_software_information)
+
         except Exception as e:
             logging.error(f"Error creating menu bar: {e}")
 
@@ -2588,6 +3066,87 @@ class WhisperGUI(QMainWindow):
         except Exception as e:
             logging.error(f"Error showing hardware info: {e}")
             show_setup_critical(self, "Error", f"Could not retrieve hardware information: {e}")
+
+    def show_software_information(self):
+        """Display detected versions, interpreters, and module paths"""
+        try:
+            info_lines = []
+            execution_env = get_execution_environment()
+            mode = "Standalone Executable" if getattr(sys, 'frozen', False) else "Source (Python)"
+            info_lines.append(f"Application Mode: {mode}")
+            info_lines.append(f"Execution Environment: {execution_env}")
+            info_lines.append(f"App Directory: {get_app_directory()}")
+            info_lines.append("")
+
+            info_lines.append("Current Python Process:")
+            info_lines.append(f"• Version: {platform.python_version()} ({platform.python_implementation()})")
+            info_lines.append(f"• Executable: {sys.executable}")
+
+            runtimes = enumerate_python_runtimes()
+            info_lines.append("")
+            info_lines.append("Detected Python Interpreters:")
+            if runtimes:
+                for runtime in runtimes:
+                    pip_state = "pip available" if runtime.get("has_pip") else "pip missing"
+                    info_lines.append(
+                        f"• {runtime['display_name']} -> Python {runtime.get('version', 'unknown')} ({pip_state})"
+                    )
+                    if runtime.get("executable"):
+                        info_lines.append(f"  Executable: {runtime['executable']}")
+            else:
+                info_lines.append("• None detected")
+
+            plan = get_python_update_plan()
+            info_lines.append("")
+            info_lines.append("yt-dlp Update Planner:")
+            info_lines.append(f"• Status: {plan.get('status')}")
+            if plan.get("status_detail"):
+                info_lines.append(f"• Detail: {plan['status_detail']}")
+            python_info = plan.get("python_info")
+            if python_info:
+                info_lines.append(
+                    f"• Selected Interpreter: {python_info.get('display_name')} (Python {python_info.get('version')})"
+                )
+            if plan.get("target_directory"):
+                info_lines.append(f"• Target Directory: {plan['target_directory']}")
+
+            ytdlp_info = get_ytdlp_installation_info()
+            info_lines.append("")
+            info_lines.append("yt-dlp Module:")
+            info_lines.append(f"• Version: {ytdlp_info.get('version') or 'Not found'}")
+            info_lines.append(f"• Location: {ytdlp_info.get('path') or 'Unknown'}")
+            info_lines.append(f"• Source: {ytdlp_info.get('installation_type')}")
+
+            version_status = evaluate_yt_dlp_version_status(ytdlp_info.get('version'))
+            latest = version_status.get("latest_version")
+            if latest:
+                info_lines.append(f"• Latest Release: {latest}")
+            status_label = version_status.get("status")
+            if status_label == "up_to_date":
+                info_lines.append("• Upstream Status: Up to date")
+            elif status_label == "behind" and version_status.get("releases_behind"):
+                releases_behind = version_status["releases_behind"]
+                plural = "s" if releases_behind != 1 else ""
+                info_lines.append(
+                    f"• Upstream Status: {releases_behind} release{plural} behind"
+                )
+            elif status_label == "unknown":
+                info_lines.append("• Upstream Status: Unable to determine (version not in release list)")
+
+            info_lines.append("")
+            info_lines.append("Faster Whisper XXL Binary:")
+            if self.executable_path and os.path.exists(self.executable_path):
+                fw_version = detect_faster_whisper_binary_version(self.executable_path)
+                info_lines.append(f"• Path: {self.executable_path}")
+                info_lines.append(f"• Version: {fw_version or 'Not reported'}")
+            else:
+                info_lines.append("• Executable path not initialized yet")
+
+            info_text = "\n".join(info_lines)
+            show_setup_information(self, "Software Information", info_text)
+        except Exception as e:
+            logging.error(f"Error showing software info: {e}")
+            show_setup_warning(self, "Software Information", f"Could not gather software info:\n{e}")
 
     def diagnose_gpu_detection(self):
         """ Run comprehensive GPU detection diagnostics """
