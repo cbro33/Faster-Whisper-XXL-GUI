@@ -2,73 +2,62 @@
 
 ![AMOLED Theme Screenshot](AMOLEDThemeScreenshot.png)
 
-## About
-
-Faster Whisper XXL GUI is a user-friendly graphical interface for the powerful Faster Whisper XXL transcription engine. It simplifies the process of transcribing audio and video files, including direct YouTube video transcription, with a wide range of configurable options.
+Faster Whisper XXL GUI is a desktop interface for the Faster Whisper XXL transcription engine. It supports local files, YouTube downloads, and a wide range of output formats with configurable VAD/audio settings.
 
 ## Features
 
-*   **Intuitive Interface:** Easy-to-use GUI for all transcription tasks.
-*   **File Transcription:** Transcribe local audio and video files.
-*   **YouTube Integration:** Directly download and transcribe YouTube videos (audio-only or full video).
-*   **Automatic Dependency Setup:** Handles the download and setup of Faster Whisper XXL and FFmpeg.
-*   **Customizable Settings:** Fine-tune transcription parameters like model, language, compute type, and more.
-*   **Advanced Options:** Control VAD (Voice Activity Detection) and audio processing settings.
-*   **Multiple Output Formats:** Generate transcripts in various formats (SRT, VTT, JSON, etc.).
-*   **Theming:** Choose between Light, Dark, and AMOLED themes.
-*   **Persistent Settings:** Your preferences are saved for future use.
+- File and YouTube transcription (audio-only or full video).
+- Automatic dependency setup (Faster Whisper XXL + FFmpeg).
+- Model/task/language controls plus VAD and audio options.
+- Multiple output formats (SRT, VTT, JSON, TXT, etc.).
+- Light/Dark/AMOLED themes.
+- Persistent settings.
 
-## Download (Windows)
+## Quick Start (Windows)
 
-For most users, the easiest way to get started is to download the latest standalone executable (`.exe`) from the **[Releases](https://github.com/cbro33/Faster-Whisper-XXL-GUI/releases)** page.
+1. Download the latest `.exe` from the [Releases](https://github.com/cbro33/Faster-Whisper-XXL-GUI/releases) page.
+2. Run it (no installation required).
+3. On first launch, accept the prompt to download and set up Faster Whisper XXL + FFmpeg.
 
-1.  Go to the [Releases](https://github.com/cbro33/Faster-Whisper-XXL-GUI/releases) section.
-2.  Download the `.exe` file from the latest release.
-3.  Run the file. No installation is needed.
+## Run From Source
 
-The first time you run the application, it will prompt you to automatically download and set up the necessary Faster Whisper XXL executable and FFmpeg.
+1. Install Python 3.8+ and `pip`.
+2. Clone and install:
+   ```bash
+   git clone https://github.com/cbro33/Faster-Whisper-XXL-GUI.git
+   cd Faster-Whisper-XXL-GUI
+   pip install -r requirements.txt
+   ```
+3. Launch:
+   ```bash
+   python src/faster-whisper-xxl-gui.py
+   ```
 
-## Installation from Source
+## Manual Setup (If Auto Download Fails)
 
-This method is for developers or users who want to run the application directly from the Python source code.
+Download the standalone Faster Whisper XXL archive and extract its contents into the app `bin` folder.
 
-1.  **Prerequisites:**
-    *   Python 3.8 or higher.
-    *   `pip` (Python package installer).
+- Release page: https://github.com/Purfview/whisper-standalone-win/releases/tag/Faster-Whisper-XXL
+- Windows: https://github.com/Purfview/whisper-standalone-win/releases/download/Faster-Whisper-XXL/Faster-Whisper-XXL_r245.4_windows.7z
+- Linux: https://github.com/Purfview/whisper-standalone-win/releases/download/Faster-Whisper-XXL/Faster-Whisper-XXL_r245.4_linux.7z
 
-2.  **Clone the repository:**
-    ```bash
-    git clone https://github.com/cbro33/Faster-Whisper-XXL-GUI.git
-    cd Faster-Whisper-XXL-GUI
-    ```
-
-3.  **Install dependencies:**
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-4.  **Run the application:**
-    ```bash
-    python src/faster-whisper-xxl-gui.py
-    ```
+If extraction fails on Windows, install 7-Zip: https://www.7-zip.org/
 
 ## Usage
 
-1.  **Select Input:**
-    *   **File Tab:** Browse and select a local audio or video file.
-    *   **yt-dlp Tab:** Enter a YouTube video URL. You can choose to download audio only or the full video.
-2.  **Configure Settings:** Adjust the various transcription parameters in the "Global Settings", "Advanced", "VAD", and "Audio" tabs according to your needs.
-3.  **Run Transcription:** Click the "Run" button to start the transcription process.
-4.  **View Output:** The console output will display the progress, and the generated transcript files will be saved in your specified output directory (defaults to an `output` folder within the application directory).
+1. Add files in the **File** tab or provide a URL in **yt-dlp**.
+2. Adjust settings in **Global Settings**, **Advanced**, **VAD**, or **Audio** tabs.
+3. Click **Run** and check the console output for progress.
+4. Outputs are saved to your chosen output directory (defaults to `output` in the app folder).
 
-## Detailed Options and Hardware Recommendations
+## Docs
 
-For a comprehensive guide on all available options, their detailed functionalities, and hardware recommendations for optimal performance, please refer to the project's [Wiki](https://github.com/cbro33/Faster-Whisper-XXL-GUI/wiki)
+Detailed options and hardware guidance live in the [Wiki](https://github.com/cbro33/Faster-Whisper-XXL-GUI/wiki).
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit issues or pull requests.
+Issues and pull requests are welcome.
 
 ## License
 
-This project is licensed under the GNU GPL 3 License - see the `LICENSE` file for details.
+This project uses the [GNU GPL 3](https://www.gnu.org/licenses/gpl-3.0.html). See [LICENSE](LICENSE).
