@@ -35,13 +35,14 @@ Faster Whisper XXL GUI is a desktop interface for the Faster Whisper XXL transcr
 
 ## Manual Setup (If Auto Download Fails)
 
+Auto Setup is still a WIP and may not work all time on every machine. If ther are issues, you can do a manual installation.
 Download the standalone Faster Whisper XXL archive and extract its contents into the app `bin` folder.
 
-- Release page: https://github.com/Purfview/whisper-standalone-win/releases/tag/Faster-Whisper-XXL
-- Windows: https://github.com/Purfview/whisper-standalone-win/releases/download/Faster-Whisper-XXL/Faster-Whisper-XXL_r245.4_windows.7z
-- Linux: https://github.com/Purfview/whisper-standalone-win/releases/download/Faster-Whisper-XXL/Faster-Whisper-XXL_r245.4_linux.7z
+- [Release page](https://github.com/Purfview/whisper-standalone-win/releases/tag/Faster-Whisper-XXL)
+- [Windows archive](https://github.com/Purfview/whisper-standalone-win/releases/download/Faster-Whisper-XXL/Faster-Whisper-XXL_r245.4_windows.7z)
+- [Linux archive](https://github.com/Purfview/whisper-standalone-win/releases/download/Faster-Whisper-XXL/Faster-Whisper-XXL_r245.4_linux.7z)
 
-If extraction fails on Windows, install 7-Zip: https://www.7-zip.org/
+If extraction fails on Windows, install [7-Zip](https://www.7-zip.org/).
 
 ## Usage
 
