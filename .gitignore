@@ -5,3 +5,4 @@ logs/
 __pycache__
 faster-whisper-xxl-gui.spec
 *.json
+*.txt

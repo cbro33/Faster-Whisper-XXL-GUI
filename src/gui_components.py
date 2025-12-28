@@ -5,6 +5,8 @@ import requests
 import webbrowser
 import shutil
 import tempfile
+import threading
+import re
 from PyQt6.QtWidgets import (
     QDialog,
     QProgressBar,
@@ -18,10 +20,11 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QWidget,
+    QSizePolicy,
 )
 from PyQt6.QtCore import pyqtSignal, Qt, QTimer
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
-from utils import get_window_stays_on_top_flag, run_hidden_subprocess
+from utils import get_window_stays_on_top_flag, run_hidden_subprocess, get_app_directory
 from gpu_utils import detect_hardware_capabilities, get_recommended_settings
 from config import SUPPORTED_EXTENSIONS
 
@@ -87,6 +90,57 @@ def show_setup_question(parent, title, text, buttons, default_button=None):
     """ Show question dialog for setup that stays on top """
     msg = create_always_on_top_message_box(parent, QMessageBox.Icon.Question, title, text, buttons, default_button)
     return msg.exec()
+
+
+_MODEL_DEBUG_ENABLED = False
+
+
+def set_model_download_logging_enabled(enabled):
+    global _MODEL_DEBUG_ENABLED
+    _MODEL_DEBUG_ENABLED = bool(enabled)
+    if _MODEL_DEBUG_ENABLED:
+        get_model_download_logger()
+
+
+def get_model_download_log_path():
+    log_dir = os.path.join(get_app_directory(), "logs")
+    return os.path.join(log_dir, "debug_log.txt")
+
+
+class RedactingFormatter(logging.Formatter):
+    def format(self, record):
+        message = super().format(record)
+        message = re.sub(r"[A-Za-z]:\\\\[^\\s]+", "<path>", message)
+        message = re.sub(r"\\\\\\\\[^\\s]+", "<path>", message)
+        message = re.sub(r"(?<![A-Za-z0-9])/(?:[^\\s]+)", "<path>", message)
+        return message
+
+
+def get_model_download_logger():
+    logger = logging.getLogger("model_download")
+    if not _MODEL_DEBUG_ENABLED:
+        logger.disabled = True
+        logger.propagate = False
+        if not getattr(logger, "_null_configured", False):
+            logger.addHandler(logging.NullHandler())
+            logger._null_configured = True
+        return logger
+    if getattr(logger, "_configured", False):
+        logger.disabled = False
+        return logger
+    log_dir = os.path.join(get_app_directory(), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = get_model_download_log_path()
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    formatter = RedactingFormatter("%(asctime)s - %(levelname)s - %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger._configured = True
+    logger.disabled = False
+    logger.info("Model download logging initialized")
+    return logger
 
 def show_yt_dlp_unavailable(parent, reason="python_missing", plan=None):
     """ Show informative dialog when automatic updates are not possible """
@@ -478,6 +532,433 @@ class DownloadManager(QDialog):
     def reject(self):
         self.cleanup_archive_and_dir("temp_extract")
         super().reject()
+
+
+class ModelDownloadDialog(QDialog):
+    download_progress = pyqtSignal(object, object, str)
+    download_finished_signal = pyqtSignal()
+    error_occurred = pyqtSignal(str)
+    _debug_counter = 0
+
+    def __init__(self, model_name, target_dir, parent=None):
+        super().__init__(parent)
+        self.model_name = model_name
+        self.target_dir = target_dir
+        self.repo_id = f"Systran/faster-whisper-{model_name}"
+        self.cancelled = False
+        self.worker_thread = None
+        self._active_response = None
+        self.file_sizes = {}  # Cache for API sizes
+        self._logged_zero_total = set()
+        self._debug_logger = get_model_download_logger()
+        ModelDownloadDialog._debug_counter += 1
+        self._debug_id = f"model-dialog-{ModelDownloadDialog._debug_counter}"
+        self._progress_total = None
+        self._progress_scale = 1
+        self._debug_logger.info("[%s] init model=%s", self._debug_id, self.model_name)
+
+        self.setWindowTitle("Model Download")
+        self.setModal(True)
+        self.setMinimumSize(520, 180)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
+
+        stay_on_top_flag = get_window_stays_on_top_flag()
+        if stay_on_top_flag is not None:
+            try:
+                self.setWindowFlags(self.windowFlags() | stay_on_top_flag)
+            except Exception as e:
+                logging.warning(f"Could not set always-on-top flag: {e}")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(30, 30, 30, 30)
+        layout.setSpacing(10)
+
+        # 1. Header
+        self.status_label = QLabel(f"Downloading model: {self.model_name}", self)
+        self.status_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #ffffff;")
+        layout.addWidget(self.status_label)
+
+        layout.addSpacing(5)
+
+        # 2. Info Row (Filename ... Size/Percentage)
+        info_layout = QHBoxLayout()
+        self.file_label = QLabel("Initializing...", self)
+        self.file_label.setStyleSheet("color: #dddddd; font-size: 14px;")
+        
+        self.details_label = QLabel("Connecting...", self)
+        self.details_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.details_label.setStyleSheet("color: #dddddd; font-size: 14px; font-weight: bold; font-family: 'Consolas', 'Courier New', monospace;")
+        
+        info_layout.addWidget(self.file_label)
+        info_layout.addStretch()
+        info_layout.addWidget(self.details_label)
+        layout.addLayout(info_layout)
+
+        # 3. Progress Bar
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setMinimumHeight(10)
+        self.progress_bar.setMaximumHeight(10)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        layout.addWidget(self.progress_bar)
+
+        # 4. Buttons
+        layout.addStretch()
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        
+        self.cancel_button = QPushButton("Cancel", self)
+        self.cancel_button.setMinimumWidth(110)
+        self.cancel_button.setObjectName("CancelButton")
+        self.cancel_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.cancel_button.setStyleSheet("font-size: 14px;")
+        
+        button_layout.addWidget(self.cancel_button)
+        layout.addLayout(button_layout)
+        
+        self.cancel_button.clicked.connect(self.cancel)
+        self.download_progress.connect(self.update_download_progress)
+        self.download_finished_signal.connect(self.on_download_finished)
+        self.error_occurred.connect(self.on_error)
+        self.finished.connect(self._log_finished)
+        self.rejected.connect(self._log_rejected)
+        self.accepted.connect(self._log_accepted)
+
+        QTimer.singleShot(100, self.start_download)
+
+    def _log_finished(self, result):
+        self._debug_logger.info(
+            "[%s] finished result=%s cancelled=%s", self._debug_id, result, self.cancelled
+        )
+
+    def _log_rejected(self):
+        self._debug_logger.info("[%s] rejected cancelled=%s", self._debug_id, self.cancelled)
+
+    def _log_accepted(self):
+        self._debug_logger.info("[%s] accepted", self._debug_id)
+
+    def cancel(self):
+        """Immediately flags the dialog as cancelled and rejects it."""
+        if self.cancelled:
+            self._debug_logger.info("[%s] cancel ignored (already cancelled)", self._debug_id)
+            return
+        self.cancelled = True
+        self._debug_logger.info(
+            "[%s] cancel requested active_response=%s",
+            self._debug_id,
+            self._active_response is not None,
+        )
+        
+        # Update UI to show cancellation
+        self.file_label.setText("Cancelling...")
+        self.details_label.setText("")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.setText("Closing...")
+        
+        # Ensure UI updates are processed before rejecting
+        from PyQt6.QtWidgets import QApplication
+        QApplication.processEvents()
+
+        # Close the network response to unblock the thread
+        if self._active_response is not None:
+            try:
+                self._active_response.close()
+            except Exception:
+                pass
+        
+        self.reject()
+
+    def start_download(self):
+        self._debug_logger.info("[%s] start_download", self._debug_id)
+        self.worker_thread = threading.Thread(target=self.download_worker, daemon=True)
+        self.worker_thread.start()
+
+    def _fetch_file_size(self, filename):
+        """Safely get file size from URL, falling back to API if header is missing."""
+        url = f"https://huggingface.co/{self.repo_id}/resolve/main/{filename}"
+        try:
+            # First, try HEAD request for Content-Length
+            head_resp = requests.head(url, allow_redirects=True, timeout=5)
+            if head_resp.status_code == 200:
+                content_length = int(head_resp.headers.get("content-length", 0))
+                if content_length > 0:
+                    if filename == "model.bin":
+                        self._debug_logger.info(
+                            "[%s] size head bytes=%s", self._debug_id, content_length
+                        )
+                    return content_length
+        except Exception:
+            pass
+
+        # If HEAD failed or gave 0, try GET request and parse content-length or use API
+        try:
+            get_resp = requests.get(url, stream=True, timeout=5)
+            if get_resp.status_code == 200:
+                content_length = int(get_resp.headers.get("content-length", 0))
+                if content_length > 0:
+                    if filename == "model.bin":
+                        self._debug_logger.info(
+                            "[%s] size get bytes=%s", self._debug_id, content_length
+                        )
+                    return content_length
+                
+                # If GET header is still 0, try API
+                size = self._fetch_file_size_from_hf_api(filename)
+                if filename == "model.bin":
+                    self._debug_logger.info(
+                        "[%s] size api bytes=%s", self._debug_id, size
+                    )
+                return size
+        except Exception:
+            pass
+            
+        # Final fallback: API lookup if all else fails
+        size = self._fetch_file_size_from_hf_api(filename)
+        if filename == "model.bin":
+            self._debug_logger.info(
+                "[%s] size api fallback bytes=%s", self._debug_id, size
+            )
+        return size
+
+    def _fetch_file_size_from_hf_api(self, filename):
+        """Fetch size from HuggingFace API, caching results."""
+        cached_size = self.file_sizes.get(filename)
+        if cached_size is not None:
+            return cached_size
+        
+        try:
+            api_url = f"https://huggingface.co/api/models/{self.repo_id}"
+            resp = requests.get(api_url, timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                for sibling in data.get("siblings", []):
+                    fname = sibling.get("rfilename")
+                    fsize = sibling.get("size")
+                    if fname and fsize:
+                        self.file_sizes[fname] = fsize  # Cache it
+                        if fname == filename:
+                            return fsize
+        except Exception:
+            logging.warning(f"API fetch failed for {filename}")
+            
+        return 0  # Return 0 if size is unknown
+
+    def download_worker(self):
+        try:
+            self._debug_logger.info("[%s] download_worker started", self._debug_id)
+            os.makedirs(self.target_dir, exist_ok=True)
+            
+            # Fetch all sizes at the start
+            self.download_progress.emit(0, 0, "Fetching metadata...@@")
+            self.file_sizes["config.json"] = self._fetch_file_size("config.json")
+            self.file_sizes["tokenizer.json"] = self._fetch_file_size("tokenizer.json")
+            self.file_sizes["preprocessor_config.json"] = self._fetch_file_size("preprocessor_config.json")
+            self.file_sizes["vocabulary.json"] = self._fetch_file_size("vocabulary.json")
+            self.file_sizes["vocabulary.txt"] = self._fetch_file_size("vocabulary.txt")
+            self.file_sizes["model.bin"] = self._fetch_file_size("model.bin")
+            
+            if self.cancelled:
+                raise RuntimeError("Cancelled")
+
+            # Download small files
+            for filename in ["config.json", "tokenizer.json", "preprocessor_config.json"]:
+                if self.cancelled:
+                    raise RuntimeError("Cancelled")
+                required = (filename != "preprocessor_config.json")
+                self._download_file(filename, required=required)
+
+            # Vocabulary
+            if self.cancelled:
+                raise RuntimeError("Cancelled")
+            if not self._download_file("vocabulary.json", required=False):
+                self._download_file("vocabulary.txt", required=False)
+
+            # Model Binary
+            if self.cancelled:
+                raise RuntimeError("Cancelled")
+            self._download_model_bin()
+
+            if not self.cancelled:
+                self.download_finished_signal.emit()
+        except Exception as exc:
+            if not self.cancelled:
+                self.error_occurred.emit(str(exc))
+        finally:
+            self._debug_logger.info(
+                "[%s] download_worker finished cancelled=%s", self._debug_id, self.cancelled
+            )
+
+    def _download_file(self, filename, required):
+        if self.cancelled:
+            return False
+        target_path = os.path.join(self.target_dir, filename)
+        
+        total = self.file_sizes.get(filename, 0)  # Use cached API size or 0
+
+        # Check if already downloaded
+        if os.path.exists(target_path):
+            existing_size = os.path.getsize(target_path)
+            if total > 0 and existing_size == total:
+                return True
+            if total == 0 and existing_size > 0:
+                return True  # Assume good if size is unknown but file exists
+            if total == 0 and existing_size == 0:
+                pass  # Re-download if both are zero
+
+        url = f"https://huggingface.co/{self.repo_id}/resolve/main/{filename}"
+        self.download_progress.emit(0, total, f"{filename}@@init")
+        if filename != "model.bin":
+            self._debug_logger.info(
+                "[%s] aux download start total=%s", self._debug_id, total
+            )
+        
+        response = requests.get(url, stream=True, timeout=30)
+        self._active_response = response
+        if response.status_code == 404:
+            if required:
+                raise FileNotFoundError(f"{filename} not found.")
+            return False
+        response.raise_for_status()
+        
+        # If total is still 0, use header size if available
+        if total == 0:
+            total = int(response.headers.get("content-length", 0))
+            if filename != "model.bin":
+                self._debug_logger.info(
+                    "[%s] aux download header total=%s", self._debug_id, total
+                )
+
+        downloaded = 0
+        self.download_progress.emit(0, total, f"{filename}@@downloading")
+        
+        with open(target_path, "wb") as handle:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if self.cancelled:
+                    handle.close()
+                    if os.path.exists(target_path):
+                        os.remove(target_path)
+                    return False
+                if chunk:
+                    handle.write(chunk)
+                    downloaded += len(chunk)
+                    self.download_progress.emit(downloaded, total, f"{filename}@@downloading")
+        return True
+
+    def _download_model_bin(self):
+        if self.cancelled:
+            return
+        target_path = os.path.join(self.target_dir, "model.bin")
+        filename = "model.bin"
+        
+        total = self.file_sizes.get(filename, 0)
+        self._debug_logger.info(
+            "[%s] model download start total_cached=%s", self._debug_id, total
+        )
+
+        if os.path.exists(target_path):
+            if total > 0 and os.path.getsize(target_path) == total:
+                return
+            if total == 0 and os.path.getsize(target_path) > 0:
+                return
+
+        url = f"https://huggingface.co/{self.repo_id}/resolve/main/{filename}"
+        self.download_progress.emit(0, 0, f"{filename}@@init")
+        
+        response = requests.get(url, stream=True, timeout=30)
+        self._active_response = response
+        if response.status_code == 404:
+            raise FileNotFoundError(f"{filename} not found.")
+        response.raise_for_status()
+        
+        if total == 0:  # If API size failed, try header size
+            total = int(response.headers.get("content-length", 0))
+            self._debug_logger.info(
+                "[%s] model download header total=%s", self._debug_id, total
+            )
+
+        downloaded = 0
+        self.download_progress.emit(0, total, f"{filename}@@downloading")
+        
+        with open(target_path, "wb") as handle:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if self.cancelled:
+                    handle.close()
+                    if os.path.exists(target_path):
+                        os.remove(target_path)
+                    return
+                if not chunk:
+                    continue
+                handle.write(chunk)
+                downloaded += len(chunk)
+                self.download_progress.emit(downloaded, total, f"{filename}@@downloading")
+
+    def format_size(self, size_in_bytes):
+        units = ["B", "KB", "MB", "GB", "TB"]
+        size = float(size_in_bytes)
+        for unit in units:
+            if size < 1024.0:
+                return f"{size:.2f} {unit}"
+            size /= 1024.0
+        return f"{size:.2f} PB"
+
+    def update_download_progress(self, value, total, text):
+        if self.cancelled:
+            return
+        
+        file_name = None
+        if "@@" in text:
+            file_name, _ = text.split("@@", 1)
+            self.file_label.setText(file_name)
+        
+        if total > 0:
+            max_qt_int = 2_147_483_647
+            scale = 1 if total <= max_qt_int else 1024 * 1024
+            scaled_total = max(1, int(total // scale))
+            scaled_value = max(0, int(value // scale))
+            if scaled_value > scaled_total:
+                scaled_value = scaled_total
+            if self._progress_total != scaled_total or self._progress_scale != scale:
+                self.progress_bar.setRange(0, scaled_total)
+                self._progress_total = scaled_total
+                self._progress_scale = scale
+            self.progress_bar.setValue(scaled_value)
+
+            percent = int((value / total) * 100)
+            current_str = self.format_size(value)
+            total_str = self.format_size(total)
+            
+            self.details_label.setText(f"{percent}%  •  {current_str} / {total_str}")
+        else:
+            # Fallback if total size is unknown
+            self.progress_bar.setRange(0, 0)
+            if value > 0:
+                self.details_label.setText(f"{self.format_size(value)} downloaded")
+                if not self._logged_zero_total:
+                    self._logged_zero_total.add("seen")
+                    self._debug_logger.info(
+                        "[%s] total unknown value=%s", self._debug_id, value
+                    )
+            else:
+                self.details_label.setText("Connecting...")
+
+    def on_download_finished(self):
+        if self.cancelled:
+            return
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(1)
+        self.file_label.setText("Download complete")
+        self.details_label.setText("100%")
+        self._debug_logger.info("[%s] download_finished", self._debug_id)
+        self.accept()
+
+    def on_error(self, message):
+        if self.cancelled:
+            return  # Don't show error if we cancelled it
+        self.error_string = message
+        self.file_label.setText("Error occurred")
+        self.details_label.setText("Failed")
+        self._debug_logger.info("[%s] error message=%s", self._debug_id, message)
+        self.reject()
 
 
 class HardwareOptimizationDialog(QDialog):

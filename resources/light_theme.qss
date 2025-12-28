@@ -94,3 +94,37 @@ QComboBox QAbstractItemView {
     border: 1px solid #dcdcdc;
     selection-background-color: #007acc;
 }
+
+QProgressBar {
+    background-color: #f0f0f0;
+    border: 1px solid #dcdcdc;
+    border-radius: 6px;
+    text-align: center;
+    color: #000000;
+    font-weight: bold;
+}
+
+QProgressBar::chunk {
+    background-color: #007acc;
+    border-radius: 6px;
+    margin: 0px;
+}
+
+QDialog {
+    background-color: #ffffff;
+}
+
+QLabel {
+    color: #000000;
+}
+
+QPushButton#CancelButton {
+    background-color: #f0f0f0;
+    border: 1px solid #bdbdbd;
+    color: #000000;
+}
+
+QPushButton#CancelButton:hover {
+    background-color: #e6e6e6;
+    border-color: #cc3333;
+}

@@ -7,6 +7,7 @@ import requests
 import webbrowser
 import platform
 import re
+import ntpath
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QSplitter, QHBoxLayout, QVBoxLayout, QLabel, 
     QComboBox, QTabWidget, QGroupBox, QFormLayout, QPushButton, 
@@ -15,7 +16,7 @@ from PyQt6.QtWidgets import (
     QSpacerItem, QMessageBox, QApplication, QGridLayout, QLineEdit, QDialog
 )
 from PyQt6.QtCore import Qt, QTimer, QProcess, QByteArray, QUrl
-from PyQt6.QtGui import QIcon, QPalette, QColor, QTextCursor, QFont
+from PyQt6.QtGui import QIcon, QPalette, QColor, QTextCursor, QFont, QDesktopServices
 
 from config import APP_VERSION, SUPPORTED_EXTENSIONS
 from utils import (
@@ -37,7 +38,8 @@ from gui_components import (
     DownloadManager, HardwareOptimizationDialog, FileDropGroupBox, FileDropListWidget,
     FileDropLineEdit, FileDropWidget, UpdateProgressDialog, show_setup_critical, 
     show_setup_question, show_setup_warning, show_setup_information,
-    show_yt_dlp_unavailable
+    show_yt_dlp_unavailable, ModelDownloadDialog, set_model_download_logging_enabled,
+    get_model_download_log_path, get_model_download_logger
 )
 from gpu_utils import detect_hardware_capabilities
 
@@ -73,6 +75,7 @@ class WhisperGUI(QMainWindow):
         self.last_line_was_overwrite = False
         self.transcription_completed_successfully = False
         self._single_output_line_emitted = False
+        self._auto_highlight_notice_shown = False
         
         if not self.check_and_setup_dependencies():
             QTimer.singleShot(0, self.close)
@@ -80,6 +83,7 @@ class WhisperGUI(QMainWindow):
 
         self.init_ui()
         self.load_settings()
+        set_model_download_logging_enabled(self.settings.get("debug_model_download_logging", False))
         self.setup_realtime_saving()
         
         # Check for hardware optimization on first run
@@ -287,9 +291,15 @@ class WhisperGUI(QMainWindow):
         output_dir_layout.setContentsMargins(0, 0, 0, 0)
         self.output_dir = QLineEdit()
         self.output_dir.setPlaceholderText("Leave empty for default 'output' folder")
-        self.output_dir.setToolTip("Folder where transcripts and related files are saved.")
+        self.output_dir.setToolTip(
+            "Where to save output files. Default is the app folder, or the media folder when using recursive batch. "
+            "Use '.' for the current folder or 'source' for the media folder."
+        )
         output_dir_label = QLabel("Output Dir:")
-        output_dir_label.setToolTip("Folder where transcripts and related files are saved.")
+        output_dir_label.setToolTip(
+            "Where to save output files. Default is the app folder, or the media folder when using recursive batch. "
+            "Use '.' for the current folder or 'source' for the media folder."
+        )
         self.browse_out_btn = QPushButton("Browse")
         self.browse_out_btn.setToolTip("Choose an output folder.")
         self.browse_out_btn.clicked.connect(self.browse_output_dir)
@@ -299,9 +309,9 @@ class WhisperGUI(QMainWindow):
         self.model_combo = QComboBox()
         self.model_combo.addItems(['tiny', 'tiny.en', 'base', 'base.en', 'small', 'small.en', 'medium', 'medium.en', 'large-v1', 'large-v2', 'large-v3', 'large-v3-turbo', 'distil-large-v2', 'distil-large-v3', 'distil-medium.en', 'distil-small.en'])
         self.model_combo.setCurrentText('large-v3')
-        self.model_combo.setToolTip("Whisper model size; larger models are slower but more accurate.")
+        self.model_combo.setToolTip("Choose a model. Larger models are more accurate but use more resources.")
         model_label = QLabel("Model:")
-        model_label.setToolTip("Whisper model size; larger models are slower but more accurate.")
+        model_label.setToolTip("Choose a model. Larger models are more accurate but use more resources.")
         layout.addRow(model_label, self.model_combo)
         self.task_combo = QComboBox()
         self.task_combo.addItems(['transcribe', 'translate'])
@@ -310,11 +320,47 @@ class WhisperGUI(QMainWindow):
         task_label.setToolTip("Transcribe keeps the original language; translate outputs English.")
         layout.addRow(task_label, self.task_combo)
         self.language_combo = QComboBox()
-        languages = ['auto'] + ['af', 'am', 'ar', 'as', 'az', 'ba', 'be', 'bg', 'bn', 'bo', 'br', 'bs', 'ca', 'cs', 'cy', 'da', 'de', 'el', 'en', 'es', 'et', 'eu', 'fa', 'fi', 'fo', 'fr', 'gl', 'gu', 'ha', 'haw', 'he', 'hi', 'hr', 'ht', 'hu', 'hy', 'id', 'is', 'it', 'ja', 'jw', 'ka', 'kk', 'km', 'kn', 'ko', 'la', 'lb', 'ln', 'lo', 'lt', 'lv', 'mg', 'mi', 'mk', 'ml', 'mn', 'mr', 'ms', 'mt', 'my', 'ne', 'nl', 'nn', 'no', 'oc', 'pa', 'pl', 'ps', 'pt', 'ro', 'ru', 'sa', 'sd', 'si', 'sk', 'sl', 'sn', 'so', 'sq', 'sr', 'su', 'sv', 'sw', 'ta', 'te', 'tg', 'th', 'tk', 'tl', 'tr', 'tt', 'uk', 'ur', 'uz', 'vi', 'yi', 'yo', 'yue', 'zh']
-        self.language_combo.addItems(languages)
+        languages = [
+            ("auto", "Auto"),
+            ("af", "Afrikaans"), ("am", "Amharic"), ("ar", "Arabic"), ("as", "Assamese"),
+            ("az", "Azerbaijani"), ("ba", "Bashkir"), ("be", "Belarusian"), ("bg", "Bulgarian"),
+            ("bn", "Bengali"), ("bo", "Tibetan"), ("br", "Breton"), ("bs", "Bosnian"),
+            ("ca", "Catalan"), ("cs", "Czech"), ("cy", "Welsh"), ("da", "Danish"),
+            ("de", "German"), ("el", "Greek"), ("en", "English"), ("es", "Spanish"),
+            ("et", "Estonian"), ("eu", "Basque"), ("fa", "Persian"), ("fi", "Finnish"),
+            ("fo", "Faroese"), ("fr", "French"), ("gl", "Galician"), ("gu", "Gujarati"),
+            ("ha", "Hausa"), ("haw", "Hawaiian"), ("he", "Hebrew"), ("hi", "Hindi"),
+            ("hr", "Croatian"), ("ht", "Haitian Creole"), ("hu", "Hungarian"), ("hy", "Armenian"),
+            ("id", "Indonesian"), ("is", "Icelandic"), ("it", "Italian"), ("ja", "Japanese"),
+            ("jw", "Javanese"), ("ka", "Georgian"), ("kk", "Kazakh"), ("km", "Khmer"),
+            ("kn", "Kannada"), ("ko", "Korean"), ("la", "Latin"), ("lb", "Luxembourgish"),
+            ("ln", "Lingala"), ("lo", "Lao"), ("lt", "Lithuanian"), ("lv", "Latvian"),
+            ("mg", "Malagasy"), ("mi", "Maori"), ("mk", "Macedonian"), ("ml", "Malayalam"),
+            ("mn", "Mongolian"), ("mr", "Marathi"), ("ms", "Malay"), ("mt", "Maltese"),
+            ("my", "Burmese"), ("ne", "Nepali"), ("nl", "Dutch"), ("nn", "Nynorsk"),
+            ("no", "Norwegian"), ("oc", "Occitan"), ("pa", "Punjabi"), ("pl", "Polish"),
+            ("ps", "Pashto"), ("pt", "Portuguese"), ("ro", "Romanian"), ("ru", "Russian"),
+            ("sa", "Sanskrit"), ("sd", "Sindhi"), ("si", "Sinhala"), ("sk", "Slovak"),
+            ("sl", "Slovenian"), ("sn", "Shona"), ("so", "Somali"), ("sq", "Albanian"),
+            ("sr", "Serbian"), ("su", "Sundanese"), ("sv", "Swedish"), ("sw", "Swahili"),
+            ("ta", "Tamil"), ("te", "Telugu"), ("tg", "Tajik"), ("th", "Thai"),
+            ("tk", "Turkmen"), ("tl", "Tagalog"), ("tr", "Turkish"), ("tt", "Tatar"),
+            ("uk", "Ukrainian"), ("ur", "Urdu"), ("uz", "Uzbek"), ("vi", "Vietnamese"),
+            ("yi", "Yiddish"), ("yo", "Yoruba"), ("yue", "Cantonese"), ("zh", "Chinese"),
+        ]
+        for code, name in languages:
+            display = f"{name} ({code})"
+            self.language_combo.addItem(display, code)
         self.language_combo.setEditable(True)
         self.language_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.language_combo.setToolTip("Auto-detect or pick a language code.")
+        if line_edit := self.language_combo.lineEdit():
+            line_edit.setTextMargins(0, 0, 0, 0)
+            line_edit.setContentsMargins(0, 0, 0, 0)
+        self.language_combo.setStyleSheet(
+            "QComboBox { padding-left: 0px; }"
+            "QComboBox QLineEdit { padding-left: 0px; margin-left: 0px; }"
+        )
         if completer := self.language_combo.completer():
             completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
         language_label = QLabel("Language:")
@@ -322,22 +368,30 @@ class WhisperGUI(QMainWindow):
         layout.addRow(language_label, self.language_combo)
         self.compute_combo = QComboBox()
         self.compute_combo.addItems(['default', 'auto', 'int8', 'int8_float16', 'int8_float32', 'int8_bfloat16', 'int16', 'float16', 'float32', 'bfloat16'])
-        self.compute_combo.setToolTip("Precision/quantization tradeoff; lower precision is faster.")
+        self.compute_combo.setToolTip(
+            "Speed vs quality setting. Lower precision is faster and uses less GPU memory."
+        )
         compute_label = QLabel("Compute Type:")
-        compute_label.setToolTip("Precision/quantization tradeoff; lower precision is faster.")
+        compute_label.setToolTip(
+            "Speed vs quality setting. Lower precision is faster and uses less GPU memory."
+        )
         layout.addRow(compute_label, self.compute_combo)
         self.device_combo = QComboBox()
         self.device_combo.addItems(['cuda', 'cpu'])
-        self.device_combo.setToolTip("CUDA uses GPU; CPU is slower but compatible.")
+        self.device_combo.setToolTip(
+            "Use GPU (cuda) if available, otherwise CPU."
+        )
         device_label = QLabel("Device:")
-        device_label.setToolTip("CUDA uses GPU; CPU is slower but compatible.")
+        device_label.setToolTip(
+            "Use GPU (cuda) if available, otherwise CPU."
+        )
         layout.addRow(device_label, self.device_combo)
         self.full_console_checkbox = QCheckBox("Show extra console details")
         self.full_console_checkbox.setObjectName("full_console_checkbox")
-        self.full_console_checkbox.setToolTip("Includes extra status lines; transcription content is always shown.")
+        self.full_console_checkbox.setToolTip("Show extra status lines (verbose).")
         self.full_console_checkbox.setChecked(False)
         console_label = QLabel("Console Output:")
-        console_label.setToolTip("Includes extra status lines; transcription content is always shown.")
+        console_label.setToolTip("Show extra status lines (verbose).")
         layout.addRow(console_label, self.full_console_checkbox)
         output_format_group = QWidget()
         container_layout = QHBoxLayout(output_format_group)
@@ -350,7 +404,7 @@ class WhisperGUI(QMainWindow):
         for i, fmt in enumerate(formats):
             checkbox = QCheckBox(fmt)
             checkbox.setObjectName(f"format_checkbox_{fmt}")
-            checkbox.setToolTip("Select output files to generate.")
+            checkbox.setToolTip("Select one or more output formats.")
             checkbox.setStyleSheet("QCheckBox::indicator { width: 16px; height: 16px; }")
             checkbox.setMinimumHeight(20)
             self.output_format_checkboxes[fmt] = checkbox
@@ -406,44 +460,42 @@ class WhisperGUI(QMainWindow):
         scroll_layout.addRow(self.tooltips_checkbox)
         self.word_timestamps_checkbox = QCheckBox("Word timestamps")
         self.word_timestamps_checkbox.setObjectName("word_timestamps_checkbox")
-        self.word_timestamps_checkbox.setToolTip("Include word-level timestamps when supported by the output format.")
+        self.word_timestamps_checkbox.setToolTip(
+            "Include word-level timestamps when supported by the output format. "
+            "For SRT/VTT, Highlight words will be enabled automatically."
+        )
         scroll_layout.addRow(self.word_timestamps_checkbox)
-        self.highlight_words_checkbox = QCheckBox("Highlight words (karaoke)")
+        self.highlight_words_checkbox = QCheckBox("Highlight words")
         self.highlight_words_checkbox.setObjectName("highlight_words_checkbox")
-        self.highlight_words_checkbox.setToolTip("Highlight words as they are spoken (works with SRT/VTT).")
+        self.highlight_words_checkbox.setToolTip(
+            "Highlight words as they are spoken (SRT/VTT only). "
+            "Required to render word-level timestamps in SRT/VTT."
+        )
         scroll_layout.addRow(self.highlight_words_checkbox)
         self.temperature = QDoubleSpinBox()
         self.temperature.setRange(0.0, 1.0)
         self.temperature.setSingleStep(0.1)
         self.temperature.setDecimals(1)
-        self.temperature.setToolTip("Higher values increase randomness; lower values are more deterministic.")
+        self.temperature.setToolTip("Higher values increase randomness; lower values are more consistent.")
         scroll_layout.addRow("Temperature:", self.temperature)
         self.beam_size = QSpinBox()
         self.beam_size.setRange(1, 100)
-        self.beam_size.setToolTip("Number of beams used in decoding.")
+        self.beam_size.setToolTip("Number of beams used in decoding (temperature 0).")
         scroll_layout.addRow("Beam Size:", self.beam_size)
         self.best_of = QSpinBox()
         self.best_of.setRange(1, 100)
-        self.best_of.setToolTip("Number of candidates to consider for greedy decoding.")
+        self.best_of.setToolTip("Number of candidates to consider when temperature > 0.")
         scroll_layout.addRow("Best Of:", self.best_of)
         self.patience = QDoubleSpinBox()
         self.patience.setRange(0.0, 10.0)
         self.patience.setSingleStep(0.1)
         self.patience.setDecimals(1)
-        self.patience.setToolTip("Adjusts beam search patience; higher may improve accuracy.")
+        self.patience.setToolTip("Beam search patience; higher may improve accuracy.")
         scroll_layout.addRow("Patience:", self.patience)
         self.initial_prompt = QTextEdit()
         self.initial_prompt.setMaximumHeight(80)
         self.initial_prompt.setToolTip("Optional text to prime the transcription.")
         scroll_layout.addRow("Initial Prompt:", self.initial_prompt)
-        self.word_timestamps_checkbox = QCheckBox("Word timestamps")
-        self.word_timestamps_checkbox.setObjectName("word_timestamps_checkbox")
-        self.word_timestamps_checkbox.setToolTip("Include word-level timestamps when supported by the output format.")
-        scroll_layout.addRow(self.word_timestamps_checkbox)
-        self.highlight_words_checkbox = QCheckBox("Highlight words (karaoke)")
-        self.highlight_words_checkbox.setObjectName("highlight_words_checkbox")
-        self.highlight_words_checkbox.setToolTip("Highlight words as they are spoken (works with SRT/VTT).")
-        scroll_layout.addRow(self.highlight_words_checkbox)
         scroll.setWidget(scroll_widget)
         scroll.setWidgetResizable(True)
         layout = QVBoxLayout(tab)
@@ -453,22 +505,36 @@ class WhisperGUI(QMainWindow):
         layout = QFormLayout(tab)
         self.vad_filter = QCheckBox("Enable VAD Filter")
         self.vad_filter.setObjectName("vad_filter_checkbox")
-        self.vad_filter.setToolTip("Enable voice activity detection to reduce non-speech segments.")
+        self.vad_filter.setToolTip(
+            "Enable voice activity detection to filter non-speech."
+        )
         layout.addRow(self.vad_filter)
         self.vad_method = QComboBox()
         self.vad_method.addItems(['silero_v4_fw', 'silero_v5_fw', 'silero_v3', 'silero_v4', 'silero_v5', 'pyannote_v3', 'pyannote_onnx_v3', 'auditok', 'webrtc'])
-        self.vad_method.setToolTip("Choose the VAD backend used to detect speech.")
+        self.vad_method.setToolTip("Choose the VAD backend.")
         layout.addRow("VAD Method:", self.vad_method)
         self.vad_threshold = QDoubleSpinBox()
         self.vad_threshold.setRange(0.0, 1.0)
         self.vad_threshold.setSingleStep(0.01)
         self.vad_threshold.setDecimals(2)
-        self.vad_threshold.setToolTip("Higher values are stricter about what counts as speech.")
+        self.vad_threshold.setToolTip(
+            "Higher values are stricter about what counts as speech."
+        )
+        self.vad_threshold.setStyleSheet(
+            "QDoubleSpinBox { padding-left: 0px; }"
+            "QDoubleSpinBox QLineEdit { padding-left: 0px; margin-left: 0px; }"
+        )
         layout.addRow("VAD Threshold:", self.vad_threshold)
         self.vad_min_speech = QSpinBox()
         self.vad_min_speech.setRange(0, 10000)
         self.vad_min_speech.setSuffix(" ms")
-        self.vad_min_speech.setToolTip("Minimum duration to treat a segment as speech.")
+        self.vad_min_speech.setToolTip(
+            "Minimum duration to treat a segment as speech."
+        )
+        self.vad_min_speech.setStyleSheet(
+            "QSpinBox { padding-left: 0px; }"
+            "QSpinBox QLineEdit { padding-left: 0px; margin-left: 0px; }"
+        )
         layout.addRow("Min Speech Duration:", self.vad_min_speech)
 
     def setup_audio_tab(self, tab):
@@ -901,11 +967,51 @@ class WhisperGUI(QMainWindow):
             help_menu = menubar.addMenu('Help')
             wiki_action = help_menu.addAction('Wiki')
             wiki_action.triggered.connect(self.open_wiki_page)
+            help_menu.addSeparator()
+            debug_logs_action = help_menu.addAction('Debug Settings')
+            debug_logs_action.triggered.connect(self.show_debug_log_dialog)
+            help_menu.addSeparator()
             check_updates_action = help_menu.addAction('Check for Updates')
             check_updates_action.triggered.connect(self.check_app_update)
 
         except Exception as e:
             logging.error(f"Error creating menu bar: {e}")
+
+    def _log_debug_parameters(self, context):
+        if not self.settings.get("debug_model_download_logging", False):
+            return
+        logger = get_model_download_logger()
+        if getattr(logger, "disabled", False):
+            return
+        params = {
+            "context": context,
+            "model": self.model_combo.currentText(),
+            "task": self.task_combo.currentText(),
+            "language": self.get_language_code(),
+            "device": self.device_combo.currentText(),
+            "compute_type": self.compute_combo.currentText(),
+            "output_formats": getattr(self, "last_output_formats", []),
+            "temperature": self.temperature.value(),
+            "beam_size": self.beam_size.value(),
+            "best_of": self.best_of.value(),
+            "patience": self.patience.value(),
+            "vad_enabled": self.vad_filter.isChecked(),
+            "vad_method": self.vad_method.currentText() if self.vad_filter.isChecked() else None,
+            "vad_threshold": self.vad_threshold.value() if self.vad_filter.isChecked() else None,
+            "vad_min_speech": self.vad_min_speech.value() if self.vad_filter.isChecked() else None,
+            "word_timestamps": (
+                self.word_timestamps_checkbox.isChecked()
+                if getattr(self, "word_timestamps_checkbox", None)
+                else False
+            ),
+            "highlight_words": (
+                self.highlight_words_checkbox.isChecked()
+                if getattr(self, "highlight_words_checkbox", None)
+                else False
+            ),
+            "convert_to_mp3": self.ff_mp3.isChecked(),
+        }
+        logger.info("[run-params] %s", json.dumps(params, separators=(",", ":")))
 
     def force_hardware_optimization(self):
         """ Force hardware optimization dialog to show """
@@ -921,6 +1027,86 @@ class WhisperGUI(QMainWindow):
             webbrowser.open("https://github.com/cbro33/Faster-Whisper-XXL-GUI/wiki")
         except Exception as e:
             logging.error(f"Error opening wiki page: {e}")
+
+    def show_debug_log_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Debug Logs")
+        dialog.setModal(True)
+        dialog.setMinimumSize(560, 300)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(22, 14, 22, 22)
+        layout.setSpacing(14)
+
+        title_label = QLabel("Debug Logging")
+        title_label.setStyleSheet("font-size: 18px; font-weight: bold;")
+        layout.addWidget(title_label)
+
+        info_label = QLabel(
+            "<div>Enable debugging and write to <b>debug_log.txt</b>.</div>"
+            "<div style='margin-top:10px;'>The log includes:</div>"
+            "<ul style='margin-top:8px; margin-bottom:0;'>"
+            "<li>Model download lifecycle (start, cancel, finish)</li>"
+            "<li>Model size detection source (HEAD/API/header)</li>"
+            "<li>Run parameters (model, task, device, compute type)</li>"
+            "<li>Output formats and advanced toggles (VAD, word timestamps, MP3)</li>"
+            "</ul>"
+        )
+        info_label.setWordWrap(True)
+        info_label.setTextFormat(Qt.TextFormat.RichText)
+        info_label.setStyleSheet("font-size: 14px; line-height: 1.25;")
+        layout.addWidget(info_label)
+        layout.addSpacing(10)
+
+        enabled_checkbox = QCheckBox("Enable debug logging")
+        enabled_checkbox.setChecked(self.settings.get("debug_model_download_logging", False))
+        enabled_checkbox.setStyleSheet("margin-top: 6px; margin-bottom: 8px; font-size: 14px;")
+        layout.addWidget(enabled_checkbox)
+
+        button_row = QHBoxLayout()
+        open_button = QPushButton("Open Log")
+        clear_button = QPushButton("Clear Log")
+        close_button = QPushButton("Close")
+        for button in (open_button, clear_button, close_button):
+            button.setMinimumWidth(110)
+            button.setMinimumHeight(34)
+        button_row.addWidget(open_button)
+        button_row.addWidget(clear_button)
+        button_row.addStretch()
+        button_row.addWidget(close_button)
+        layout.addLayout(button_row)
+
+        def on_toggle():
+            enabled = enabled_checkbox.isChecked()
+            self.settings["debug_model_download_logging"] = enabled
+            self.save_settings_to_file()
+            set_model_download_logging_enabled(enabled)
+
+        def on_open():
+            log_path = get_model_download_log_path()
+            if not os.path.exists(log_path) or os.path.getsize(log_path) == 0:
+                QMessageBox.information(self, "Debug Log", "No debug log found yet.")
+                return
+            QDesktopServices.openUrl(QUrl.fromLocalFile(log_path))
+
+        def on_clear():
+            log_path = get_model_download_log_path()
+            try:
+                if not os.path.exists(log_path) or os.path.getsize(log_path) == 0:
+                    QMessageBox.information(self, "Debug Log", "No debug log to clear.")
+                    return
+                with open(log_path, "w", encoding="utf-8"):
+                    pass
+                QMessageBox.information(self, "Debug Log", "Debug log cleared.")
+            except Exception as exc:
+                QMessageBox.warning(self, "Debug Log", f"Unable to clear log file:\n{exc}")
+
+        enabled_checkbox.stateChanged.connect(on_toggle)
+        open_button.clicked.connect(on_open)
+        clear_button.clicked.connect(on_clear)
+        close_button.clicked.connect(dialog.accept)
+
+        dialog.exec()
 
     def show_hardware_info(self):
         """ Show current hardware information """
@@ -1132,7 +1318,7 @@ class WhisperGUI(QMainWindow):
         """Save combo box settings immediately"""
         self.settings["model"] = self.model_combo.currentText()
         self.settings["task"] = self.task_combo.currentText()
-        self.settings["language"] = self.language_combo.currentText()
+        self.settings["language"] = self.get_language_code()
         self.settings["compute_type"] = self.compute_combo.currentText()
         self.settings["device"] = self.device_combo.currentText()
         self.settings["vad_method"] = self.vad_method.currentText()
@@ -1254,6 +1440,75 @@ class WhisperGUI(QMainWindow):
         os.makedirs(dir_path, exist_ok=True)
         return dir_path
 
+    def get_language_code(self):
+        data = self.language_combo.currentData()
+        if data:
+            return str(data)
+        text = self.language_combo.currentText().strip()
+        if text.endswith(")") and "(" in text:
+            code = text[text.rfind("(") + 1:-1].strip()
+            if code:
+                return code
+        return text
+
+    def _is_windows_path(self, path):
+        return bool(re.match(r"^[A-Za-z]:\\\\", path))
+
+    def _windows_to_posix_path(self, path):
+        drive = path[0].lower()
+        rest = path[2:].replace("\\", "/").lstrip("/")
+        return f"/mnt/{drive}/{rest}"
+
+    def get_model_dirs(self):
+        if not self.executable_path:
+            return None, None
+        if self._is_windows_path(self.executable_path):
+            exe_dir = ntpath.dirname(self.executable_path)
+            cli_model_dir = ntpath.join(exe_dir, "_models")
+            if sys.platform == "win32":
+                local_model_dir = cli_model_dir
+            else:
+                local_model_dir = self._windows_to_posix_path(cli_model_dir)
+        else:
+            exe_dir = os.path.dirname(self.executable_path)
+            cli_model_dir = os.path.join(exe_dir, "_models")
+            local_model_dir = cli_model_dir
+        return cli_model_dir, local_model_dir
+
+    def ensure_model_available(self):
+        model_name = self.model_combo.currentText()
+        cli_model_dir, local_model_dir = self.get_model_dirs()
+        if not local_model_dir:
+            return True
+        if getattr(self, "_model_download_cancelled", False):
+            logging.info("ensure_model_available: skip dialog (recent cancel)")
+            return False
+        model_folder = f"faster-whisper-{model_name}"
+        target_dir = os.path.join(local_model_dir, model_folder)
+        model_bin = os.path.join(target_dir, "model.bin")
+        if os.path.exists(model_bin) and os.path.getsize(model_bin) > 0:
+            logging.info("ensure_model_available: model present %s", model_bin)
+            return True
+        if not hasattr(self, "_model_dialog_count"):
+            self._model_dialog_count = 0
+        self._model_dialog_count += 1
+        logging.info(
+            "ensure_model_available: open dialog #%s model=%s target=%s",
+            self._model_dialog_count,
+            model_name,
+            target_dir,
+        )
+        dialog = ModelDownloadDialog(model_name, target_dir, parent=self)
+        result = dialog.exec()
+        logging.info(
+            "ensure_model_available: dialog #%s result=%s",
+            self._model_dialog_count,
+            result,
+        )
+        if result != QDialog.DialogCode.Accepted:
+            self._model_download_cancelled = True
+        return result == QDialog.DialogCode.Accepted
+
     def build_command(self, input_file):
         if not self.executable_path or not os.path.exists(self.executable_path):
             QMessageBox.critical(self, "Error", f"Core executable not found at: {self.executable_path}. Please restart the application to run the setup.")
@@ -1267,15 +1522,17 @@ class WhisperGUI(QMainWindow):
             return None
         
         cmd = [self.executable_path, input_file]
+        model_dir_cli, _ = self.get_model_dirs()
         options = {
             "-m": self.model_combo.currentText(), "--task": self.task_combo.currentText(),
-            "-l": self.language_combo.currentText() if self.language_combo.currentText() != 'auto' else None,
+            "-l": self.get_language_code() if self.get_language_code() != 'auto' else None,
             "--compute_type": self.compute_combo.currentText(), "--device": self.device_combo.currentText(),
             "--temperature": str(self.temperature.value()) if self.temperature.value() > 0 else None,
             "--beam_size": str(self.beam_size.value()) if self.beam_size.value() != 5 else None,
             "--best_of": str(self.best_of.value()) if self.best_of.value() != 5 else None,
             "--patience": str(self.patience.value()) if self.patience.value() != 1.0 else None,
             "--initial_prompt": self.initial_prompt.toPlainText() if self.initial_prompt.toPlainText() else None,
+            "--model_dir": model_dir_cli,
             "--output_dir": self.get_output_dir(),
             "--vad_method": self.vad_method.currentText() if self.vad_filter.isChecked() else None,
             "--vad_threshold": str(self.vad_threshold.value()) if self.vad_filter.isChecked() else None,
@@ -1292,11 +1549,6 @@ class WhisperGUI(QMainWindow):
             if checkbox.isChecked():
                 cmd.append(option)
 
-        if getattr(self, "word_timestamps_checkbox", None) and self.word_timestamps_checkbox.isChecked():
-            cmd.extend(["--word_timestamps", "True"])
-        if getattr(self, "highlight_words_checkbox", None) and self.highlight_words_checkbox.isChecked():
-            cmd.extend(["--highlight_words", "True"])
-        
         selected_formats = []
         display_formats = []
         self.txt_with_timestamps_requested = False
@@ -1327,15 +1579,6 @@ class WhisperGUI(QMainWindow):
             cmd.extend(["--output_format"] + selected_formats)
         self.last_output_formats = list(display_formats)
 
-        if getattr(self, "highlight_words_checkbox", None) and self.highlight_words_checkbox.isChecked():
-            if not (getattr(self, "word_timestamps_checkbox", None) and self.word_timestamps_checkbox.isChecked()):
-                QMessageBox.warning(
-                    self,
-                    "Highlight Words",
-                    "Highlight words requires Word timestamps to be enabled."
-                )
-                return None
-
         if getattr(self, "word_timestamps_checkbox", None) and self.word_timestamps_checkbox.isChecked():
             supported_formats = {"json", "vtt", "srt", "lrc", "all"}
             if not set(selected_formats or []) & supported_formats:
@@ -1346,6 +1589,40 @@ class WhisperGUI(QMainWindow):
                     "Please select a supported output format."
                 )
                 return None
+            subtitle_formats = {"vtt", "srt", "all"}
+            if set(selected_formats or []) & subtitle_formats:
+                if getattr(self, "highlight_words_checkbox", None) and not self.highlight_words_checkbox.isChecked():
+                    self.highlight_words_checkbox.setChecked(True)
+                    if not getattr(self, "_auto_highlight_notice_shown", False):
+                        QMessageBox.information(
+                            self,
+                            "Word Timestamps",
+                            "Highlight words was enabled automatically to render word-level timing in SRT/VTT."
+                        )
+                        self._auto_highlight_notice_shown = True
+
+        if getattr(self, "highlight_words_checkbox", None) and self.highlight_words_checkbox.isChecked():
+            if not (getattr(self, "word_timestamps_checkbox", None) and self.word_timestamps_checkbox.isChecked()):
+                QMessageBox.warning(
+                    self,
+                    "Highlight Words",
+                    "Highlight words requires Word timestamps to be enabled."
+                )
+                return None
+            highlight_formats = {"srt", "vtt", "all"}
+            if not set(selected_formats or []) & highlight_formats:
+                QMessageBox.warning(
+                    self,
+                    "Highlight Words",
+                    "Highlight words only works with SRT or VTT output.\n"
+                    "Please select SRT or VTT."
+                )
+                return None
+
+        if getattr(self, "word_timestamps_checkbox", None) and self.word_timestamps_checkbox.isChecked():
+            cmd.extend(["--word_timestamps", "True"])
+        if getattr(self, "highlight_words_checkbox", None) and self.highlight_words_checkbox.isChecked():
+            cmd.extend(["--highlight_words", "True"])
         return cmd
 
     def start_processing(self):
@@ -1353,6 +1630,7 @@ class WhisperGUI(QMainWindow):
         self.output_buffer = ""
         self.last_line_was_overwrite = False
         self.transcription_completed_successfully = False
+        self._model_download_cancelled = False
 
         active_tab = self.tabs.currentWidget()
         if active_tab == self.file_tab:
@@ -1394,10 +1672,17 @@ class WhisperGUI(QMainWindow):
             return False
 
         self.current_input_file = input_file
+        self._single_output_line_emitted = False
+        logging.info("run_transcription: input=%s", input_file)
+
+        if not self.ensure_model_available():
+            logging.info("run_transcription: model download cancelled or failed")
+            return False
 
         command = self.build_command(input_file)
         if not command:
             return False
+        self._log_debug_parameters("transcribe")
 
         if clear_output:
             self.output_text.clear()
@@ -1568,8 +1853,10 @@ class WhisperGUI(QMainWindow):
             if wants_sentences:
                 success = self.create_sentences_only_file(txt_with_timestamps, sentences_only_path)
                 if success:
-                    self._append_text_to_console(f"\nOutput saved to: {sentences_only_path}\n")
-                    self._single_output_line_emitted = True
+                    formats = getattr(self, "last_output_formats", [])
+                    if len(formats) <= 1:
+                        self._append_text_to_console(f"\nOutput saved to: {sentences_only_path}\n")
+                        self._single_output_line_emitted = True
             
             if wants_sentences and not wants_timestamps:
                 if os.path.exists(txt_with_timestamps):
@@ -1604,10 +1891,12 @@ class WhisperGUI(QMainWindow):
             if not self.full_console_checkbox.isChecked():
                 output_dir = self.get_output_dir()
                 formats = getattr(self, "last_output_formats", [])
-                if formats and not getattr(self, "_single_output_line_emitted", False):
+                if formats:
                     formats_label = ", ".join(fmt.replace("(", "[").replace(")", "]") for fmt in formats)
-                    if len(formats) > 1:
-                        self._append_text_to_console(f"Outputs saved to: {output_dir} ({formats_label})\n")
+                    has_non_txt = any(not fmt.startswith("txt") for fmt in formats)
+                    if has_non_txt or not getattr(self, "_single_output_line_emitted", False):
+                        if len(formats) > 1:
+                            self._append_text_to_console(f"\nOutputs saved to: {output_dir} ({formats_label})\n")
         else:
             status_str = "Crashed" if exit_status == QProcess.ExitStatus.CrashExit else "Failed"
             self._append_text_to_console(f"Process {status_str} with exit code {exit_code}.\n")
@@ -1648,6 +1937,20 @@ class WhisperGUI(QMainWindow):
         if not url:
             QMessageBox.warning(self, "Warning", "Please enter a YouTube URL!")
             return
+        if self.settings.get("debug_model_download_logging", False):
+            logger = get_model_download_logger()
+            if not getattr(logger, "disabled", False):
+                logger.info(
+                    "[run-params] %s",
+                    json.dumps(
+                        {
+                            "context": "youtube_download",
+                            "audio_only": self.audio_only_checkbox.isChecked(),
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
+        self._model_download_cancelled = False
         
         output_path = self.get_output_dir()
         audio_only = self.audio_only_checkbox.isChecked()
@@ -1725,7 +2028,7 @@ class WhisperGUI(QMainWindow):
         self.settings["output_dir"] = self.output_dir.text()
         self.settings["model"] = self.model_combo.currentText()
         self.settings["task"] = self.task_combo.currentText()
-        self.settings["language"] = self.language_combo.currentText()
+        self.settings["language"] = self.get_language_code()
         self.settings["compute_type"] = self.compute_combo.currentText()
         self.settings["device"] = self.device_combo.currentText()
         self.settings["temperature"] = self.temperature.value()
@@ -1800,7 +2103,12 @@ class WhisperGUI(QMainWindow):
         self.output_dir.setText(self.settings.get("output_dir", ""))
         self.model_combo.setCurrentText(self.settings.get("model", "large-v3"))
         self.task_combo.setCurrentText(self.settings.get("task", "transcribe"))
-        self.language_combo.setCurrentText(self.settings.get("language", "auto"))
+        language_code = self.settings.get("language", "auto")
+        language_index = self.language_combo.findData(language_code)
+        if language_index >= 0:
+            self.language_combo.setCurrentIndex(language_index)
+        else:
+            self.language_combo.setCurrentText(language_code)
         self.compute_combo.setCurrentText(self.settings.get("compute_type", "float16"))
         self.device_combo.setCurrentText(self.settings.get("device", "cuda"))
         self.temperature.setValue(self.settings.get("temperature", 0.0))
