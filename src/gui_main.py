@@ -1553,6 +1553,7 @@ class WhisperGUI(QMainWindow):
         display_formats = []
         self.txt_with_timestamps_requested = False
         self.sentences_only_requested = False
+        self._auto_json_for_lrc = False
         
         for fmt, cb in self.output_format_checkboxes.items():
             if fmt != 'all' and cb.isChecked():
@@ -1574,6 +1575,16 @@ class WhisperGUI(QMainWindow):
         elif self.output_format_checkboxes['all'].isChecked():
             selected_formats = ['all']
             display_formats = ['all']
+
+        if (
+            getattr(self, "word_timestamps_checkbox", None)
+            and self.word_timestamps_checkbox.isChecked()
+            and ("lrc" in selected_formats or "all" in selected_formats)
+            and "json" not in selected_formats
+            and "all" not in selected_formats
+        ):
+            selected_formats.append("json")
+            self._auto_json_for_lrc = True
 
         if selected_formats:
             cmd.extend(["--output_format"] + selected_formats)
@@ -1839,6 +1850,87 @@ class WhisperGUI(QMainWindow):
             self._append_text_to_console(f"Error creating sentences-only txt file: {str(e)}\n")
             return False
 
+    def _format_lrc_timestamp(self, seconds):
+        try:
+            total_centis = int(round(max(0.0, float(seconds)) * 100))
+        except (TypeError, ValueError):
+            total_centis = 0
+        minutes = total_centis // 6000
+        secs = (total_centis // 100) % 60
+        centis = total_centis % 100
+        return f"{minutes:02d}:{secs:02d}.{centis:02d}"
+
+    def create_enhanced_lrc_from_json(self, input_file_path):
+        """Generate enhanced LRC with word timestamps from JSON output."""
+        try:
+            output_dir = self.get_output_dir()
+            filename_only = os.path.splitext(os.path.basename(input_file_path))[0]
+            json_path = os.path.join(output_dir, filename_only + '.json')
+            lrc_path = os.path.join(output_dir, filename_only + '.lrc')
+
+            if not os.path.exists(json_path):
+                self._append_text_to_console(f"Warning: JSON file not found at {json_path}\n")
+                return False
+
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            segments = []
+            if isinstance(data, dict):
+                segments = data.get("segments") or []
+            elif isinstance(data, list):
+                segments = data
+
+            if not segments:
+                self._append_text_to_console("Warning: No segments found in JSON file\n")
+                return False
+
+            lines = []
+            for segment in segments:
+                if not isinstance(segment, dict):
+                    continue
+                start = segment.get("start", 0)
+                words = segment.get("words") or []
+                if words:
+                    word_chunks = []
+                    for word_entry in words:
+                        if not isinstance(word_entry, dict):
+                            continue
+                        word_text = str(word_entry.get("word", "")).strip()
+                        if not word_text:
+                            continue
+                        word_start = word_entry.get("start", start)
+                        word_ts = self._format_lrc_timestamp(word_start)
+                        word_chunks.append(f"<{word_ts}>{word_text}")
+                    if not word_chunks:
+                        text = str(segment.get("text", "")).strip()
+                        if not text:
+                            continue
+                        lines.append(f"[{self._format_lrc_timestamp(start)}]{text}")
+                    else:
+                        line = f"[{self._format_lrc_timestamp(start)}]" + " ".join(word_chunks)
+                        lines.append(line)
+                else:
+                    text = str(segment.get("text", "")).strip()
+                    if not text:
+                        continue
+                    lines.append(f"[{self._format_lrc_timestamp(start)}]{text}")
+
+            if not lines:
+                self._append_text_to_console("Warning: No valid LRC lines created from JSON\n")
+                return False
+
+            with open(lrc_path, 'w', encoding='utf-8') as f:
+                f.write("\n".join(lines) + "\n")
+
+            if self._auto_json_for_lrc and os.path.exists(json_path):
+                os.remove(json_path)
+
+            return True
+        except Exception as e:
+            self._append_text_to_console(f"Error creating enhanced LRC file: {str(e)}\n")
+            return False
+
     def handle_txt_format_selection(self, input_file_path):
         """Handle txt format files based on user selection"""
         try:
@@ -1888,6 +1980,19 @@ class WhisperGUI(QMainWindow):
                 (hasattr(self, 'txt_with_timestamps_requested') and self.txt_with_timestamps_requested)) and \
                hasattr(self, 'current_input_file') and self.current_input_file:
                 self.handle_txt_format_selection(self.current_input_file)
+            if (
+                getattr(self, "word_timestamps_checkbox", None)
+                and self.word_timestamps_checkbox.isChecked()
+                and hasattr(self, 'current_input_file')
+                and self.current_input_file
+            ):
+                formats = getattr(self, "last_output_formats", [])
+                if "lrc" in formats or "all" in formats:
+                    success = self.create_enhanced_lrc_from_json(self.current_input_file)
+                    if success and not self.full_console_checkbox.isChecked():
+                        self._append_text_to_console(
+                            f"\nWord timestamps LRC saved to: {self.get_output_dir()}\n"
+                        )
             if not self.full_console_checkbox.isChecked():
                 output_dir = self.get_output_dir()
                 formats = getattr(self, "last_output_formats", [])
