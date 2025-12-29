@@ -35,7 +35,7 @@ Faster Whisper XXL GUI is a desktop interface for the Faster Whisper XXL transcr
 
 ## Manual Setup (If Auto Download Fails)
 
-Auto Setup is still a WIP and may not work all time on every machine. If ther are issues, you can do a manual installation.
+Auto Setup is still a WIP and may not work all the time on every machine. If there are issues, you can do a manual installation.
 Download the standalone Faster Whisper XXL archive and extract its contents into the app `bin` folder.
 
 - [Release page](https://github.com/Purfview/whisper-standalone-win/releases/tag/Faster-Whisper-XXL)
