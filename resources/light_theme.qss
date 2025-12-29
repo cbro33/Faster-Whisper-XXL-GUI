@@ -19,13 +19,13 @@ QGroupBox::title {
     left: 10px;
     padding: 0 5px 0 5px;
 }
-QLineEdit, QTextEdit, QListWidget, QComboBox, QSpinBox, QDoubleSpinBox {
+QLineEdit, QTextEdit, QPlainTextEdit, QListWidget, QComboBox, QSpinBox, QDoubleSpinBox {
     background-color: #f0f0f0;
     border: 1px solid #dcdcdc;
     padding: 5px;
     border-radius: 3px;
 }
-QLineEdit:focus, QTextEdit:focus, QComboBox:focus {
+QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus {
     border: 1px solid #007acc;
 }
 QPushButton {

@@ -1200,6 +1200,33 @@ class FileDropListWidget(QListWidget):
         return path.lower().endswith(SUPPORTED_EXTENSIONS)
 
 
+class LinkDropListWidget(QListWidget):
+    """Custom QListWidget that accepts URL drops or pasted text."""
+
+    def __init__(self, add_links_callback=None, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self._add_links_callback = add_links_callback
+        self.setDragEnabled(False)
+
+    def dragEnterEvent(self, event: QDragEnterEvent):
+        if event.mimeData().hasUrls() or event.mimeData().hasText():
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dropEvent(self, event: QDropEvent):
+        links = []
+        if event.mimeData().hasUrls():
+            links.extend(url.toString() for url in event.mimeData().urls())
+        if event.mimeData().hasText():
+            links.append(event.mimeData().text())
+        if links and self._add_links_callback:
+            self._add_links_callback(links)
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
 class FileDropGroupBox(QGroupBox):
     """Group box that accepts audio/video files or folders drops."""
 

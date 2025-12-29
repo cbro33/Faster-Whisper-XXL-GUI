@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QComboBox, QTabWidget, QGroupBox, QFormLayout, QPushButton, 
     QSizePolicy, QCheckBox, QTextEdit, QDoubleSpinBox, QSpinBox, 
     QScrollArea, QFileDialog, QCompleter, QListWidget, QAbstractItemView,
-    QSpacerItem, QMessageBox, QApplication, QGridLayout, QLineEdit, QDialog
+    QSpacerItem, QMessageBox, QApplication, QGridLayout, QLineEdit, QDialog, QInputDialog
 )
 from PyQt6.QtCore import Qt, QTimer, QProcess, QByteArray, QUrl
 from PyQt6.QtGui import QIcon, QPalette, QColor, QTextCursor, QFont, QDesktopServices
@@ -36,7 +36,7 @@ from ytdlp_utils import (
 from workers import YouTubeDownloader, YtDlpUpdateWorker
 from gui_components import (
     DownloadManager, HardwareOptimizationDialog, FileDropGroupBox, FileDropListWidget,
-    FileDropLineEdit, FileDropWidget, UpdateProgressDialog, show_setup_critical, 
+    FileDropWidget, LinkDropListWidget, UpdateProgressDialog, show_setup_critical,
     show_setup_question, show_setup_warning, show_setup_information,
     show_yt_dlp_unavailable, ModelDownloadDialog, set_model_download_logging_enabled,
     get_model_download_log_path, get_model_download_logger
@@ -49,10 +49,13 @@ class WhisperGUI(QMainWindow):
         self.process = None
         self.downloader = None
         self.stop_requested = False
+        self.downloads_completed = True
+        self.serial_download_waiting = False
         self.output_format_checkboxes = {}
         self.pending_files = []
         self.batch_total = 0
         self.batch_index = 0
+        self.batch_total_known = False
         
         # Use portable settings location (same directory as exe/source)
         portable_dir = get_portable_settings_directory()
@@ -273,15 +276,57 @@ class WhisperGUI(QMainWindow):
 
     def setup_youtube_tab(self, tab):
         layout = QFormLayout(tab)
-        self.youtube_url = FileDropLineEdit()
-        self.youtube_url.setPlaceholderText("https://www.youtube.com/watch?v=...")
-        self.youtube_url.setToolTip("Paste a YouTube URL to download and transcribe.")
-        layout.addRow("YouTube URL:", self.youtube_url)
+        link_group = QGroupBox("Links")
+        link_layout = QVBoxLayout(link_group)
+        hint_row = QHBoxLayout()
+        hint_label = QLabel("Paste one link per line or drop URLs.")
+        hint_label.setStyleSheet("color: gray;")
+        self.link_count_label = QLabel("0 links")
+        hint_row.addWidget(hint_label)
+        hint_row.addStretch()
+        hint_row.addWidget(self.link_count_label)
+        link_layout.addLayout(hint_row)
+
+        self.link_list = LinkDropListWidget(add_links_callback=self.add_input_links)
+        self.link_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.link_list.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+        self.link_list.setDefaultDropAction(Qt.DropAction.CopyAction)
+        self.link_list.setAcceptDrops(True)
+        self.link_list.viewport().setAcceptDrops(True)
+        self.link_list.setMinimumHeight(80)
+        self.link_list.setMaximumHeight(90)
+        self.link_list.setFrameShape(QListWidget.Shape.NoFrame)
+        link_layout.addWidget(self.link_list)
+
+        link_button_layout = QHBoxLayout()
+        self.add_link_btn = QPushButton("Add Links")
+        self.add_link_btn.clicked.connect(self.prompt_add_links)
+        self.paste_links_btn = QPushButton("Paste Links")
+        self.paste_links_btn.clicked.connect(self.paste_links)
+        self.remove_link_btn = QPushButton("Remove Selected")
+        self.remove_link_btn.clicked.connect(self.remove_selected_links)
+        self.clear_links_btn = QPushButton("Clear All")
+        self.clear_links_btn.clicked.connect(self.clear_links)
+        link_button_layout.addWidget(self.add_link_btn)
+        link_button_layout.addWidget(self.paste_links_btn)
+        link_button_layout.addWidget(self.remove_link_btn)
+        link_button_layout.addWidget(self.clear_links_btn)
+        link_layout.addLayout(link_button_layout)
+        link_group.setMaximumHeight(190)
+        layout.addRow(link_group)
+
         self.audio_only_checkbox = QCheckBox("Audio Only (Download faster)")
         self.audio_only_checkbox.setChecked(True)
         self.audio_only_checkbox.setObjectName("audio_only_checkbox")
         self.audio_only_checkbox.setToolTip("Downloads audio only for faster processing.")
         layout.addRow(self.audio_only_checkbox)
+        self.download_all_checkbox = QCheckBox("Download all before transcribing")
+        self.download_all_checkbox.setChecked(False)
+        self.download_all_checkbox.setToolTip(
+            "When enabled, downloads all items first, then transcribes. "
+            "When disabled, items are transcribed as soon as they finish downloading."
+        )
+        layout.addRow(self.download_all_checkbox)
 
     def setup_global_settings(self, layout):
         layout.setVerticalSpacing(4)
@@ -1409,6 +1454,96 @@ class WhisperGUI(QMainWindow):
             existing.add(normalized)
         self.update_file_count_label()
 
+    def _extract_links(self, text):
+        if not text:
+            return []
+        links = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            links.extend(token for token in re.split(r"\s+", line) if token)
+        return links
+
+    def add_input_links(self, links):
+        if not links:
+            return
+        collected = []
+        for entry in links:
+            if not entry:
+                continue
+            if isinstance(entry, str):
+                collected.extend(self._extract_links(entry))
+            else:
+                collected.append(str(entry))
+
+        if not collected:
+            return
+
+        existing = {self.link_list.item(i).text() for i in range(self.link_list.count())}
+        for link in collected:
+            normalized = link.strip()
+            if not normalized or normalized in existing:
+                continue
+            self.link_list.addItem(normalized)
+            existing.add(normalized)
+        self.update_link_count_label()
+
+    def prompt_add_links(self):
+        dialog = QInputDialog(self)
+        dialog.setInputMode(QInputDialog.InputMode.TextInput)
+        dialog.setOption(QInputDialog.InputDialogOption.UsePlainTextEditForTextInput, True)
+        dialog.setWindowTitle("Add Links")
+        dialog.setLabelText("Enter one or more YouTube URLs (one per line):")
+        dialog.resize(520, 320)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.add_input_links([dialog.textValue()])
+
+    def paste_links(self):
+        text = QApplication.clipboard().text()
+        if not text:
+            QMessageBox.information(self, "Paste Links", "Clipboard is empty.")
+            return
+        self.add_input_links([text])
+
+    def remove_selected_links(self):
+        for item in self.link_list.selectedItems():
+            row = self.link_list.row(item)
+            self.link_list.takeItem(row)
+        self.update_link_count_label()
+
+    def clear_links(self):
+        self.link_list.clear()
+        self.update_link_count_label()
+
+    def get_input_links(self):
+        return [self.link_list.item(i).text() for i in range(self.link_list.count())]
+
+    def update_link_count_label(self):
+        count = self.link_list.count()
+        label = "link" if count == 1 else "links"
+        if hasattr(self, "link_count_label"):
+            self.link_count_label.setText(f"{count} {label}")
+
+    def on_download_file_ready(self, file_path):
+        if self.download_all_checkbox.isChecked():
+            return
+        if not file_path:
+            return
+        self.pending_files.append(file_path)
+        if not self.batch_total_known:
+            self.batch_total += 1
+        self._append_text_to_console(f"Download finished, output file: {file_path}\n" + "="*50 + "\n")
+        self.serial_download_waiting = True
+        if not self.process and not self.stop_requested:
+            self.start_next_file()
+
+    def on_download_total_found(self, total):
+        if total <= 0:
+            return
+        self.batch_total = total
+        self.batch_total_known = True
+
     def remove_selected_files(self):
         for item in self.file_list.selectedItems():
             row = self.file_list.row(item)
@@ -1652,6 +1787,7 @@ class WhisperGUI(QMainWindow):
             self.pending_files = list(input_files)
             self.batch_total = len(self.pending_files)
             self.batch_index = 0
+            self.batch_total_known = True
             self.output_text.clear()
             self.run_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
@@ -1666,8 +1802,9 @@ class WhisperGUI(QMainWindow):
         while self.pending_files and not self.stop_requested:
             self.batch_index += 1
             next_file = self.pending_files.pop(0)
+            total_display = self.batch_total if self.batch_total_known else "?"
             self._append_text_to_console(
-                f"\nPROCESSING FILE {self.batch_index}/{self.batch_total} • {next_file}\n\n"
+                f"\nPROCESSING FILE {self.batch_index}/{total_display} • {next_file}\n\n"
             )
             if self.run_transcription(next_file):
                 started = True
@@ -2014,6 +2151,15 @@ class WhisperGUI(QMainWindow):
             self.start_next_file()
             return
 
+        if self.downloader and self.downloader.isRunning():
+            if self.serial_download_waiting and not self.stop_requested:
+                self.serial_download_waiting = False
+                self.downloader.allow_next_download()
+            self.process = None
+            self.run_btn.setEnabled(False)
+            self.stop_btn.setEnabled(True)
+            return
+
         self.run_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.process = None
@@ -2038,9 +2184,9 @@ class WhisperGUI(QMainWindow):
         self._append_text_to_console(f"{ '='*50 }\nPROCESS ERROR:\n{error_message}\n{ '='*50 }\n")
 
     def download_and_transcribe(self):
-        url = self.youtube_url.text()
-        if not url:
-            QMessageBox.warning(self, "Warning", "Please enter a YouTube URL!")
+        urls = self.get_input_links()
+        if not urls:
+            QMessageBox.warning(self, "Warning", "Please add one or more YouTube links.")
             return
         if self.settings.get("debug_model_download_logging", False):
             logger = get_model_download_logger()
@@ -2056,20 +2202,40 @@ class WhisperGUI(QMainWindow):
                     ),
                 )
         self._model_download_cancelled = False
+        self.downloads_completed = False
+        self.serial_download_waiting = False
+        self.pending_files = []
+        self.batch_total = 0
+        self.batch_index = 0
+        self.batch_total_known = False
         
         output_path = self.get_output_dir()
         audio_only = self.audio_only_checkbox.isChecked()
+        stream_mode = not self.download_all_checkbox.isChecked()
         
-        self.downloader = YouTubeDownloader(url, output_path, audio_only)
+        serial_mode = stream_mode
+        self.downloader = YouTubeDownloader(
+            urls,
+            output_path,
+            audio_only,
+            stream_mode=stream_mode,
+            serial_mode=serial_mode
+        )
         self.downloader.finished.connect(self.on_download_finished)
         self.downloader.error.connect(self.on_download_error)
         self.downloader.progress.connect(self.handle_download_progress)
+        self.downloader.file_ready.connect(self.on_download_file_ready)
+        self.downloader.total_found.connect(self.on_download_total_found)
         
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         
         self.output_text.clear()
-        self._append_text_to_console(f"Starting download from: {url}\n" + "="*50 + "\n")
+        if stream_mode:
+            self._append_text_to_console("Streaming downloads: transcribing as items finish.\n\n")
+        self._append_text_to_console(
+            "Starting download from:\n" + "\n".join(urls) + "\n" + "="*50 + "\n"
+        )
         self.downloader.start()
 
     def handle_download_progress(self, text):
@@ -2078,13 +2244,37 @@ class WhisperGUI(QMainWindow):
         else:
             self._append_text_to_console(text + "\n")
 
-    def on_download_finished(self, file_path):
+    def on_download_finished(self, file_paths):
+        self.downloads_completed = True
         if self.stop_requested:
             self.on_finished(0, QProcess.ExitStatus.NormalExit) 
             return
 
-        self._append_text_to_console(f"Download finished, output file:\n{file_path}\n" + "="*50 + "\n")
-        self.run_transcription(input_file=file_path)
+        if not file_paths:
+            self._append_text_to_console("Download finished with no files.\n" + "="*50 + "\n")
+            if not self.process and not self.pending_files:
+                self.run_btn.setEnabled(True)
+                self.stop_btn.setEnabled(False)
+                self.downloader = None
+            return
+
+        if self.download_all_checkbox.isChecked():
+            self._append_text_to_console(
+                "Download finished, output files: "
+                + ", ".join(file_paths)
+                + "\n"
+                + "="*50
+                + "\n"
+            )
+            self.pending_files = list(file_paths)
+            self.batch_total = len(self.pending_files)
+            self.batch_index = 0
+            self.batch_total_known = True
+            self.start_next_file()
+        else:
+            if not self.process and not self.pending_files:
+                self.run_btn.setEnabled(True)
+                self.stop_btn.setEnabled(False)
 
     def on_download_error(self, error_message):
         if "cancelled by user" in error_message and self.stop_requested:
@@ -2092,8 +2282,10 @@ class WhisperGUI(QMainWindow):
             return
 
         self._append_text_to_console(f"YouTube Download Error:\n{error_message}\n")
-        self.run_btn.setEnabled(True)
-        self.stop_btn.setEnabled(False)
+        self.downloads_completed = True
+        if not self.process and not self.pending_files:
+            self.run_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
         self.downloader = None
 
     def closeEvent(self, event):

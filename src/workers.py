@@ -1,6 +1,7 @@
 import os
 import logging
 import subprocess
+import threading
 import yt_dlp
 from PyQt6.QtCore import pyqtSignal, QThread
 from utils import popen_hidden_subprocess
@@ -8,16 +9,25 @@ from ytdlp_utils import log_ytdlp_update_debug
 from python_utils import refresh_python_detection_cache
 
 class YouTubeDownloader(QThread):
-    finished = pyqtSignal(str)
+    finished = pyqtSignal(list)
     error = pyqtSignal(str)
     progress = pyqtSignal(str)
+    file_ready = pyqtSignal(str)
+    total_found = pyqtSignal(int)
 
-    def __init__(self, url, output_path, audio_only=True):
+    def __init__(self, urls, output_path, audio_only=True, stream_mode=True, serial_mode=False):
         super().__init__()
-        self.url = url
+        if isinstance(urls, str):
+            self.urls = [urls]
+        else:
+            self.urls = list(urls or [])
         self.output_path = output_path
         self.audio_only = audio_only
+        self.stream_mode = stream_mode
+        self.serial_mode = serial_mode
         self.stop_requested = False
+        self._resume_event = threading.Event()
+        self._resume_event.set()
 
     def progress_hook(self, d):
         if self.stop_requested:
@@ -29,7 +39,29 @@ class YouTubeDownloader(QThread):
             speed_str = d.get('_speed_str', 'N/A').strip()
             self.progress.emit(f"Downloading: {percent_str} of {total_bytes_str} at {speed_str}")
         elif d['status'] == 'finished':
-            self.progress.emit("Download finished, now processing...")
+            pass
+
+    def _final_filename(self, ydl, info_dict):
+        final_filename = ydl.prepare_filename(info_dict)
+        if self.audio_only:
+            base, _ = os.path.splitext(final_filename)
+            final_filename = base + '.mp3'
+        return final_filename
+
+    def _collect_filenames(self, ydl, info_dict):
+        if not info_dict:
+            return []
+        if info_dict.get('_type') == 'playlist' or 'entries' in info_dict:
+            entries = list(info_dict.get('entries') or [])
+            return [self._final_filename(ydl, entry) for entry in entries if entry]
+        return [self._final_filename(ydl, info_dict)]
+
+    def _entry_url(self, entry):
+        if isinstance(entry, dict):
+            return entry.get("webpage_url") or entry.get("url")
+        if isinstance(entry, str):
+            return entry
+        return None
 
     def run(self):
         try:
@@ -43,7 +75,6 @@ class YouTubeDownloader(QThread):
                         'preferredquality': '192',
                     }],
                     'outtmpl': output_template,
-                    'noplaylist': True,
                     'progress_hooks': [self.progress_hook],
                     'logger': logging.getLogger('yt_dlp'),
                 }
@@ -51,29 +82,73 @@ class YouTubeDownloader(QThread):
                 ydl_opts = {
                     'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
                     'outtmpl': output_template,
-                    'noplaylist': True,
                     'progress_hooks': [self.progress_hook],
                     'logger': logging.getLogger('yt_dlp'),
                 }
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info_dict = ydl.extract_info(self.url, download=True)
-                final_filename = ydl.prepare_filename(info_dict)
-                
-                if self.audio_only:
-                    base, _ = os.path.splitext(final_filename)
-                    final_filename = base + '.mp3'
-                
-                if not os.path.exists(final_filename):
-                    raise FileNotFoundError(f"Post-processing failed. Expected file not found: {final_filename}")
 
-                self.finished.emit(final_filename)
+            downloaded_files = []
+            total_expected = 0
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                for url in self.urls:
+                    if self.stop_requested:
+                        raise yt_dlp.utils.DownloadError("Download cancelled by user.")
+                    if self.stream_mode:
+                        info_dict = ydl.extract_info(url, download=False)
+                        if info_dict and (info_dict.get('_type') == 'playlist' or 'entries' in info_dict):
+                            entries = list(info_dict.get('entries') or [])
+                            if entries:
+                                total_expected += len(entries)
+                                self.total_found.emit(total_expected)
+                            for entry in entries:
+                                if self.stop_requested:
+                                    raise yt_dlp.utils.DownloadError("Download cancelled by user.")
+                                entry_url = self._entry_url(entry)
+                                if not entry_url:
+                                    continue
+                                entry_info = ydl.extract_info(entry_url, download=True)
+                                for path in self._collect_filenames(ydl, entry_info):
+                                    downloaded_files.append(path)
+                                    self.file_ready.emit(path)
+                                    if self.serial_mode:
+                                        self._resume_event.clear()
+                                        while not self._resume_event.is_set():
+                                            if self.stop_requested:
+                                                raise yt_dlp.utils.DownloadError("Download cancelled by user.")
+                                            self._resume_event.wait(0.1)
+                        else:
+                            total_expected += 1
+                            self.total_found.emit(total_expected)
+                            info_dict = ydl.extract_info(url, download=True)
+                            for path in self._collect_filenames(ydl, info_dict):
+                                downloaded_files.append(path)
+                                self.file_ready.emit(path)
+                                if self.serial_mode:
+                                    self._resume_event.clear()
+                                    while not self._resume_event.is_set():
+                                        if self.stop_requested:
+                                            raise yt_dlp.utils.DownloadError("Download cancelled by user.")
+                                        self._resume_event.wait(0.1)
+                    else:
+                        info_dict = ydl.extract_info(url, download=True)
+                        downloaded_files.extend(self._collect_filenames(ydl, info_dict))
+
+            missing = [path for path in downloaded_files if not os.path.exists(path)]
+            if missing:
+                raise FileNotFoundError(
+                    "Post-processing failed. Expected files not found:\n" + "\n".join(missing)
+                )
+
+            self.finished.emit(downloaded_files)
         except Exception as e:
             logging.error(f"yt-dlp thread error: {e}", exc_info=True)
             self.error.emit(str(e))
 
     def stop(self):
         self.stop_requested = True
+        self._resume_event.set()
+
+    def allow_next_download(self):
+        self._resume_event.set()
 
 
 class YtDlpUpdateWorker(QThread):
