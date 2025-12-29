@@ -36,7 +36,7 @@ from ytdlp_utils import (
 from workers import YouTubeDownloader, YtDlpUpdateWorker
 from gui_components import (
     DownloadManager, HardwareOptimizationDialog, FileDropGroupBox, FileDropListWidget,
-    FileDropWidget, LinkDropListWidget, UpdateProgressDialog, show_setup_critical,
+    FileDropWidget, LinkDropGroupBox, LinkDropListWidget, UpdateProgressDialog, show_setup_critical,
     show_setup_question, show_setup_warning, show_setup_information,
     show_yt_dlp_unavailable, ModelDownloadDialog, set_model_download_logging_enabled,
     get_model_download_log_path, get_model_download_logger
@@ -276,7 +276,7 @@ class WhisperGUI(QMainWindow):
 
     def setup_youtube_tab(self, tab):
         layout = QFormLayout(tab)
-        link_group = QGroupBox("Links")
+        link_group = LinkDropGroupBox("Links", add_links_callback=self.add_input_links)
         link_layout = QVBoxLayout(link_group)
         hint_row = QHBoxLayout()
         hint_label = QLabel("Paste one link per line or drop URLs.")
