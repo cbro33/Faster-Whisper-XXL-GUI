@@ -2,6 +2,7 @@ import sys
 import os
 import logging
 import subprocess
+import shutil
 from PyQt6.QtCore import Qt
 
 def get_app_directory():
@@ -153,3 +154,17 @@ def detect_faster_whisper_binary_version(executable_path):
             if output:
                 return output.splitlines()[0]
     return None
+
+def resolve_ffmpeg_location():
+    """Return ffmpeg executable path from bundled bin or PATH."""
+    try:
+        app_dir = get_app_directory()
+        bin_dir = os.path.join(app_dir, "bin")
+        exe_name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+        bundled = os.path.join(bin_dir, exe_name)
+        if os.path.exists(bundled):
+            return bundled
+        return shutil.which(exe_name)
+    except Exception as exc:
+        logging.debug(f"Could not resolve ffmpeg path: {exc}")
+        return None

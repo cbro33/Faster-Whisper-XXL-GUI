@@ -2,6 +2,7 @@ import sys
 import os
 import json
 import logging
+import time
 import shutil
 import requests
 import webbrowser
@@ -13,15 +14,17 @@ from PyQt6.QtWidgets import (
     QComboBox, QTabWidget, QGroupBox, QFormLayout, QPushButton, 
     QSizePolicy, QCheckBox, QTextEdit, QDoubleSpinBox, QSpinBox, 
     QScrollArea, QFileDialog, QCompleter, QListWidget, QAbstractItemView,
-    QSpacerItem, QMessageBox, QApplication, QGridLayout, QLineEdit, QDialog, QInputDialog
+    QSpacerItem, QMessageBox, QApplication, QGridLayout, QLineEdit, QDialog, QInputDialog,
+    QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar
 )
-from PyQt6.QtCore import Qt, QTimer, QProcess, QByteArray, QUrl
+from PyQt6.QtCore import Qt, QTimer, QProcess, QByteArray, QUrl, QThread, pyqtSignal
 from PyQt6.QtGui import QIcon, QPalette, QColor, QTextCursor, QFont, QDesktopServices
 
 from config import APP_VERSION, SUPPORTED_EXTENSIONS
 from utils import (
     get_app_directory, get_settings_directory, get_portable_settings_directory,
-    resource_path, format_path_for_display, detect_faster_whisper_binary_version
+    resource_path, format_path_for_display, detect_faster_whisper_binary_version,
+    run_hidden_subprocess, resolve_ffmpeg_location
 )
 from python_utils import (
     enumerate_python_runtimes, get_execution_environment, get_executable_fallback_path,
@@ -42,6 +45,194 @@ from gui_components import (
     get_model_download_log_path, get_model_download_logger
 )
 from gpu_utils import detect_hardware_capabilities
+
+class YtDlpVersionCheckWorker(QThread):
+    finished = pyqtSignal(dict)
+
+    def __init__(self, url, timeout=5, parent=None):
+        super().__init__(parent)
+        self.url = url
+        self.timeout = timeout
+
+    def run(self):
+        result = {"ok": False, "status_code": None, "latest_version": None, "error": None}
+        try:
+            response = requests.get(self.url, timeout=self.timeout)
+            result["status_code"] = response.status_code
+            if response.status_code == 200:
+                data = response.json()
+                result["latest_version"] = data.get("tag_name")
+            result["ok"] = True
+        except Exception as exc:
+            result["error"] = str(exc)
+        self.finished.emit(result)
+
+class LoudnessAnalysisWorker(QThread):
+    progress = pyqtSignal(int, int, str)
+    finished = pyqtSignal(object, object, bool)
+
+    def __init__(self, ffmpeg_path, file_paths, parent=None):
+        super().__init__(parent)
+        self.ffmpeg_path = ffmpeg_path
+        self.file_paths = list(file_paths)
+        self.stop_requested = False
+
+    def stop(self):
+        self.stop_requested = True
+
+    def run(self):
+        results = []
+        failed = []
+        total = len(self.file_paths)
+        for index, path in enumerate(self.file_paths, start=1):
+            if self.stop_requested:
+                break
+            self.progress.emit(index, total, os.path.basename(path))
+            data, error = self._analyze_loudness_file(path)
+            if data is None:
+                failed.append((path, error))
+            else:
+                results.append((path, data))
+        canceled = self.stop_requested
+        self.progress.emit(total, total, "Done")
+        self.finished.emit(results, failed, canceled)
+
+    def _analyze_loudness_file(self, input_file):
+        command = [
+            self.ffmpeg_path,
+            "-hide_banner",
+            "-i",
+            input_file,
+            "-filter_complex",
+            "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
+            "-f",
+            "null",
+            "-",
+        ]
+        result = run_hidden_subprocess(command, capture_output=True, text=True)
+        output = (result.stderr or "") + (result.stdout or "")
+        match = re.findall(r"\{.*?\}", output, flags=re.DOTALL)
+        if not match:
+            return None, "parse_failed"
+        try:
+            return json.loads(match[-1]), None
+        except json.JSONDecodeError:
+            return None, "decode_failed"
+
+class LoudnessProgressDialog(QDialog):
+    def __init__(self, total, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Analyze Loudness")
+        self.setModal(True)
+        self.setMinimumSize(420, 150)
+        self._total = total
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 12, 16, 14)
+        layout.setSpacing(10)
+
+        self.status_label = QLabel("Preparing analysis…", self)
+        layout.addWidget(self.status_label)
+
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setRange(0, self._total)
+        self.progress_bar.setValue(0)
+        layout.addWidget(self.progress_bar)
+
+        self.cancel_button = QPushButton("Cancel", self)
+        self.cancel_button.clicked.connect(self.reject)
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        button_layout.addWidget(self.cancel_button)
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
+
+    def update_progress(self, current, total, filename):
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(min(current, total))
+        if current >= total:
+            self.status_label.setText("Finalizing…")
+        else:
+            self.status_label.setText(f"Analyzing {current}/{total}: {filename}")
+
+class AudioPreprocessWorker(QThread):
+    finished = pyqtSignal(object)
+
+    def __init__(self, ffmpeg_path, input_file, output_dir, filters, parent=None):
+        super().__init__(parent)
+        self.ffmpeg_path = ffmpeg_path
+        self.input_file = input_file
+        self.output_dir = output_dir
+        self.filters = list(filters or [])
+        self.stop_requested = False
+
+    def stop(self):
+        self.stop_requested = True
+
+    def run(self):
+        if not self.filters:
+            self.finished.emit({"ok": True, "path": self.input_file})
+            return
+        base_name = os.path.splitext(os.path.basename(self.input_file))[0]
+        stamp = int(time.time() * 1000)
+        output_path = os.path.join(self.output_dir, f"{base_name}_preprocessed_{stamp}.wav")
+        command = [
+            self.ffmpeg_path,
+            "-y",
+            "-i",
+            self.input_file,
+            "-filter_complex",
+            ",".join(self.filters),
+            "-c:a",
+            "pcm_s16le",
+            output_path,
+        ]
+        result = run_hidden_subprocess(command, capture_output=True, text=True)
+        if self.stop_requested:
+            if os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except Exception:
+                    pass
+            self.finished.emit({"ok": False, "error": "canceled"})
+            return
+        if result.returncode != 0:
+            snippet = (result.stderr or result.stdout or "").strip()
+            if snippet:
+                snippet = snippet.splitlines()[-1]
+            self.finished.emit({"ok": False, "error": snippet or "ffmpeg failed"})
+            return
+        self.finished.emit({"ok": True, "path": output_path})
+
+class AudioPreprocessDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Preparing Audio")
+        self.setModal(True)
+        self.setMinimumSize(420, 150)
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 12, 16, 14)
+        layout.setSpacing(10)
+
+        self.status_label = QLabel("Preparing audio…", self)
+        layout.addWidget(self.status_label)
+
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setRange(0, 0)
+        layout.addWidget(self.progress_bar)
+
+        self.cancel_button = QPushButton("Cancel", self)
+        self.cancel_button.clicked.connect(self.reject)
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        button_layout.addWidget(self.cancel_button)
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
 
 class WhisperGUI(QMainWindow):
     def __init__(self):
@@ -79,6 +270,14 @@ class WhisperGUI(QMainWindow):
         self.transcription_completed_successfully = False
         self._single_output_line_emitted = False
         self._auto_highlight_notice_shown = False
+        self._current_processed_audio = None
+        self._current_original_audio = None
+        self._current_output_basename = None
+        self._force_output_suffix = False
+        self._output_basename_registry = {}
+        self.last_downloaded_file = None
+        self.preprocess_worker = None
+        self.preprocess_dialog = None
         
         if not self.check_and_setup_dependencies():
             QTimer.singleShot(0, self.close)
@@ -554,6 +753,10 @@ class WhisperGUI(QMainWindow):
             "Enable voice activity detection to filter non-speech."
         )
         layout.addRow(self.vad_filter)
+        vad_hint = QLabel("Hint: if quiet speech is missing, try disabling VAD or lowering the threshold.")
+        vad_hint.setWordWrap(True)
+        vad_hint.setStyleSheet("color: #a0a0a0; font-size: 12px;")
+        layout.addRow(vad_hint)
         self.vad_method = QComboBox()
         self.vad_method.addItems(['silero_v4_fw', 'silero_v5_fw', 'silero_v3', 'silero_v4', 'silero_v5', 'pyannote_v3', 'pyannote_onnx_v3', 'auditok', 'webrtc'])
         self.vad_method.setToolTip("Choose the VAD backend.")
@@ -583,11 +786,124 @@ class WhisperGUI(QMainWindow):
         layout.addRow("Min Speech Duration:", self.vad_min_speech)
 
     def setup_audio_tab(self, tab):
-        layout = QFormLayout(tab)
+        scroll = QScrollArea()
+        scroll_widget = QWidget()
+        layout = QVBoxLayout(scroll_widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(10)
+
+        pre_group = QGroupBox("Pre-Processing")
+        self.audio_pre_group = pre_group
+        pre_layout = QFormLayout(pre_group)
+        pre_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        pre_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        pre_layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        pre_layout.setFormAlignment(Qt.AlignmentFlag.AlignTop)
+        pre_layout.setHorizontalSpacing(10)
+        pre_layout.setVerticalSpacing(4)
+        pre_layout.setContentsMargins(8, 8, 8, 8)
+
         self.ff_mp3 = QCheckBox("Convert to MP3")
         self.ff_mp3.setObjectName("ff_mp3_checkbox")
         self.ff_mp3.setToolTip("Convert input audio to MP3 before processing.")
-        layout.addRow(self.ff_mp3)
+        pre_layout.addRow(self.ff_mp3)
+
+        self.audio_preprocess_enable = QCheckBox("Enable Audio Pre-Processing")
+        self.audio_preprocess_enable.setObjectName("audio_preprocess_enable")
+        pre_layout.addRow(self.audio_preprocess_enable)
+
+        self.keep_preprocessed_audio = QCheckBox("Keep preprocessed audio files")
+        self.keep_preprocessed_audio.setObjectName("keep_preprocessed_audio_checkbox")
+        self.keep_preprocessed_audio.setToolTip("Leave the temporary WAV files in the output folder.")
+        pre_layout.addRow(self.keep_preprocessed_audio)
+
+        self.audio_gain_label = QLabel("Gain:")
+        self.audio_gain = QDoubleSpinBox()
+        self.audio_gain.setRange(-30.0, 30.0)
+        self.audio_gain.setSingleStep(0.5)
+        self.audio_gain.setDecimals(1)
+        self.audio_gain.setSuffix(" dB")
+        self.audio_gain.setToolTip("Boost or reduce input audio before transcription.")
+        self.audio_gain.setValue(0.0)
+        pre_layout.addRow(self.audio_gain_label, self.audio_gain)
+
+        layout.addWidget(pre_group)
+
+        norm_group = QGroupBox("Normalization")
+        self.audio_norm_group = norm_group
+        norm_layout = QFormLayout(norm_group)
+        norm_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        norm_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        norm_layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        norm_layout.setFormAlignment(Qt.AlignmentFlag.AlignTop)
+        norm_layout.setHorizontalSpacing(10)
+        norm_layout.setVerticalSpacing(4)
+        norm_layout.setContentsMargins(8, 8, 8, 8)
+
+        self.audio_normalize = QCheckBox("Normalize Loudness (LUFS)")
+        self.audio_normalize.setObjectName("audio_normalize_checkbox")
+        norm_layout.addRow(self.audio_normalize)
+
+        self.audio_lufs_target_label = QLabel("Target LUFS:")
+        self.audio_lufs_target = QDoubleSpinBox()
+        self.audio_lufs_target.setRange(-30.0, -10.0)
+        self.audio_lufs_target.setSingleStep(0.5)
+        self.audio_lufs_target.setDecimals(1)
+        self.audio_lufs_target.setSuffix(" LUFS")
+        self.audio_lufs_target.setToolTip("Target loudness for normalization.")
+        self.audio_lufs_target.setValue(-16.0)
+        norm_layout.addRow(self.audio_lufs_target_label, self.audio_lufs_target)
+
+        self.audio_true_peak_enable = QCheckBox("Limit True Peak")
+        self.audio_true_peak_enable.setObjectName("audio_true_peak_checkbox")
+        self.audio_true_peak_enable.setChecked(True)
+        norm_layout.addRow(self.audio_true_peak_enable)
+
+        self.audio_true_peak_label = QLabel("True Peak:")
+        self.audio_true_peak = QDoubleSpinBox()
+        self.audio_true_peak.setRange(-6.0, 0.0)
+        self.audio_true_peak.setSingleStep(0.1)
+        self.audio_true_peak.setDecimals(1)
+        self.audio_true_peak.setSuffix(" dBTP")
+        self.audio_true_peak.setToolTip("True peak ceiling when normalizing.")
+        self.audio_true_peak.setValue(-1.5)
+        norm_layout.addRow(self.audio_true_peak_label, self.audio_true_peak)
+
+        self.audio_lra_label = QLabel("Target LRA:")
+        self.audio_lra = QDoubleSpinBox()
+        self.audio_lra.setRange(1.0, 20.0)
+        self.audio_lra.setSingleStep(0.5)
+        self.audio_lra.setDecimals(1)
+        self.audio_lra.setSuffix(" LU")
+        self.audio_lra.setToolTip("Loudness range target for normalization.")
+        self.audio_lra.setValue(11.0)
+        norm_layout.addRow(self.audio_lra_label, self.audio_lra)
+
+        layout.addWidget(norm_group)
+
+        self.audio_analyze_button = QPushButton("Analyze Loudness")
+        self.audio_analyze_button.clicked.connect(self.analyze_loudness)
+        self.audio_analyze_button.setMinimumHeight(28)
+        self.audio_analyze_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        layout.addWidget(self.audio_analyze_button)
+        self.audio_quiet_preset_button = QPushButton("Quiet Speech Preset")
+        self.audio_quiet_preset_button.setCheckable(True)
+        self.audio_quiet_preset_button.toggled.connect(self.toggle_quiet_speech_preset)
+        self.audio_quiet_preset_button.setMinimumHeight(28)
+        self.audio_quiet_preset_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        layout.addWidget(self.audio_quiet_preset_button)
+        layout.addStretch()
+
+        scroll.setWidget(scroll_widget)
+        scroll.setWidgetResizable(True)
+        tab_layout = QVBoxLayout(tab)
+        tab_layout.addWidget(scroll)
+
+        self.audio_preprocess_enable.toggled.connect(self.update_audio_preprocess_controls)
+        self.audio_normalize.toggled.connect(self.update_audio_normalize_controls)
+        self.audio_true_peak_enable.toggled.connect(self.update_audio_normalize_controls)
+        self.update_audio_preprocess_controls(self.audio_preprocess_enable.isChecked())
+        self.update_audio_normalize_controls(self.audio_normalize.isChecked())
 
     def apply_theme(self, theme_name):
         self.settings["theme"] = theme_name.lower()
@@ -609,6 +925,307 @@ class WhisperGUI(QMainWindow):
         
         # Save theme change immediately
         self.save_settings_to_file()
+
+    def update_audio_preprocess_controls(self, enabled):
+        if hasattr(self, "audio_norm_group"):
+            self.audio_norm_group.setVisible(enabled)
+        self.keep_preprocessed_audio.setVisible(enabled)
+        self.audio_gain.setVisible(enabled)
+        self.audio_gain_label.setVisible(enabled)
+        self.audio_normalize.setVisible(enabled)
+        self.update_audio_normalize_controls(self.audio_normalize.isChecked())
+
+    def update_audio_normalize_controls(self, enabled):
+        preprocess_enabled = self.audio_preprocess_enable.isChecked()
+        active = enabled and preprocess_enabled
+        self.audio_lufs_target.setVisible(active)
+        self.audio_lufs_target_label.setVisible(active)
+        self.audio_true_peak_enable.setVisible(active)
+        self.audio_true_peak.setVisible(active and self.audio_true_peak_enable.isChecked())
+        self.audio_true_peak_label.setVisible(active and self.audio_true_peak_enable.isChecked())
+        self.audio_lra.setVisible(active)
+        self.audio_lra_label.setVisible(active)
+
+    def toggle_quiet_speech_preset(self, enabled):
+        if enabled:
+            self.audio_preprocess_enable.setChecked(True)
+            self.audio_gain.setValue(12.0)
+            self.audio_normalize.setChecked(True)
+            self.audio_lufs_target.setValue(-16.0)
+            self.audio_lra.setValue(11.0)
+            self.audio_true_peak_enable.setChecked(True)
+            self.audio_true_peak.setValue(-1.5)
+        else:
+            self.audio_preprocess_enable.setChecked(False)
+            self.audio_gain.setValue(0.0)
+            self.audio_normalize.setChecked(False)
+            self.audio_lufs_target.setValue(-16.0)
+            self.audio_lra.setValue(11.0)
+            self.audio_true_peak_enable.setChecked(True)
+            self.audio_true_peak.setValue(-1.5)
+        self.update_audio_preprocess_controls(self.audio_preprocess_enable.isChecked())
+        self.update_audio_normalize_controls(self.audio_normalize.isChecked())
+
+    def analyze_loudness(self):
+        items = self.file_list.selectedItems()
+        if not items and self.file_list.count() == 0:
+            QMessageBox.warning(
+                self,
+                "Analyze Loudness",
+                "<span style='font-size:14px;'>"
+                "Please select one or more local files in the File tab."
+                "</span>",
+            )
+            return
+        if items:
+            file_paths = [item.text() for item in items]
+        else:
+            file_paths = [self.file_list.item(i).text() for i in range(self.file_list.count())]
+        ffmpeg_path = resolve_ffmpeg_location()
+        if not ffmpeg_path:
+            QMessageBox.warning(
+                self,
+                "Analyze Loudness",
+                "<span style='font-size:14px;'>"
+                "ffmpeg was not found. Please install or bundle it."
+                "</span>",
+            )
+            return
+        self.loudness_progress_dialog = LoudnessProgressDialog(len(file_paths), self)
+        self.loudness_worker = LoudnessAnalysisWorker(ffmpeg_path, file_paths, self)
+        self.loudness_worker.progress.connect(self.loudness_progress_dialog.update_progress)
+        self.loudness_worker.finished.connect(self.on_loudness_analysis_finished)
+        self.loudness_progress_dialog.rejected.connect(self.cancel_loudness_analysis)
+        self.loudness_progress_dialog.show()
+        self.loudness_worker.start()
+
+    def cancel_loudness_analysis(self):
+        if getattr(self, "loudness_worker", None) and self.loudness_worker.isRunning():
+            self.loudness_worker.stop()
+
+    def on_loudness_analysis_finished(self, results, failed, canceled):
+        if getattr(self, "loudness_progress_dialog", None):
+            self.loudness_progress_dialog.accept()
+            self.loudness_progress_dialog = None
+        self.loudness_worker = None
+        if not results:
+            message = "Loudness analysis failed for all selected files."
+            if canceled:
+                message = "Loudness analysis was canceled."
+            QMessageBox.warning(
+                self,
+                "Analyze Loudness",
+                "<span style='font-size:14px;'>"
+                f"{message}"
+                "</span>",
+            )
+            return
+        if canceled:
+            QMessageBox.information(
+                self,
+                "Analyze Loudness",
+                "<span style='font-size:14px;'>"
+                "Loudness analysis was canceled. Showing partial results."
+                "</span>",
+            )
+        if failed:
+            preview = "<br>".join(format_path_for_display(p) for p, _ in failed[:8])
+            more = ""
+            if len(failed) > 8:
+                more = f"<br>…and {len(failed) - 8} more."
+            QMessageBox.warning(
+                self,
+                "Analyze Loudness",
+                "<span style='font-size:14px;'>"
+                f"Some files could not be analyzed ({len(failed)}):<br>{preview}{more}"
+                "</span>",
+            )
+        self.show_loudness_table(results)
+
+    def show_loudness_table(self, results):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Loudness Analysis")
+        dialog.setModal(True)
+        dialog.setMinimumSize(760, 320)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(14, 12, 14, 14)
+        layout.setSpacing(10)
+
+        table = QTableWidget(dialog)
+        table.setColumnCount(4)
+        table.setHorizontalHeaderLabels(["File", "LUFS", "True Peak (dB)", "LRA"])
+        table.setRowCount(len(results))
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setStretchLastSection(False)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+
+        for row, (path, data) in enumerate(results):
+            file_item = QTableWidgetItem(os.path.basename(path))
+            file_item.setToolTip(format_path_for_display(path))
+            table.setItem(row, 0, file_item)
+            table.setItem(row, 1, QTableWidgetItem(str(data.get("input_i", ""))))
+            table.setItem(row, 2, QTableWidgetItem(str(data.get("input_tp", ""))))
+            table.setItem(row, 3, QTableWidgetItem(str(data.get("input_lra", ""))))
+
+        layout.addWidget(table)
+
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(dialog.accept)
+        layout.addWidget(close_button)
+        dialog.exec()
+
+
+    def preprocess_audio(self, input_file):
+        if not self.audio_preprocess_enable.isChecked():
+            return input_file
+        ffmpeg_path = resolve_ffmpeg_location()
+        if not ffmpeg_path:
+            QMessageBox.warning(self, "Audio Pre-Processing", "ffmpeg was not found. Please install or bundle it.")
+            return None
+        filters = []
+        gain = self.audio_gain.value()
+        if abs(gain) >= 0.05:
+            filters.append(f"volume={gain}dB")
+        if self.audio_normalize.isChecked():
+            lufs = self.audio_lufs_target.value()
+            lra = self.audio_lra.value()
+            if self.audio_true_peak_enable.isChecked():
+                tp = self.audio_true_peak.value()
+                filters.append(f"loudnorm=I={lufs}:TP={tp}:LRA={lra}")
+            else:
+                filters.append(f"loudnorm=I={lufs}:LRA={lra}")
+        if not filters:
+            return input_file
+        output_dir = self.get_output_dir()
+        if not output_dir:
+            return None
+        base_name = os.path.splitext(os.path.basename(input_file))[0]
+        stamp = int(time.time() * 1000)
+        output_path = os.path.join(output_dir, f"{base_name}_preprocessed_{stamp}.wav")
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-i",
+            input_file,
+            "-filter_complex",
+            ",".join(filters),
+            "-c:a",
+            "pcm_s16le",
+            output_path,
+        ]
+        result = run_hidden_subprocess(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            snippet = (result.stderr or result.stdout or "").strip()
+            if snippet:
+                snippet = snippet.splitlines()[-1]
+            QMessageBox.warning(
+                self,
+                "Audio Pre-Processing Failed",
+                "ffmpeg could not process the audio.\n"
+                + (f"\nDetails: {snippet}" if snippet else "")
+            )
+            return None
+        self._current_processed_audio = output_path
+        return output_path
+
+    def get_preprocess_filters(self):
+        if not self.audio_preprocess_enable.isChecked():
+            return []
+        filters = []
+        gain = self.audio_gain.value()
+        if abs(gain) >= 0.05:
+            filters.append(f"volume={gain}dB")
+        if self.audio_normalize.isChecked():
+            lufs = self.audio_lufs_target.value()
+            lra = self.audio_lra.value()
+            if self.audio_true_peak_enable.isChecked():
+                tp = self.audio_true_peak.value()
+                filters.append(f"loudnorm=I={lufs}:TP={tp}:LRA={lra}")
+            else:
+                filters.append(f"loudnorm=I={lufs}:LRA={lra}")
+        return filters
+
+    def cleanup_processed_audio(self):
+        if getattr(self, "keep_preprocessed_audio", None) and self.keep_preprocessed_audio.isChecked():
+            self._current_processed_audio = None
+            return
+        path = getattr(self, "_current_processed_audio", None)
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception as exc:
+                logging.debug(f"Failed to remove temp audio file {path}: {exc}")
+        self._current_processed_audio = None
+
+    def rename_outputs_for_current_run(self):
+        output_dir = self.get_output_dir()
+        if not output_dir:
+            return
+        original = getattr(self, "_current_original_audio", None) or ""
+        original_base = os.path.splitext(os.path.basename(original))[0]
+        target_base = self._current_output_basename or original_base
+        if self._current_processed_audio:
+            source_base = os.path.splitext(os.path.basename(self._current_processed_audio))[0]
+        else:
+            source_base = original_base
+        if not source_base or source_base == target_base:
+            return
+        extensions = ["srt", "vtt", "txt", "tsv", "json", "lrc"]
+        for ext in extensions:
+            src = os.path.join(output_dir, f"{source_base}.{ext}")
+            if not os.path.exists(src):
+                continue
+            dst = os.path.join(output_dir, f"{target_base}.{ext}")
+            if os.path.exists(dst):
+                logging.warning("Output already exists, skipping rename: %s", dst)
+                continue
+            try:
+                os.rename(src, dst)
+            except Exception as exc:
+                logging.warning("Failed to rename output %s -> %s: %s", src, dst, exc)
+
+    def _compute_output_basename(self, input_file_path, output_dir, force_suffix=False):
+        original_base = os.path.splitext(os.path.basename(input_file_path))[0]
+        original_ext = os.path.splitext(input_file_path)[1].lstrip(".").lower()
+        if not original_ext:
+            return original_base
+        if force_suffix:
+            return f"{original_base}_{original_ext}"
+        registry = self._get_output_basename_registry(output_dir)
+        existing_exts = registry.get(original_base, set())
+        if existing_exts and original_ext not in existing_exts:
+            return f"{original_base}_{original_ext}"
+        extensions = ["srt", "vtt", "txt", "tsv", "json", "lrc"]
+        for ext in extensions:
+            if os.path.exists(os.path.join(output_dir, f"{original_base}.{ext}")):
+                return f"{original_base}_{original_ext}"
+        sentences_path = os.path.join(output_dir, f"{original_base}_sentences.txt")
+        if os.path.exists(sentences_path):
+            return f"{original_base}_{original_ext}"
+        return original_base
+
+    def _get_output_basename_registry(self, output_dir):
+        key = os.path.abspath(output_dir).lower()
+        registry = getattr(self, "_output_basename_registry", None)
+        if registry is None:
+            self._output_basename_registry = {}
+            registry = self._output_basename_registry
+        return registry.setdefault(key, {})
+
+    def _register_output_basename(self, input_file_path, output_dir):
+        original_base = os.path.splitext(os.path.basename(input_file_path))[0]
+        original_ext = os.path.splitext(input_file_path)[1].lstrip(".").lower()
+        if not original_ext:
+            return
+        registry = self._get_output_basename_registry(output_dir)
+        registry.setdefault(original_base, set()).add(original_ext)
 
     def check_for_transcription_success(self, text):
         """Check if the output indicates successful transcription completion"""
@@ -654,68 +1271,97 @@ class WhisperGUI(QMainWindow):
             install_info = get_ytdlp_installation_info()
             current_version = install_info["version"]
             env = install_info["environment"]
-            
+
             if not current_version:
                 logging.error("yt-dlp not found")
                 return
-            
+
             logging.info(
                 f"Current yt-dlp version: {current_version}, type: {install_info['installation_type']}, env: {env}"
             )
 
             plan = get_python_update_plan()
-            plan_status = plan.get("status")
-            
-            try:
-                response = requests.get("https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest", timeout=5)
-                if response.status_code == 200:
-                    latest_data = response.json()
-                    latest_version = latest_data["tag_name"]
-                    
-                    if current_version != latest_version:
-                        if plan_status == "ready":
-                            update_msg = (
-                                f"Your yt-dlp version ({current_version}) is outdated.\n"
-                                f"Latest version is {latest_version}.\n\n"
-                                "Would you like to update it now?\n"
-                                "(This may fix 403 unauthorized errors for video downloads.)"
-                            )
-                            python_info = plan.get("python_info")
-                            target_dir = plan.get("target_directory")
-                            if python_info and env == "exe_with_python":
-                                update_msg += (
-                                    f"\n\nDetected Python: {python_info.get('display_name')} "
-                                    f"(version {python_info.get('version')})."
-                                )
-                            if target_dir:
-                                update_msg += f"\nUpdated files will be stored in:\n{target_dir}"
+            if getattr(self, "yt_dlp_version_worker", None) and self.yt_dlp_version_worker.isRunning():
+                logging.info("yt-dlp version check already running")
+                return
 
-                            reply = show_setup_question(
-                                self, "yt-dlp Update Available",
-                                update_msg,
-                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                                QMessageBox.StandardButton.Yes
-                            )
+            self._ytdlp_version_context = {
+                "current_version": current_version,
+                "env": env,
+                "plan": plan,
+            }
+            self.yt_dlp_version_worker = YtDlpVersionCheckWorker(
+                "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest",
+                timeout=5,
+                parent=self,
+            )
+            self.yt_dlp_version_worker.finished.connect(self.on_yt_dlp_version_check_finished)
+            self.yt_dlp_version_worker.start()
 
-                            if reply == QMessageBox.StandardButton.Yes:
-                                self.update_yt_dlp()
-                            else:
-                                self.yt_dlp_update_session_complete = True
-                        else:
-                            self.handle_update_plan_blockers(plan)
-                            self.yt_dlp_update_session_complete = True
-                    else:
-                        logging.info("yt-dlp is up to date")
-                        record_ytdlp_update_success(current_version)
-                        clear_ytdlp_update_failure(env)
-                        self.yt_dlp_update_session_complete = True
-                else:
-                    logging.warning("Could not check for yt-dlp updates")
-            except requests.RequestException as e:
-                logging.warning(f"Failed to check yt-dlp version: {e}")
-                
         except Exception as e:
             logging.error(f"Error checking yt-dlp version: {e}")
+
+    def on_yt_dlp_version_check_finished(self, result):
+        self.yt_dlp_version_worker = None
+        if not result.get("ok"):
+            logging.warning(f"Failed to check yt-dlp version: {result.get('error')}")
+            return
+        if result.get("status_code") != 200:
+            logging.warning("Could not check for yt-dlp updates")
+            return
+        latest_version = result.get("latest_version")
+        if not latest_version:
+            logging.warning("Could not parse latest yt-dlp version")
+            return
+
+        context = getattr(self, "_ytdlp_version_context", {}) or {}
+        current_version = context.get("current_version")
+        env = context.get("env")
+        plan = context.get("plan") or {}
+        plan_status = plan.get("status")
+
+        if not current_version:
+            logging.warning("yt-dlp current version missing; skipping update prompt")
+            return
+
+        if current_version != latest_version:
+            if plan_status == "ready":
+                update_msg = (
+                    f"Your yt-dlp version ({current_version}) is outdated.\n"
+                    f"Latest version is {latest_version}.\n\n"
+                    "Would you like to update it now?\n"
+                    "(This may fix 403 unauthorized errors for video downloads.)"
+                )
+                python_info = plan.get("python_info")
+                target_dir = plan.get("target_directory")
+                if python_info and env == "exe_with_python":
+                    update_msg += (
+                        f"\n\nDetected Python: {python_info.get('display_name')} "
+                        f"(version {python_info.get('version')})."
+                    )
+                if target_dir:
+                    update_msg += f"\nUpdated files will be stored in:\n{target_dir}"
+
+                reply = show_setup_question(
+                    self,
+                    "yt-dlp Update Available",
+                    update_msg,
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+
+                if reply == QMessageBox.StandardButton.Yes:
+                    self.update_yt_dlp()
+                else:
+                    self.yt_dlp_update_session_complete = True
+            else:
+                self.handle_update_plan_blockers(plan)
+                self.yt_dlp_update_session_complete = True
+        else:
+            logging.info("yt-dlp is up to date")
+            record_ytdlp_update_success(current_version)
+            clear_ytdlp_update_failure(env)
+            self.yt_dlp_update_session_complete = True
 
     def handle_update_plan_blockers(self, plan):
         """Show contextual guidance when we cannot update yt-dlp automatically"""
@@ -1055,6 +1701,13 @@ class WhisperGUI(QMainWindow):
                 else False
             ),
             "convert_to_mp3": self.ff_mp3.isChecked(),
+            "audio_preprocess_enabled": self.audio_preprocess_enable.isChecked(),
+            "audio_gain_db": self.audio_gain.value(),
+            "audio_normalize_enabled": self.audio_normalize.isChecked(),
+            "audio_lufs_target": self.audio_lufs_target.value(),
+            "audio_true_peak_enabled": self.audio_true_peak_enable.isChecked(),
+            "audio_true_peak_db": self.audio_true_peak.value(),
+            "audio_lra": self.audio_lra.value(),
         }
         logger.info("[run-params] %s", json.dumps(params, separators=(",", ":")))
 
@@ -1530,6 +2183,7 @@ class WhisperGUI(QMainWindow):
             return
         if not file_path:
             return
+        self.last_downloaded_file = file_path
         self.pending_files.append(file_path)
         if not self.batch_total_known:
             self.batch_total += 1
@@ -1572,8 +2226,18 @@ class WhisperGUI(QMainWindow):
         dir_path = self.output_dir.text()
         if not dir_path:
             dir_path = os.path.join(get_app_directory(), "output")
-        os.makedirs(dir_path, exist_ok=True)
-        return dir_path
+        try:
+            os.makedirs(dir_path, exist_ok=True)
+            return dir_path
+        except Exception as exc:
+            logging.error(f"Failed to create output directory '{dir_path}': {exc}")
+            QMessageBox.warning(
+                self,
+                "Output Directory Error",
+                f"Could not create the output directory:\n{dir_path}\n\n"
+                "Please choose a different location."
+            )
+            return None
 
     def get_language_code(self):
         data = self.language_combo.currentData()
@@ -1655,7 +2319,10 @@ class WhisperGUI(QMainWindow):
         if not input_file or not os.path.exists(input_file):
             QMessageBox.warning(self, "Warning", f"Input file not found: {input_file}")
             return None
-        
+        output_dir = self.get_output_dir()
+        if not output_dir:
+            return None
+
         cmd = [self.executable_path, input_file]
         model_dir_cli, _ = self.get_model_dirs()
         options = {
@@ -1668,7 +2335,7 @@ class WhisperGUI(QMainWindow):
             "--patience": str(self.patience.value()) if self.patience.value() != 1.0 else None,
             "--initial_prompt": self.initial_prompt.toPlainText() if self.initial_prompt.toPlainText() else None,
             "--model_dir": model_dir_cli,
-            "--output_dir": self.get_output_dir(),
+            "--output_dir": output_dir,
             "--vad_method": self.vad_method.currentText() if self.vad_filter.isChecked() else None,
             "--vad_threshold": str(self.vad_threshold.value()) if self.vad_filter.isChecked() else None,
             "--vad_min_speech_duration_ms": str(self.vad_min_speech.value()) if self.vad_filter.isChecked() else None,
@@ -1777,6 +2444,8 @@ class WhisperGUI(QMainWindow):
         self.last_line_was_overwrite = False
         self.transcription_completed_successfully = False
         self._model_download_cancelled = False
+        if not self.get_output_dir():
+            return
 
         active_tab = self.tabs.currentWidget()
         if active_tab == self.file_tab:
@@ -1820,6 +2489,8 @@ class WhisperGUI(QMainWindow):
             return False
 
         self.current_input_file = input_file
+        self._current_original_audio = input_file
+        self._current_output_basename = None
         self._single_output_line_emitted = False
         logging.info("run_transcription: input=%s", input_file)
 
@@ -1827,9 +2498,93 @@ class WhisperGUI(QMainWindow):
             logging.info("run_transcription: model download cancelled or failed")
             return False
 
+        self.cleanup_processed_audio()
+        filters = self.get_preprocess_filters()
+        self._force_output_suffix = bool(filters)
+        output_dir = self.get_output_dir()
+        if not output_dir:
+            return False
+        self._current_output_basename = self._compute_output_basename(
+            input_file,
+            output_dir,
+            force_suffix=bool(filters)
+        )
+        self._register_output_basename(input_file, output_dir)
+        if self.audio_preprocess_enable.isChecked() and filters:
+            return self.start_preprocess_and_transcribe(input_file, filters, clear_output)
         command = self.build_command(input_file)
         if not command:
             return False
+        return self.start_transcription_process(command, clear_output)
+
+    def start_preprocess_and_transcribe(self, input_file, filters, clear_output):
+        ffmpeg_path = resolve_ffmpeg_location()
+        if not ffmpeg_path:
+            QMessageBox.warning(self, "Audio Pre-Processing", "ffmpeg was not found. Please install or bundle it.")
+            return False
+        output_dir = self.get_output_dir()
+        if not output_dir:
+            return False
+        if self.preprocess_worker and self.preprocess_worker.isRunning():
+            QMessageBox.warning(self, "Audio Pre-Processing", "Audio pre-processing is already running.")
+            return False
+        self.preprocess_dialog = AudioPreprocessDialog(self)
+        self.preprocess_worker = AudioPreprocessWorker(
+            ffmpeg_path,
+            input_file,
+            output_dir,
+            filters,
+            self,
+        )
+        self.preprocess_worker.finished.connect(
+            lambda result: self.on_preprocess_finished(result, clear_output)
+        )
+        self.preprocess_dialog.rejected.connect(self.cancel_preprocess)
+        self.preprocess_dialog.show()
+        self.preprocess_worker.start()
+        return True
+
+    def cancel_preprocess(self):
+        if self.preprocess_worker and self.preprocess_worker.isRunning():
+            self.preprocess_worker.stop()
+
+    def on_preprocess_finished(self, result, clear_output):
+        if self.preprocess_dialog:
+            self.preprocess_dialog.accept()
+            self.preprocess_dialog = None
+        worker = self.preprocess_worker
+        self.preprocess_worker = None
+        if not result or not result.get("ok"):
+            error = result.get("error") if result else "Audio preprocessing failed"
+            if error == "canceled":
+                self._append_text_to_console("\nAudio preprocessing canceled.\n")
+            else:
+                self._append_text_to_console(f"\nAudio preprocessing failed: {error}\n")
+            if self.pending_files and not self.stop_requested:
+                self.start_next_file()
+                return
+            self.run_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            return
+        processed_file = result.get("path")
+        if not processed_file:
+            self._append_text_to_console("\nAudio preprocessing failed.\n")
+            self.run_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            return
+        if processed_file != self._current_original_audio:
+            self._current_processed_audio = processed_file
+        command = self.build_command(processed_file)
+        if not command:
+            if self.pending_files and not self.stop_requested:
+                self.start_next_file()
+                return
+            self.run_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            return
+        self.start_transcription_process(command, clear_output)
+
+    def start_transcription_process(self, command, clear_output):
         self._log_debug_parameters("transcribe")
 
         if clear_output:
@@ -1865,6 +2620,10 @@ class WhisperGUI(QMainWindow):
         self.pending_files = []
         self.batch_total = 0
         self.batch_index = 0
+        if self.preprocess_worker and self.preprocess_worker.isRunning():
+            self.preprocess_worker.stop()
+            if self.preprocess_dialog:
+                self.preprocess_dialog.reject()
         if self.downloader and self.downloader.isRunning():
             self._append_text_to_console("\nRequesting download cancellation...\n")
             self.downloader.stop()
@@ -1872,7 +2631,7 @@ class WhisperGUI(QMainWindow):
             self._append_text_to_console("\nTerminating process...\n")
             self.process.terminate()
             if not self.process.waitForFinished(2000):
-                self._append_text_to_console("Process did not terminate gracefully, killing it.\n")
+                self._append_text_to_console("Process did not terminate gracefully, killing it.\n\n")
                 self.process.kill()
 
 
@@ -1955,27 +2714,27 @@ class WhisperGUI(QMainWindow):
         """Helper method to create sentences-only file from timestamped txt"""
         try:
             if not os.path.exists(txt_with_timestamps):
-                self._append_text_to_console(f"Warning: Timestamped txt file not found at {txt_with_timestamps}\n")
+                self._append_text_to_console(f"\nWarning: Timestamped txt file not found at {txt_with_timestamps}\n")
                 return False
             
             with open(txt_with_timestamps, 'r', encoding='utf-8') as f:
                 content = f.read()
             
             if not content.strip():
-                self._append_text_to_console(f"Warning: Timestamped txt file is empty\n")
+                self._append_text_to_console(f"\nWarning: Timestamped txt file is empty\n")
                 return False
             
             pattern = r'\[[\d:.\->\s]+\]\s*(.*)'
             matches = re.findall(pattern, content)
             
             if not matches:
-                self._append_text_to_console(f"Warning: No timestamped content found in txt file\n")
+                self._append_text_to_console(f"\nWarning: No timestamped content found in txt file\n")
                 return False
             
             sentences_text = ' '.join(match.strip() for match in matches if match.strip())
             
             if not sentences_text:
-                self._append_text_to_console(f"Warning: No valid sentences extracted from txt file\n")
+                self._append_text_to_console(f"\nWarning: No valid sentences extracted from txt file\n")
                 return False
             
             with open(sentences_only_path, 'w', encoding='utf-8') as f:
@@ -2001,12 +2760,12 @@ class WhisperGUI(QMainWindow):
         """Generate enhanced LRC with word timestamps from JSON output."""
         try:
             output_dir = self.get_output_dir()
-            filename_only = os.path.splitext(os.path.basename(input_file_path))[0]
+            filename_only = self._current_output_basename or os.path.splitext(os.path.basename(input_file_path))[0]
             json_path = os.path.join(output_dir, filename_only + '.json')
             lrc_path = os.path.join(output_dir, filename_only + '.lrc')
 
             if not os.path.exists(json_path):
-                self._append_text_to_console(f"Warning: JSON file not found at {json_path}\n")
+                self._append_text_to_console(f"\nWarning: JSON file not found at {json_path}\n")
                 return False
 
             with open(json_path, 'r', encoding='utf-8') as f:
@@ -2019,7 +2778,7 @@ class WhisperGUI(QMainWindow):
                 segments = data
 
             if not segments:
-                self._append_text_to_console("Warning: No segments found in JSON file\n")
+                self._append_text_to_console("\nWarning: No segments found in JSON file\n")
                 return False
 
             lines = []
@@ -2054,7 +2813,7 @@ class WhisperGUI(QMainWindow):
                     lines.append(f"[{self._format_lrc_timestamp(start)}]{text}")
 
             if not lines:
-                self._append_text_to_console("Warning: No valid LRC lines created from JSON\n")
+                self._append_text_to_console("\nWarning: No valid LRC lines created from JSON\n")
                 return False
 
             with open(lrc_path, 'w', encoding='utf-8') as f:
@@ -2072,7 +2831,8 @@ class WhisperGUI(QMainWindow):
         """Handle txt format files based on user selection"""
         try:
             output_dir = self.get_output_dir()
-            filename_only = os.path.splitext(os.path.basename(input_file_path))[0]
+            filename_only = self._current_output_basename or os.path.splitext(os.path.basename(input_file_path))[0]
+            original_base = os.path.splitext(os.path.basename(input_file_path))[0]
             txt_with_timestamps = os.path.join(output_dir, filename_only + '.txt')
             sentences_only_path = os.path.join(output_dir, filename_only + '_sentences.txt')
             
@@ -2080,7 +2840,10 @@ class WhisperGUI(QMainWindow):
             wants_sentences = getattr(self, 'sentences_only_requested', False)
             
             if wants_sentences:
-                success = self.create_sentences_only_file(txt_with_timestamps, sentences_only_path)
+                source_txt = txt_with_timestamps
+                if not os.path.exists(source_txt) and filename_only != original_base:
+                    source_txt = os.path.join(output_dir, original_base + '.txt')
+                success = self.create_sentences_only_file(source_txt, sentences_only_path)
                 if success:
                     formats = getattr(self, "last_output_formats", [])
                     if len(formats) <= 1:
@@ -2090,6 +2853,10 @@ class WhisperGUI(QMainWindow):
             if wants_sentences and not wants_timestamps:
                 if os.path.exists(txt_with_timestamps):
                     os.remove(txt_with_timestamps)
+                elif filename_only != original_base:
+                    original_txt = os.path.join(output_dir, original_base + '.txt')
+                    if os.path.exists(original_txt):
+                        os.remove(original_txt)
             
         except Exception as e:
             self._append_text_to_console(f"Error handling txt format selection: {str(e)}\n")
@@ -2112,7 +2879,9 @@ class WhisperGUI(QMainWindow):
         elif exit_code == 0 or self.transcription_completed_successfully:
             if self.full_console_checkbox.isChecked():
                 self._append_text_to_console("Process completed successfully.\n")
-            
+
+            self.rename_outputs_for_current_run()
+
             if ((hasattr(self, 'sentences_only_requested') and self.sentences_only_requested) or
                 (hasattr(self, 'txt_with_timestamps_requested') and self.txt_with_timestamps_requested)) and \
                hasattr(self, 'current_input_file') and self.current_input_file:
@@ -2143,6 +2912,8 @@ class WhisperGUI(QMainWindow):
             status_str = "Crashed" if exit_status == QProcess.ExitStatus.CrashExit else "Failed"
             self._append_text_to_console(f"Process {status_str} with exit code {exit_code}.\n")
 
+        self.cleanup_processed_audio()
+
         if self.pending_files and not self.stop_requested:
             self.process = None
             self.transcription_completed_successfully = False
@@ -2165,6 +2936,7 @@ class WhisperGUI(QMainWindow):
         self.process = None
         self.downloader = None
         self.stop_requested = False
+        self._force_output_suffix = False
         
     def on_process_error(self, error):
         if error == QProcess.ProcessError.Crashed and self.transcription_completed_successfully:
@@ -2188,6 +2960,9 @@ class WhisperGUI(QMainWindow):
         if not urls:
             QMessageBox.warning(self, "Warning", "Please add one or more YouTube links.")
             return
+        output_path = self.get_output_dir()
+        if not output_path:
+            return
         if self.settings.get("debug_model_download_logging", False):
             logger = get_model_download_logger()
             if not getattr(logger, "disabled", False):
@@ -2209,7 +2984,6 @@ class WhisperGUI(QMainWindow):
         self.batch_index = 0
         self.batch_total_known = False
         
-        output_path = self.get_output_dir()
         audio_only = self.audio_only_checkbox.isChecked()
         stream_mode = not self.download_all_checkbox.isChecked()
         
@@ -2257,6 +3031,7 @@ class WhisperGUI(QMainWindow):
                 self.stop_btn.setEnabled(False)
                 self.downloader = None
             return
+        self.last_downloaded_file = file_paths[-1]
 
         if self.download_all_checkbox.isChecked():
             self._append_text_to_console(
@@ -2333,6 +3108,14 @@ class WhisperGUI(QMainWindow):
         self.settings["best_of"] = self.best_of.value()
         self.settings["patience"] = self.patience.value()
         self.settings["initial_prompt"] = self.initial_prompt.toPlainText()
+        self.settings["audio_preprocess_enabled"] = self.audio_preprocess_enable.isChecked()
+        self.settings["audio_gain_db"] = self.audio_gain.value()
+        self.settings["audio_normalize_enabled"] = self.audio_normalize.isChecked()
+        self.settings["audio_lufs_target"] = self.audio_lufs_target.value()
+        self.settings["audio_true_peak_enabled"] = self.audio_true_peak_enable.isChecked()
+        self.settings["audio_true_peak_db"] = self.audio_true_peak.value()
+        self.settings["audio_lra"] = self.audio_lra.value()
+        self.settings["keep_preprocessed_audio"] = self.keep_preprocessed_audio.isChecked()
         
         self.settings["vad_method"] = self.vad_method.currentText()
         self.settings["vad_threshold"] = self.vad_threshold.value()
@@ -2413,6 +3196,16 @@ class WhisperGUI(QMainWindow):
         self.best_of.setValue(self.settings.get("best_of", 5))
         self.patience.setValue(self.settings.get("patience", 1.0))
         self.initial_prompt.setPlainText(self.settings.get("initial_prompt", ""))
+        self.audio_gain.setValue(self.settings.get("audio_gain_db", 0.0))
+        self.audio_lufs_target.setValue(self.settings.get("audio_lufs_target", -16.0))
+        self.audio_true_peak.setValue(self.settings.get("audio_true_peak_db", -1.5))
+        self.audio_lra.setValue(self.settings.get("audio_lra", 11.0))
+        self.audio_preprocess_enable.setChecked(self.settings.get("audio_preprocess_enabled", False))
+        self.audio_normalize.setChecked(self.settings.get("audio_normalize_enabled", False))
+        self.audio_true_peak_enable.setChecked(self.settings.get("audio_true_peak_enabled", True))
+        self.keep_preprocessed_audio.setChecked(self.settings.get("keep_preprocessed_audio", False))
+        self.update_audio_preprocess_controls(self.audio_preprocess_enable.isChecked())
+        self.update_audio_normalize_controls(self.audio_normalize.isChecked())
         
         self.vad_method.setCurrentText(self.settings.get("vad_method", "silero_v4_fw"))
         self.vad_threshold.setValue(self.settings.get("vad_threshold", 0.5))

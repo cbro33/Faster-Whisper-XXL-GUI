@@ -4,7 +4,7 @@ import subprocess
 import threading
 import yt_dlp
 from PyQt6.QtCore import pyqtSignal, QThread
-from utils import popen_hidden_subprocess
+from utils import popen_hidden_subprocess, resolve_ffmpeg_location
 from ytdlp_utils import log_ytdlp_update_debug
 from python_utils import refresh_python_detection_cache
 
@@ -66,6 +66,7 @@ class YouTubeDownloader(QThread):
     def run(self):
         try:
             output_template = os.path.join(self.output_path, '%(title)s.%(ext)s')
+            ffmpeg_location = resolve_ffmpeg_location()
             if self.audio_only:
                 ydl_opts = {
                     'format': 'bestaudio/best',
@@ -85,6 +86,8 @@ class YouTubeDownloader(QThread):
                     'progress_hooks': [self.progress_hook],
                     'logger': logging.getLogger('yt_dlp'),
                 }
+            if ffmpeg_location:
+                ydl_opts['ffmpeg_location'] = ffmpeg_location
 
             downloaded_files = []
             total_expected = 0
