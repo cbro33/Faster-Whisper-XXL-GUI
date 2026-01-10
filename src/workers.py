@@ -2,9 +2,9 @@ import os
 import logging
 import subprocess
 import threading
-import yt_dlp
 from PyQt6.QtCore import pyqtSignal, QThread
-from utils import popen_hidden_subprocess, resolve_ffmpeg_location
+from utils import popen_hidden_subprocess, resolve_ffmpeg_location, run_hidden_subprocess
+import ytdlp_utils
 from ytdlp_utils import log_ytdlp_update_debug
 from python_utils import refresh_python_detection_cache
 
@@ -15,7 +15,7 @@ class YouTubeDownloader(QThread):
     file_ready = pyqtSignal(str)
     total_found = pyqtSignal(int)
 
-    def __init__(self, urls, output_path, audio_only=True, stream_mode=True, serial_mode=False):
+    def __init__(self, urls, output_path, audio_only=True, stream_mode=True, serial_mode=False, ytdlp_exe=None):
         super().__init__()
         if isinstance(urls, str):
             self.urls = [urls]
@@ -25,13 +25,14 @@ class YouTubeDownloader(QThread):
         self.audio_only = audio_only
         self.stream_mode = stream_mode
         self.serial_mode = serial_mode
+        self.ytdlp_exe = ytdlp_exe
         self.stop_requested = False
         self._resume_event = threading.Event()
         self._resume_event.set()
 
     def progress_hook(self, d):
         if self.stop_requested:
-            raise yt_dlp.utils.DownloadError("Download cancelled by user.")
+            raise ytdlp_utils.yt_dlp.utils.DownloadError("Download cancelled by user.")
         if d['status'] == 'downloading':
             # Sanitize the output to prevent weird formatting issues
             percent_str = d.get('_percent_str', 'N/A').strip()
@@ -91,10 +92,27 @@ class YouTubeDownloader(QThread):
 
             downloaded_files = []
             total_expected = 0
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            if self.ytdlp_exe:
                 for url in self.urls:
                     if self.stop_requested:
-                        raise yt_dlp.utils.DownloadError("Download cancelled by user.")
+                        raise RuntimeError("Download cancelled by user.")
+                    self.progress.emit("Downloading with yt-dlp.exe...")
+                    paths = self._run_ytdlp_exe(url, output_template, ffmpeg_location)
+                    for path in paths:
+                        downloaded_files.append(path)
+                        self.file_ready.emit(path)
+                        if self.serial_mode:
+                            self._resume_event.clear()
+                            while not self._resume_event.is_set():
+                                if self.stop_requested:
+                                    raise RuntimeError("Download cancelled by user.")
+                                self._resume_event.wait(0.1)
+            if ytdlp_utils.yt_dlp is None:
+                raise RuntimeError("yt-dlp module is not available.")
+            with ytdlp_utils.yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                for url in self.urls:
+                    if self.stop_requested:
+                        raise ytdlp_utils.yt_dlp.utils.DownloadError("Download cancelled by user.")
                     if self.stream_mode:
                         info_dict = ydl.extract_info(url, download=False)
                         if info_dict and (info_dict.get('_type') == 'playlist' or 'entries' in info_dict):
@@ -104,7 +122,7 @@ class YouTubeDownloader(QThread):
                                 self.total_found.emit(total_expected)
                             for entry in entries:
                                 if self.stop_requested:
-                                    raise yt_dlp.utils.DownloadError("Download cancelled by user.")
+                                    raise ytdlp_utils.yt_dlp.utils.DownloadError("Download cancelled by user.")
                                 entry_url = self._entry_url(entry)
                                 if not entry_url:
                                     continue
@@ -116,7 +134,7 @@ class YouTubeDownloader(QThread):
                                         self._resume_event.clear()
                                         while not self._resume_event.is_set():
                                             if self.stop_requested:
-                                                raise yt_dlp.utils.DownloadError("Download cancelled by user.")
+                                                raise ytdlp_utils.yt_dlp.utils.DownloadError("Download cancelled by user.")
                                             self._resume_event.wait(0.1)
                         else:
                             total_expected += 1
@@ -129,7 +147,7 @@ class YouTubeDownloader(QThread):
                                     self._resume_event.clear()
                                     while not self._resume_event.is_set():
                                         if self.stop_requested:
-                                            raise yt_dlp.utils.DownloadError("Download cancelled by user.")
+                                            raise ytdlp_utils.yt_dlp.utils.DownloadError("Download cancelled by user.")
                                         self._resume_event.wait(0.1)
                     else:
                         info_dict = ydl.extract_info(url, download=True)
@@ -152,6 +170,21 @@ class YouTubeDownloader(QThread):
 
     def allow_next_download(self):
         self._resume_event.set()
+
+    def _run_ytdlp_exe(self, url, output_template, ffmpeg_location):
+        cmd = [self.ytdlp_exe, url, "-o", output_template, "--print", "after_move:filepath"]
+        if self.audio_only:
+            cmd.extend(["-f", "bestaudio/best", "-x", "--audio-format", "mp3", "--audio-quality", "192"])
+        else:
+            cmd.extend(["-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"])
+        if ffmpeg_location:
+            cmd.extend(["--ffmpeg-location", ffmpeg_location])
+        result = run_hidden_subprocess(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            msg = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(msg or "yt-dlp.exe failed")
+        lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+        return [line for line in lines if os.path.exists(line)]
 
 
 class YtDlpUpdateWorker(QThread):

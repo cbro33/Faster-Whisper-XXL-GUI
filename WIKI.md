@@ -74,6 +74,9 @@ The application is divided into several tabs, each grouping related settings. Th
 *   **Audio-only:**
     *   **Description:** If checked, only the audio track of the YouTube video will be downloaded and processed. If unchecked, the full video will be downloaded.
     *   **Recommendation:** For transcription purposes, downloading audio-only is usually sufficient and significantly faster, saving bandwidth and storage. Only uncheck if you specifically need the video file.
+*   **Manual yt-dlp updates (no Python):**
+    *   **Description:** Download the latest `yt-dlp.exe` and set Source to `EXE (custom or PATH)` in Settings.
+    *   **Usage:** Replace the exe when a new release is available; the app will use that file for downloads.
 
 ## 4. Global Settings
 
@@ -171,6 +174,12 @@ These settings provide more granular control over the Whisper model's behavior.
     *   **Acronyms/Jargon:** Introducing specific terms or acronyms that might not be in the model's vocabulary.
 *   **Usage:** Enter a short phrase or sentence.
 *   **Recommendation:** Use sparingly and precisely. An irrelevant or misleading prompt can degrade accuracy.
+
+### Extra CLI Args
+
+*   **Description:** Free-form command-line arguments passed directly to Faster Whisper XXL for advanced options not exposed in the UI. Located in the Paths and Overrides tab.
+*   **Usage:** Enter flags as you would on the command line (e.g., `--diarize --vad_clip_duration 30`). These are appended to the command and can override earlier settings.
+*   **Tip:** Run the Faster Whisper XXL executable with `--help` to see available flags.
 
 ### Word Timestamps
 

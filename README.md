@@ -19,6 +19,13 @@ Faster Whisper XXL GUI is a desktop interface for the Faster Whisper XXL transcr
 2. Run it (no installation required).
 3. On first launch, accept the prompt to download and set up Faster Whisper XXL + FFmpeg.
 
+## Manual yt-dlp Updates (No Python)
+
+1. Download the latest `yt-dlp.exe` from the official [yt-dlp releases page](https://github.com/yt-dlp/yt-dlp/releases).
+2. Place it in a stable folder (or anywhere on your PATH).
+3. In the app, go to Settings → yt-dlp and set Source to `EXE (custom or PATH)`, then browse to the file.
+4. To update later, replace that `yt-dlp.exe` with a newer one.
+
 ## Run From Source
 
 1. Install Python 3.8+ and `pip`.

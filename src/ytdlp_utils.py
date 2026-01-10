@@ -19,6 +19,7 @@ from python_utils import (
 
 # Global cache for yt-dlp module to avoid repeated imports
 yt_dlp = None
+yt_dlp_source_override = None
 
 def get_ytdlp_debug_log_path():
     """Return path for yt-dlp update debug logging."""
@@ -277,6 +278,26 @@ def refresh_yt_dlp_module_after_update():
         log_ytdlp_update_debug(f"Reload failed: {exc}")
         return None
 
+def select_yt_dlp_source(source):
+    """Select which yt-dlp module to use: bundled or system."""
+    global yt_dlp, yt_dlp_source_override
+    yt_dlp_source_override = source
+    if source == "system":
+        module = load_system_yt_dlp_module()
+        if module:
+            yt_dlp = module
+            return yt_dlp
+    try:
+        import importlib
+        clear_ytdlp_module_cache()
+        module = importlib.import_module("yt_dlp")
+        module = maybe_use_external_yt_dlp(module)
+        yt_dlp = module
+        return yt_dlp
+    except Exception as exc:
+        logging.warning(f"Could not load bundled yt-dlp: {exc}")
+        return None
+
 _YT_DLP_RELEASE_CACHE = {
     "timestamp": 0,
     "releases": None
@@ -518,13 +539,16 @@ def is_within_update_cooldown(last_update_timestamp, cooldown_hours=24):
     return (current_time - last_update_timestamp) < cooldown_seconds
 
 
-def should_check_ytdlp_update():
-    """ Determine if we should check for yt-dlp updates based on persistent tracking """
+def should_check_ytdlp_update(current_version=None, env=None):
+    """Determine if we should check for yt-dlp updates based on persistent tracking."""
     try:
-        # Get current installation info
-        install_info = get_ytdlp_installation_info()
-        env = install_info["environment"]
-        current_version = install_info["version"]
+        # Get current installation info if not provided
+        if current_version is None or env is None:
+            install_info = get_ytdlp_installation_info()
+            if env is None:
+                env = install_info["environment"]
+            if current_version is None:
+                current_version = install_info["version"]
         
         if not current_version:
             return True  # yt-dlp not found, should check

@@ -9,6 +9,7 @@ import webbrowser
 import platform
 import re
 import ntpath
+import shlex
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QSplitter, QHBoxLayout, QVBoxLayout, QLabel, 
     QComboBox, QTabWidget, QGroupBox, QFormLayout, QPushButton, 
@@ -18,7 +19,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar
 )
 from PyQt6.QtCore import Qt, QTimer, QProcess, QByteArray, QUrl, QThread, pyqtSignal
-from PyQt6.QtGui import QIcon, QPalette, QColor, QTextCursor, QFont, QDesktopServices
+from PyQt6.QtGui import QIcon, QPalette, QColor, QTextCursor, QFont, QDesktopServices, QFontMetrics
 
 from config import APP_VERSION, SUPPORTED_EXTENSIONS
 from utils import (
@@ -34,7 +35,8 @@ from ytdlp_utils import (
     get_system_yt_dlp_info, evaluate_yt_dlp_version_status, can_update_yt_dlp,
     get_python_update_plan, should_check_ytdlp_update, record_ytdlp_update_success,
     record_ytdlp_update_failure, clear_ytdlp_update_failure, is_within_update_cooldown,
-    get_ytdlp_installation_info, refresh_yt_dlp_module_after_update, remove_external_yt_dlp
+    get_ytdlp_installation_info, refresh_yt_dlp_module_after_update, remove_external_yt_dlp,
+    select_yt_dlp_source
 )
 from workers import YouTubeDownloader, YtDlpUpdateWorker
 from gui_components import (
@@ -253,6 +255,7 @@ class WhisperGUI(QMainWindow):
         self.settings_file = os.path.join(portable_dir, "settings.json")
         self.old_roaming_settings_file = os.path.join(get_settings_directory(), "settings.json")  # For migration FROM roaming
         self.settings = {}
+        self.load_settings_file_only()
         
         # yt-dlp update tracking to prevent multiple checks
         self.yt_dlp_update_checked = False
@@ -297,6 +300,12 @@ class WhisperGUI(QMainWindow):
         QTimer.singleShot(1200, self.check_app_update)
 
     def check_and_setup_dependencies(self):
+        override_exe = self.settings.get("fw_executable_override")
+        if override_exe and os.path.exists(override_exe):
+            self.executable_path = os.path.abspath(override_exe)
+            self.executable_name = os.path.basename(self.executable_path)
+            logging.info(f"Using override executable: {self.executable_path}")
+            return True
         if sys.platform == "win32":
             self.executable_name = "faster-whisper-xxl.exe"
             url = "https://github.com/Purfview/whisper-standalone-win/releases/download/Faster-Whisper-XXL/Faster-Whisper-XXL_r245.4_windows.7z"
@@ -353,8 +362,11 @@ class WhisperGUI(QMainWindow):
 
     def init_ui(self):
         self.setWindowTitle(f"Faster Whisper XXL GUI v{APP_VERSION}")
-        self.setGeometry(100, 100, 1300, 1000)
-        self.setMinimumSize(1100, 800)
+        if getattr(sys, "frozen", False):
+            self.setGeometry(100, 100, 1303, 800)
+        else:
+            self.setGeometry(100, 100, 1500, 1000)
+        self.setMinimumSize(1250, 800)
 
         # Create menu bar
         self.create_menu_bar()
@@ -367,6 +379,7 @@ class WhisperGUI(QMainWindow):
         central_layout.addWidget(self.main_splitter)
 
         left_panel = QWidget()
+        self.left_panel = left_panel
         left_layout = QVBoxLayout(left_panel)
         left_layout.setSpacing(10)
         left_layout.setContentsMargins(10, 10, 10, 10)
@@ -395,6 +408,10 @@ class WhisperGUI(QMainWindow):
         self.setup_youtube_tab(self.youtube_tab)
         self.tabs.addTab(self.youtube_tab, "yt-dlp")
 
+        overrides_tab = QWidget()
+        self.setup_overrides_tab(overrides_tab)
+        self.tabs.addTab(overrides_tab, "Paths and Overrides")
+
         advanced_tab = QWidget()
         self.setup_advanced_tab(advanced_tab)
         self.tabs.addTab(advanced_tab, "Advanced")
@@ -406,6 +423,8 @@ class WhisperGUI(QMainWindow):
         audio_tab = QWidget()
         self.setup_audio_tab(audio_tab)
         self.tabs.addTab(audio_tab, "Audio")
+
+        self._apply_tab_minimums()
 
         global_settings_group = QGroupBox("Global Settings")
         global_settings_layout = QFormLayout(global_settings_group)
@@ -421,10 +440,77 @@ class WhisperGUI(QMainWindow):
         left_layout.setStretch(3, 0)
 
         right_panel = self.create_output_console()
+        self.right_panel = right_panel
 
         self.main_splitter.addWidget(left_panel)
         self.main_splitter.addWidget(right_panel)
-        self.main_splitter.setSizes([450, 750])
+        if getattr(sys, "frozen", False):
+            self.main_splitter.setSizes([545, 758])
+        else:
+            self.main_splitter.setSizes([560, 940])
+        QTimer.singleShot(0, self._apply_tab_minimums)
+        QTimer.singleShot(0, self._enforce_splitter_sizes_for_frozen)
+
+    def _required_tab_bar_width(self):
+        if not getattr(self, "tabs", None):
+            return None
+        tab_bar = self.tabs.tabBar()
+        total = 20
+        for idx in range(self.tabs.count()):
+            hint = tab_bar.tabSizeHint(idx)
+            total += hint.width() + 2
+        return total
+
+    def _apply_tab_minimums(self):
+        if not getattr(sys, "frozen", False):
+            return
+        min_width = self._required_tab_bar_width()
+        if not min_width:
+            return
+        if getattr(self, "left_panel", None):
+            current_min = self.left_panel.minimumWidth()
+            if min_width > current_min:
+                self.left_panel.setMinimumWidth(min_width)
+        if getattr(self, "main_splitter", None):
+            sizes = self.main_splitter.sizes()
+            if len(sizes) >= 2:
+                total = sum(sizes)
+                desired_left = max(sizes[0], min_width)
+                min_right = 520
+                if total < desired_left + min_right:
+                    self.setMinimumWidth(desired_left + min_right + 40)
+                    self.resize(desired_left + min_right + 40, self.height())
+                    total = sum(self.main_splitter.sizes())
+                if total > desired_left + min_right:
+                    self.main_splitter.setSizes([desired_left, total - desired_left])
+
+    def _enforce_splitter_sizes_for_frozen(self):
+        if not getattr(sys, "frozen", False):
+            return
+        if not getattr(self, "main_splitter", None):
+            return
+        sizes = self.main_splitter.sizes()
+        if len(sizes) < 2:
+            return
+        min_left = self._required_tab_bar_width() or 0
+        min_right = 520
+        target_width = max(self.width(), self.minimumWidth())
+        if self.width() < target_width:
+            self.resize(target_width, self.height())
+        total = self.main_splitter.width() or target_width
+        desired_left = max(min_left, int(total * 0.45))
+        desired_right = max(min_right, total - desired_left)
+        if total < desired_left + desired_right:
+            total = desired_left + desired_right
+            self.resize(total + 40, self.height())
+            total = self.main_splitter.width() or self.width()
+            desired_right = max(min_right, total - desired_left)
+        self.main_splitter.setSizes([desired_left, desired_right])
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if getattr(sys, "frozen", False):
+            QTimer.singleShot(0, self._apply_tab_minimums)
 
     def setup_file_tab(self, tab):
         layout = QFormLayout(tab)
@@ -526,6 +612,150 @@ class WhisperGUI(QMainWindow):
             "When disabled, items are transcribed as soon as they finish downloading."
         )
         layout.addRow(self.download_all_checkbox)
+
+    def setup_overrides_tab(self, tab):
+        scroll = QScrollArea()
+        scroll_widget = QWidget()
+        layout = QVBoxLayout(scroll_widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(10)
+
+        core_group = QGroupBox("Core Paths")
+        core_layout = QFormLayout(core_group)
+        core_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        core_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+
+        self.fw_exe_path = QLineEdit()
+        self.fw_exe_path.setPlaceholderText("Optional override for faster-whisper-xxl executable")
+        fw_browse = QPushButton("Browse")
+        fw_clear = QPushButton("Clear")
+        fw_test = QPushButton("Test")
+        fw_find = QPushButton("Find PATH")
+        fw_row = QHBoxLayout()
+        fw_row.addWidget(self.fw_exe_path)
+        fw_row.addWidget(fw_browse)
+        fw_row.addWidget(fw_clear)
+        fw_row.addWidget(fw_test)
+        fw_row.addWidget(fw_find)
+        core_layout.addRow("Whisper XXL EXE:", fw_row)
+
+        self.model_dir_path = QLineEdit()
+        self.model_dir_path.setPlaceholderText("Optional override for model directory")
+        model_browse = QPushButton("Browse")
+        model_clear = QPushButton("Clear")
+        model_test = QPushButton("Test")
+        model_row = QHBoxLayout()
+        model_row.addWidget(self.model_dir_path)
+        model_row.addWidget(model_browse)
+        model_row.addWidget(model_clear)
+        model_row.addWidget(model_test)
+        core_layout.addRow("Model Directory:", model_row)
+
+        layout.addWidget(core_group)
+
+        ytdlp_group = QGroupBox("yt-dlp")
+        ytdlp_layout = QFormLayout(ytdlp_group)
+        ytdlp_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        ytdlp_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+
+        bundled_label = (
+            "Uses Python module (current env)."
+            if not getattr(sys, "frozen", False)
+            else "Uses bundled Python module."
+        )
+        ytdlp_hint = QLabel(bundled_label)
+        ytdlp_hint.setStyleSheet("color: #a0a0a0; font-size: 12px;")
+        ytdlp_hint.setWordWrap(True)
+        ytdlp_layout.addRow(ytdlp_hint)
+        self.ytdlp_source_combo = QComboBox()
+        self.ytdlp_source_combo.addItem("Python module (current env/bundled)", "bundled")
+        self.ytdlp_source_combo.addItem("EXE (custom or PATH)", "path")
+        self.ytdlp_source_combo.setToolTip("Choose whether downloads use the Python module or yt-dlp EXE.")
+        ytdlp_layout.addRow("Source:", self.ytdlp_source_combo)
+
+        self.ytdlp_exe_path = QLineEdit()
+        self.ytdlp_exe_path.setPlaceholderText("Optional override for yt-dlp.exe (manual use)")
+        ytdlp_browse = QPushButton("Browse")
+        ytdlp_clear = QPushButton("Clear")
+        ytdlp_test = QPushButton("Test")
+        ytdlp_find = QPushButton("Find PATH")
+        ytdlp_row = QHBoxLayout()
+        ytdlp_row.addWidget(self.ytdlp_exe_path)
+        ytdlp_row.addWidget(ytdlp_browse)
+        ytdlp_row.addWidget(ytdlp_clear)
+        ytdlp_row.addWidget(ytdlp_test)
+        ytdlp_row.addWidget(ytdlp_find)
+        ytdlp_layout.addRow("yt-dlp EXE:", ytdlp_row)
+
+        layout.addWidget(ytdlp_group)
+
+        ffmpeg_group = QGroupBox("ffmpeg")
+        ffmpeg_layout = QFormLayout(ffmpeg_group)
+        ffmpeg_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        ffmpeg_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+
+        self.ffmpeg_path_input = QLineEdit()
+        self.ffmpeg_path_input.setPlaceholderText("Optional override for ffmpeg executable")
+        ffmpeg_browse = QPushButton("Browse")
+        ffmpeg_clear = QPushButton("Clear")
+        ffmpeg_test = QPushButton("Test")
+        ffmpeg_find = QPushButton("Find PATH")
+        ffmpeg_row = QHBoxLayout()
+        ffmpeg_row.addWidget(self.ffmpeg_path_input)
+        ffmpeg_row.addWidget(ffmpeg_browse)
+        ffmpeg_row.addWidget(ffmpeg_clear)
+        ffmpeg_row.addWidget(ffmpeg_test)
+        ffmpeg_row.addWidget(ffmpeg_find)
+        ffmpeg_layout.addRow("FFMPEG EXE:", ffmpeg_row)
+
+        layout.addWidget(ffmpeg_group)
+
+        cli_group = QGroupBox("CLI Overrides")
+        cli_layout = QFormLayout(cli_group)
+        cli_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        cli_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+
+        self.extra_cli_args = QTextEdit()
+        self.extra_cli_args.setMaximumHeight(100)
+        self.extra_cli_args.setToolTip(
+            "Extra Faster Whisper XXL CLI arguments. These are appended to the command as-is. "
+            "Use --help with the executable to see available flags."
+        )
+        cli_layout.addRow("Extra CLI Args:", self.extra_cli_args)
+        cli_hint = QLabel("Hint: run the Faster Whisper XXL executable with --help to see available flags.")
+        cli_hint.setWordWrap(True)
+        cli_hint.setStyleSheet("color: #a0a0a0; font-size: 12px;")
+        cli_layout.addRow(cli_hint)
+
+        layout.addWidget(cli_group)
+        layout.addStretch()
+
+        scroll.setWidget(scroll_widget)
+        scroll.setWidgetResizable(True)
+        tab_layout = QVBoxLayout(tab)
+        tab_layout.addWidget(scroll)
+
+        fw_browse.clicked.connect(lambda: self.browse_executable_path(self.fw_exe_path))
+        fw_clear.clicked.connect(lambda: self.clear_config_path(self.fw_exe_path))
+        fw_test.clicked.connect(self.test_faster_whisper_path)
+        fw_find.clicked.connect(self.show_faster_whisper_path_picker)
+        model_browse.clicked.connect(lambda: self.browse_directory_path(self.model_dir_path))
+        model_clear.clicked.connect(lambda: self.clear_config_path(self.model_dir_path))
+        model_test.clicked.connect(self.test_model_dir_path)
+        ytdlp_browse.clicked.connect(lambda: self.browse_executable_path(self.ytdlp_exe_path))
+        ytdlp_clear.clicked.connect(lambda: self.clear_config_path(self.ytdlp_exe_path))
+        ytdlp_test.clicked.connect(self.test_ytdlp_path)
+        ytdlp_find.clicked.connect(self.show_ytdlp_path_picker)
+        ffmpeg_browse.clicked.connect(lambda: self.browse_executable_path(self.ffmpeg_path_input))
+        ffmpeg_clear.clicked.connect(lambda: self.clear_config_path(self.ffmpeg_path_input))
+        ffmpeg_test.clicked.connect(self.test_ffmpeg_path)
+        ffmpeg_find.clicked.connect(self.show_ffmpeg_path_picker)
+
+        self.fw_exe_path.editingFinished.connect(self.save_config_settings)
+        self.model_dir_path.editingFinished.connect(self.save_config_settings)
+        self.ytdlp_exe_path.editingFinished.connect(self.save_config_settings)
+        self.ffmpeg_path_input.editingFinished.connect(self.save_config_settings)
+        self.ytdlp_source_combo.currentIndexChanged.connect(self.save_config_settings)
 
     def setup_global_settings(self, layout):
         layout.setVerticalSpacing(4)
@@ -905,6 +1135,360 @@ class WhisperGUI(QMainWindow):
         self.update_audio_preprocess_controls(self.audio_preprocess_enable.isChecked())
         self.update_audio_normalize_controls(self.audio_normalize.isChecked())
 
+    def browse_executable_path(self, target_line_edit):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Executable")
+        if path:
+            target_line_edit.setText(path)
+            self.save_config_settings()
+
+    def browse_directory_path(self, target_line_edit):
+        path = QFileDialog.getExistingDirectory(self, "Select Directory")
+        if path:
+            target_line_edit.setText(path)
+            self.save_config_settings()
+
+    def clear_config_path(self, target_line_edit):
+        target_line_edit.clear()
+        self.save_config_settings()
+
+    def save_config_settings(self):
+        self.settings["fw_executable_override"] = self.fw_exe_path.text().strip()
+        self.settings["model_dir_override"] = self.model_dir_path.text().strip()
+        self.settings["yt_dlp_source"] = self.ytdlp_source_combo.currentData()
+        self.settings["yt_dlp_exe_override"] = self.ytdlp_exe_path.text().strip()
+        self.settings["ffmpeg_override"] = self.ffmpeg_path_input.text().strip()
+        self.apply_config_settings()
+        self.save_settings_to_file()
+
+    def apply_config_settings(self):
+        ffmpeg_override = self.settings.get("ffmpeg_override")
+        if ffmpeg_override:
+            os.environ["FWHISPER_FFMPEG_PATH"] = ffmpeg_override
+        else:
+            os.environ.pop("FWHISPER_FFMPEG_PATH", None)
+        source = self.settings.get("yt_dlp_source", "bundled")
+        if source == "bundled":
+            select_yt_dlp_source(source)
+        fw_override = self.settings.get("fw_executable_override")
+        if fw_override and os.path.exists(fw_override):
+            self.executable_path = os.path.abspath(fw_override)
+
+    def test_faster_whisper_path(self):
+        path = self.fw_exe_path.text().strip()
+        if not path:
+            QMessageBox.warning(self, "Whisper XXL", "Please select an executable path first.")
+            return
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "Whisper XXL", "Executable not found.")
+            return
+        try:
+            result = run_hidden_subprocess([path, "--version"], capture_output=True, text=True, timeout=5)
+            output = (result.stdout or result.stderr or "").strip()
+            if result.returncode == 0 and output:
+                QMessageBox.information(self, "Whisper XXL", f"Detected: {output.splitlines()[0]}")
+            else:
+                QMessageBox.warning(self, "Whisper XXL", "Executable found, but version check failed.")
+        except Exception as exc:
+            QMessageBox.warning(self, "Whisper XXL", f"Failed to run executable: {exc}")
+
+    def test_model_dir_path(self):
+        path = self.model_dir_path.text().strip()
+        if not path:
+            QMessageBox.warning(self, "Model Directory", "Please select a model directory first.")
+            return
+        if not os.path.isdir(path):
+            QMessageBox.warning(self, "Model Directory", f"Directory not found:\n{path}")
+            return
+        def format_size(bytes_size):
+            if bytes_size is None:
+                return ""
+            if bytes_size >= 1024 * 1024:
+                return f"{bytes_size / (1024 * 1024):.1f} MB"
+            return f"{bytes_size / 1024:.0f} KB"
+
+        model_entries = []
+        try:
+            for entry in sorted(os.listdir(path)):
+                entry_path = os.path.join(path, entry)
+                if not os.path.isdir(entry_path):
+                    continue
+                model_bin = os.path.join(entry_path, "model.bin")
+                if os.path.exists(model_bin):
+                    size = None
+                    try:
+                        size = os.path.getsize(model_bin)
+                    except Exception:
+                        size = None
+                    model_entries.append(
+                        {
+                            "name": entry,
+                            "path": model_bin,
+                            "size": format_size(size),
+                        }
+                    )
+        except Exception as exc:
+            QMessageBox.warning(self, "Model Directory", f"Failed to scan directory:\n{exc}")
+            return
+
+        if model_entries:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Model Directory")
+            dialog.setModal(True)
+            dialog.setMinimumSize(900, 360)
+
+            layout = QVBoxLayout(dialog)
+            layout.setContentsMargins(12, 10, 12, 12)
+            layout.setSpacing(10)
+
+            status_label = QLabel(f"Found {len(model_entries)} model folders.")
+            status_label.setWordWrap(True)
+            status_label.setStyleSheet("font-size: 14px; font-weight: bold;")
+            layout.addWidget(status_label)
+
+            table = QTableWidget(dialog)
+            table.setColumnCount(3)
+            table.setHorizontalHeaderLabels(["Model", "Path", "Size"])
+            table.setRowCount(len(model_entries))
+            table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            table.verticalHeader().setVisible(False)
+            table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+
+            for row, entry in enumerate(model_entries):
+                table.setItem(row, 0, QTableWidgetItem(entry["name"]))
+                path_item = QTableWidgetItem(entry["path"])
+                path_item.setToolTip(entry["path"])
+                table.setItem(row, 1, path_item)
+                table.setItem(row, 2, QTableWidgetItem(entry["size"]))
+            layout.addWidget(table)
+
+            button_row = QHBoxLayout()
+            close_button = QPushButton("Close")
+            button_row.addStretch()
+            button_row.addWidget(close_button)
+            layout.addLayout(button_row)
+
+            close_button.clicked.connect(dialog.accept)
+            dialog.exec()
+        else:
+            QMessageBox.information(
+                self,
+                "Model Directory",
+                "Directory exists, but no model files were found yet.\n"
+                "Models will be downloaded on first run."
+            )
+
+    def test_ytdlp_path(self):
+        source = self.ytdlp_source_combo.currentData()
+        if source == "bundled":
+            info = get_ytdlp_installation_info()
+            version = info.get("version")
+            location = info.get("path")
+            if version:
+                QMessageBox.information(self, "yt-dlp", f"Bundled module: {version}\n{location}")
+            else:
+                QMessageBox.warning(self, "yt-dlp", "Bundled yt-dlp not found.")
+            return
+        path = self.ytdlp_exe_path.text().strip()
+        if not path:
+            path = shutil.which("yt-dlp")
+            if not path:
+                QMessageBox.warning(self, "yt-dlp", "yt-dlp not found in PATH.")
+                return
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "yt-dlp", "yt-dlp executable not found.")
+            return
+        try:
+            result = run_hidden_subprocess([path, "--version"], capture_output=True, text=True, timeout=5)
+            output = (result.stdout or result.stderr or "").strip()
+            if result.returncode == 0 and output:
+                QMessageBox.information(self, "yt-dlp", f"Detected: {output.splitlines()[0]}\n{path}")
+            else:
+                QMessageBox.warning(self, "yt-dlp", "Executable found, but version check failed.")
+        except Exception as exc:
+            QMessageBox.warning(self, "yt-dlp", f"Failed to run yt-dlp: {exc}")
+
+    def get_ytdlp_exe_version(self):
+        path = self.settings.get("yt_dlp_exe_override") or shutil.which("yt-dlp")
+        if not path:
+            return None, None, "yt-dlp executable not found in PATH."
+        try:
+            result = run_hidden_subprocess([path, "--version"], capture_output=True, text=True, timeout=5)
+        except Exception as exc:
+            return None, path, str(exc)
+        output = (result.stdout or result.stderr or "").strip()
+        if result.returncode != 0 or not output:
+            return None, path, output or f"Command failed (exit {result.returncode})."
+        match = re.search(r"\d{4}\.\d{2}\.\d{2}", output)
+        if match:
+            return match.group(0), path, None
+        return output.split()[0], path, None
+
+    def show_ytdlp_path_picker(self):
+        exe_names = ["yt-dlp.exe"] if sys.platform == "win32" else ["yt-dlp"]
+        candidates = self.find_path_candidates(exe_names, ["--version"])
+        self.show_executable_picker("Select yt-dlp from PATH", candidates, self.ytdlp_exe_path)
+
+    def show_faster_whisper_path_picker(self):
+        exe_names = ["faster-whisper-xxl.exe"] if sys.platform == "win32" else ["faster-whisper-xxl"]
+        candidates = self.find_path_candidates(exe_names, ["--version"])
+        self.show_executable_picker("Select Faster Whisper XXL from PATH", candidates, self.fw_exe_path)
+
+    def show_ffmpeg_path_picker(self):
+        exe_names = ["ffmpeg.exe"] if sys.platform == "win32" else ["ffmpeg"]
+        candidates = self.find_path_candidates(exe_names, ["-version"])
+        self.show_executable_picker("Select FFMPEG from PATH", candidates, self.ffmpeg_path_input)
+
+    def show_executable_picker(self, title, candidates, target_line_edit):
+        if not candidates:
+            QMessageBox.information(self, "Executables", "No matching executables found in PATH.")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.setModal(True)
+        dialog.setMinimumSize(900, 360)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 10, 12, 12)
+        layout.setSpacing(10)
+
+        table = QTableWidget(dialog)
+        table.setColumnCount(3)
+        table.setHorizontalHeaderLabels(["Path", "Version", "Size"])
+        table.setRowCount(len(candidates))
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+
+        for row, entry in enumerate(candidates):
+            path_item = QTableWidgetItem(entry["path"])
+            path_item.setToolTip(entry["path"])
+            table.setItem(row, 0, path_item)
+            table.setItem(row, 1, QTableWidgetItem(entry.get("version") or "Unknown"))
+            table.setItem(row, 2, QTableWidgetItem(entry.get("size") or ""))
+        layout.addWidget(table)
+
+        button_row = QHBoxLayout()
+        select_button = QPushButton("Use Selected")
+        close_button = QPushButton("Close")
+        button_row.addStretch()
+        button_row.addWidget(select_button)
+        button_row.addWidget(close_button)
+        layout.addLayout(button_row)
+
+        def apply_selection():
+            row = table.currentRow()
+            if row < 0:
+                return
+            path = table.item(row, 0).text()
+            target_line_edit.setText(path)
+            self.save_config_settings()
+            dialog.accept()
+
+        select_button.clicked.connect(apply_selection)
+        close_button.clicked.connect(dialog.reject)
+        table.itemDoubleClicked.connect(lambda _item: apply_selection())
+
+        dialog.exec()
+
+    def show_info_dialog(self, title, message, min_width=520, min_height=180):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.setModal(True)
+        dialog.setMinimumSize(min_width, min_height)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 10, 12, 12)
+        layout.setSpacing(10)
+
+        label = QLabel(message)
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(label)
+
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(dialog.accept)
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+        button_row.addWidget(close_button)
+        layout.addLayout(button_row)
+
+        dialog.exec()
+
+    def find_path_candidates(self, exe_names, version_args):
+        candidates = []
+        seen = set()
+        for folder in os.environ.get("PATH", "").split(os.pathsep):
+            if not folder:
+                continue
+            for exe_name in exe_names:
+                candidate = os.path.join(folder, exe_name)
+                if not os.path.isfile(candidate):
+                    continue
+                normalized = os.path.abspath(candidate)
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                size = ""
+                try:
+                    bytes_size = os.path.getsize(normalized)
+                    if bytes_size >= 1024 * 1024:
+                        size = f"{bytes_size / (1024 * 1024):.1f} MB"
+                    else:
+                        size = f"{bytes_size / 1024:.0f} KB"
+                except Exception:
+                    size = ""
+                version = None
+                try:
+                    result = run_hidden_subprocess([normalized, *version_args], capture_output=True, text=True, timeout=5)
+                    output = (result.stdout or result.stderr or "").strip()
+                    if result.returncode == 0 and output:
+                        version = output.splitlines()[0]
+                except Exception:
+                    version = None
+                candidates.append({"path": normalized, "version": version, "size": size})
+        return candidates
+
+    def test_ffmpeg_path(self):
+        path = self.ffmpeg_path_input.text().strip() or resolve_ffmpeg_location()
+        if not path:
+            QMessageBox.warning(self, "ffmpeg", "ffmpeg not found.")
+            return
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "ffmpeg", "ffmpeg executable not found.")
+            return
+        try:
+            result = run_hidden_subprocess([path, "-version"], capture_output=True, text=True, timeout=5)
+            output = (result.stdout or result.stderr or "").strip()
+            if result.returncode == 0 and output:
+                first_line = output.splitlines()[0]
+                match = re.search(r"ffmpeg version ([^\\s]+)", first_line, re.IGNORECASE)
+                version = match.group(1) if match else "unknown"
+                build_tag_match = re.search(r"(?:-([\\w\\.]+_build[^\\s]*))", first_line)
+                build_tag = build_tag_match.group(1) if build_tag_match else None
+                years = None
+                year_match = re.search(r"Copyright \\(c\\) (\\d{4})-(\\d{4})", output)
+                if year_match:
+                    years = f"{year_match.group(1)}-{year_match.group(2)}"
+                parts = [f"ffmpeg {version}"]
+                if build_tag:
+                    parts.append(f"({build_tag})")
+                if years:
+                    parts.append(f"{years}")
+                message = " ".join(parts) + f"\n{path}"
+                self.show_info_dialog("FFMPEG", message, min_width=520, min_height=180)
+            else:
+                QMessageBox.warning(self, "ffmpeg", "Executable found, but version check failed.")
+        except Exception as exc:
+            QMessageBox.warning(self, "ffmpeg", f"Failed to run ffmpeg: {exc}")
+
     def apply_theme(self, theme_name):
         self.settings["theme"] = theme_name.lower()
         qss_path = ""
@@ -1261,16 +1845,34 @@ class WhisperGUI(QMainWindow):
         if self.yt_dlp_update_in_progress:
             logging.info("yt-dlp update in progress, skipping version check")
             return
-        
-        if not should_check_ytdlp_update():
-            return
-        
-        self.yt_dlp_update_checked = True
-        
+
         try:
-            install_info = get_ytdlp_installation_info()
-            current_version = install_info["version"]
-            env = install_info["environment"]
+            source = self.settings.get("yt_dlp_source", "bundled")
+            if source == "path":
+                current_version, exe_path, error = self.get_ytdlp_exe_version()
+                env = get_execution_environment()
+                if not current_version:
+                    logging.warning(
+                        "yt-dlp EXE version check failed: %s",
+                        error or "yt-dlp executable not found",
+                    )
+                    return
+                if not should_check_ytdlp_update(current_version=current_version, env=env):
+                    return
+                self.yt_dlp_update_checked = True
+                install_info = {
+                    "version": current_version,
+                    "environment": env,
+                    "installation_type": "exe_path",
+                    "path": exe_path,
+                }
+            else:
+                if not should_check_ytdlp_update():
+                    return
+                self.yt_dlp_update_checked = True
+                install_info = get_ytdlp_installation_info()
+                current_version = install_info["version"]
+                env = install_info["environment"]
 
             if not current_version:
                 logging.error("yt-dlp not found")
@@ -1289,6 +1891,8 @@ class WhisperGUI(QMainWindow):
                 "current_version": current_version,
                 "env": env,
                 "plan": plan,
+                "source": source,
+                "exe_path": install_info.get("path"),
             }
             self.yt_dlp_version_worker = YtDlpVersionCheckWorker(
                 "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest",
@@ -1319,9 +1923,35 @@ class WhisperGUI(QMainWindow):
         env = context.get("env")
         plan = context.get("plan") or {}
         plan_status = plan.get("status")
+        source = context.get("source")
+        exe_path = context.get("exe_path")
 
         if not current_version:
             logging.warning("yt-dlp current version missing; skipping update prompt")
+            return
+        if source == "path":
+            if current_version != latest_version:
+                update_msg = (
+                    f"Your yt-dlp EXE version ({current_version}) is outdated.\n"
+                    f"Latest version is {latest_version}.\n\n"
+                    "Would you like to open the yt-dlp downloads page?"
+                )
+                if exe_path:
+                    update_msg += f"\n\nCurrent EXE:\n{format_path_for_display(exe_path)}"
+                reply = show_setup_question(
+                    self,
+                    "yt-dlp Update Available",
+                    update_msg,
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    webbrowser.open("https://github.com/yt-dlp/yt-dlp/releases/latest")
+            else:
+                logging.info("yt-dlp EXE is up to date")
+                record_ytdlp_update_success(current_version)
+                clear_ytdlp_update_failure(env)
+            self.yt_dlp_update_session_complete = True
             return
 
         if current_version != latest_version:
@@ -1878,19 +2508,25 @@ class WhisperGUI(QMainWindow):
             else:
                 info_lines.append("• None detected")
 
+            source = self.settings.get("yt_dlp_source", "bundled")
             plan = get_python_update_plan()
             info_lines.append("")
             info_lines.append("yt-dlp Update Planner:")
-            info_lines.append(f"• Status: {plan.get('status')}")
-            if plan.get("status_detail"):
-                info_lines.append(f"• Detail: {plan['status_detail']}")
-            python_info = plan.get("python_info")
-            if python_info:
-                info_lines.append(
-                    f"• Selected Interpreter: {python_info.get('display_name')} (Python {python_info.get('version')})"
-                )
-            if plan.get("target_directory"):
-                info_lines.append(f"• Target Directory: {format_path_for_display(plan['target_directory'])}")
+            if source == "path":
+                info_lines.append("• Source: EXE (custom or PATH)")
+                info_lines.append("• Update Method: Manual (download new yt-dlp.exe)")
+            else:
+                info_lines.append("• Source: Python module (bundled/current env)")
+                info_lines.append(f"• Status: {plan.get('status')}")
+                if plan.get("status_detail"):
+                    info_lines.append(f"• Detail: {plan['status_detail']}")
+                python_info = plan.get("python_info")
+                if python_info:
+                    info_lines.append(
+                        f"• Selected Interpreter: {python_info.get('display_name')} (Python {python_info.get('version')})"
+                    )
+                if plan.get("target_directory"):
+                    info_lines.append(f"• Target Directory: {format_path_for_display(plan['target_directory'])}")
 
             probe_log = get_python_probe_log()
             if plan.get("status") != "ready" and failures:
@@ -1905,14 +2541,22 @@ class WhisperGUI(QMainWindow):
                         f"• {cmd_label}: {entry.get('status')}" + (f" ({detail})" if detail else "")
                     )
 
-            ytdlp_info = get_ytdlp_installation_info()
             info_lines.append("")
-            info_lines.append("yt-dlp Module:")
-            info_lines.append(f"• Version: {ytdlp_info.get('version') or 'Not found'}")
-            info_lines.append(f"• Location: {format_path_for_display(ytdlp_info.get('path')) or 'Unknown'}")
-            info_lines.append(f"• Source: {ytdlp_info.get('installation_type')}")
-
-            version_status = evaluate_yt_dlp_version_status(ytdlp_info.get('version'))
+            if source == "path":
+                exe_version, exe_path, exe_error = self.get_ytdlp_exe_version()
+                info_lines.append("yt-dlp EXE:")
+                info_lines.append(f"• Version: {exe_version or 'Unknown'}")
+                info_lines.append(f"• Location: {format_path_for_display(exe_path) or 'Unknown'}")
+                if exe_error:
+                    info_lines.append(f"• Status: {exe_error}")
+                version_status = evaluate_yt_dlp_version_status(exe_version)
+            else:
+                ytdlp_info = get_ytdlp_installation_info()
+                info_lines.append("yt-dlp Module:")
+                info_lines.append(f"• Version: {ytdlp_info.get('version') or 'Not found'}")
+                info_lines.append(f"• Location: {format_path_for_display(ytdlp_info.get('path')) or 'Unknown'}")
+                info_lines.append(f"• Source: {ytdlp_info.get('installation_type')}")
+                version_status = evaluate_yt_dlp_version_status(ytdlp_info.get('version'))
             latest = version_status.get("latest_version")
             if latest:
                 info_lines.append(f"• Latest Release: {latest}")
@@ -2259,6 +2903,9 @@ class WhisperGUI(QMainWindow):
         return f"/mnt/{drive}/{rest}"
 
     def get_model_dirs(self):
+        model_override = self.settings.get("model_dir_override")
+        if model_override:
+            return model_override, model_override
         if not self.executable_path:
             return None, None
         if self._is_windows_path(self.executable_path):
@@ -2436,6 +3083,18 @@ class WhisperGUI(QMainWindow):
             cmd.extend(["--word_timestamps", "True"])
         if getattr(self, "highlight_words_checkbox", None) and self.highlight_words_checkbox.isChecked():
             cmd.extend(["--highlight_words", "True"])
+        extra_args = self.extra_cli_args.toPlainText().strip()
+        if extra_args:
+            try:
+                extra_tokens = shlex.split(extra_args, posix=os.name != "nt")
+            except ValueError as exc:
+                QMessageBox.warning(
+                    self,
+                    "Extra CLI Args",
+                    f"Could not parse extra arguments:\n{exc}"
+                )
+                return None
+            cmd.extend(extra_tokens)
         return cmd
 
     def start_processing(self):
@@ -2988,12 +3647,22 @@ class WhisperGUI(QMainWindow):
         stream_mode = not self.download_all_checkbox.isChecked()
         
         serial_mode = stream_mode
+        ytdlp_exe = None
+        source = self.settings.get("yt_dlp_source", "bundled")
+        if source == "path":
+            ytdlp_exe = self.settings.get("yt_dlp_exe_override") or shutil.which("yt-dlp")
+            if not ytdlp_exe:
+                QMessageBox.warning(self, "yt-dlp", "yt-dlp was not found in PATH. Please set a custom path.")
+                self.run_btn.setEnabled(True)
+                self.stop_btn.setEnabled(False)
+                return
         self.downloader = YouTubeDownloader(
             urls,
             output_path,
             audio_only,
             stream_mode=stream_mode,
-            serial_mode=serial_mode
+            serial_mode=serial_mode,
+            ytdlp_exe=ytdlp_exe
         )
         self.downloader.finished.connect(self.on_download_finished)
         self.downloader.error.connect(self.on_download_error)
@@ -3108,6 +3777,7 @@ class WhisperGUI(QMainWindow):
         self.settings["best_of"] = self.best_of.value()
         self.settings["patience"] = self.patience.value()
         self.settings["initial_prompt"] = self.initial_prompt.toPlainText()
+        self.settings["extra_cli_args"] = self.extra_cli_args.toPlainText()
         self.settings["audio_preprocess_enabled"] = self.audio_preprocess_enable.isChecked()
         self.settings["audio_gain_db"] = self.audio_gain.value()
         self.settings["audio_normalize_enabled"] = self.audio_normalize.isChecked()
@@ -3116,6 +3786,11 @@ class WhisperGUI(QMainWindow):
         self.settings["audio_true_peak_db"] = self.audio_true_peak.value()
         self.settings["audio_lra"] = self.audio_lra.value()
         self.settings["keep_preprocessed_audio"] = self.keep_preprocessed_audio.isChecked()
+        self.settings["fw_executable_override"] = self.fw_exe_path.text().strip()
+        self.settings["model_dir_override"] = self.model_dir_path.text().strip()
+        self.settings["yt_dlp_source"] = self.ytdlp_source_combo.currentData()
+        self.settings["yt_dlp_exe_override"] = self.ytdlp_exe_path.text().strip()
+        self.settings["ffmpeg_override"] = self.ffmpeg_path_input.text().strip()
         
         self.settings["vad_method"] = self.vad_method.currentText()
         self.settings["vad_threshold"] = self.vad_threshold.value()
@@ -3169,16 +3844,19 @@ class WhisperGUI(QMainWindow):
         self.theme_combo.blockSignals(False)
         self.apply_theme(theme)
 
-        if geometry_hex := self.settings.get("geometry"):
-            try:
-                if isinstance(geometry_hex, str) and all(c in '0123456789abcdefABCDEF' for c in geometry_hex):
-                    self.restoreGeometry(QByteArray.fromHex(bytes(geometry_hex, 'utf-8')))
-                else:
-                    logging.warning("Invalid geometry data in settings")
-            except Exception as e:
-                logging.warning(f"Failed to restore window geometry: {e}")
-        if splitter_sizes := self.settings.get("splitter_sizes"):
-            self.main_splitter.setSizes(splitter_sizes)
+        if not getattr(sys, "frozen", False):
+            if geometry_hex := self.settings.get("geometry"):
+                try:
+                    if isinstance(geometry_hex, str) and all(c in '0123456789abcdefABCDEF' for c in geometry_hex):
+                        self.restoreGeometry(QByteArray.fromHex(bytes(geometry_hex, 'utf-8')))
+                    else:
+                        logging.warning("Invalid geometry data in settings")
+                except Exception as e:
+                    logging.warning(f"Failed to restore window geometry: {e}")
+            if splitter_sizes := self.settings.get("splitter_sizes"):
+                self.main_splitter.setSizes(splitter_sizes)
+                self._apply_tab_minimums()
+                self._enforce_splitter_sizes_for_frozen()
 
         self.output_dir.setText(self.settings.get("output_dir", ""))
         self.model_combo.setCurrentText(self.settings.get("model", "large-v3"))
@@ -3196,6 +3874,7 @@ class WhisperGUI(QMainWindow):
         self.best_of.setValue(self.settings.get("best_of", 5))
         self.patience.setValue(self.settings.get("patience", 1.0))
         self.initial_prompt.setPlainText(self.settings.get("initial_prompt", ""))
+        self.extra_cli_args.setPlainText(self.settings.get("extra_cli_args", ""))
         self.audio_gain.setValue(self.settings.get("audio_gain_db", 0.0))
         self.audio_lufs_target.setValue(self.settings.get("audio_lufs_target", -16.0))
         self.audio_true_peak.setValue(self.settings.get("audio_true_peak_db", -1.5))
@@ -3221,3 +3900,33 @@ class WhisperGUI(QMainWindow):
         output_formats = self.settings.get("output_formats", ["srt"])
         for fmt, cb in self.output_format_checkboxes.items():
             cb.setChecked(fmt in output_formats)
+
+        self.fw_exe_path.setText(self.settings.get("fw_executable_override", ""))
+        self.model_dir_path.setText(self.settings.get("model_dir_override", ""))
+        self.ytdlp_exe_path.setText(self.settings.get("yt_dlp_exe_override", ""))
+        self.ffmpeg_path_input.setText(self.settings.get("ffmpeg_override", ""))
+        source = self.settings.get("yt_dlp_source", "bundled")
+        if source == "system":
+            source = "bundled"
+        index = self.ytdlp_source_combo.findData(source)
+        if index >= 0:
+            self.ytdlp_source_combo.setCurrentIndex(index)
+        self.apply_config_settings()
+
+    def load_settings_file_only(self):
+        """Load settings from disk before UI init (no widget access)."""
+        try:
+            if os.path.exists(self.settings_file):
+                with open(self.settings_file, "r") as f:
+                    self.settings = json.load(f)
+            elif os.path.exists(self.old_roaming_settings_file):
+                with open(self.old_roaming_settings_file, "r") as f:
+                    self.settings = json.load(f)
+            elif os.path.exists("settings.json"):
+                with open("settings.json", "r") as f:
+                    self.settings = json.load(f)
+            else:
+                self.settings = {}
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logging.warning(f"Could not load settings file: {e}. Using defaults.")
+            self.settings = {}

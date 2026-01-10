@@ -173,6 +173,7 @@ def show_yt_dlp_unavailable(parent, reason="python_missing", plan=None):
         text = (
             "Your system doesn't have Python installed, so yt-dlp cannot be updated automatically.\n\n"
             "To update yt-dlp, you have these options:\n\n"
+            "• Download the latest yt-dlp.exe and set Source to EXE in Settings\n"
             "• Install Python from python.org and restart this application\n"
             "• Download a newer version of this application (may include updated yt-dlp)\n"
             "• Continue using the current version (may have limitations with some videos)\n\n"
@@ -191,8 +192,16 @@ def show_yt_dlp_unavailable(parent, reason="python_missing", plan=None):
         default
     )
 
+    ytdlp_button = None
+    if reason in ("python_missing", "pip_missing"):
+        ytdlp_button = msg.addButton("Get yt-dlp.exe", QMessageBox.ButtonRole.ActionRole)
+
     reply = msg.exec()
-    if buttons != QMessageBox.StandardButton.Ok and reply == QMessageBox.StandardButton.Yes:
+    clicked = msg.clickedButton()
+    if ytdlp_button and clicked is ytdlp_button:
+        import webbrowser
+        webbrowser.open("https://github.com/yt-dlp/yt-dlp/releases/latest")
+    elif buttons != QMessageBox.StandardButton.Ok and reply == QMessageBox.StandardButton.Yes:
         import webbrowser
         webbrowser.open("https://python.org/downloads/")
 

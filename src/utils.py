@@ -158,6 +158,9 @@ def detect_faster_whisper_binary_version(executable_path):
 def resolve_ffmpeg_location():
     """Return ffmpeg executable path from bundled bin or PATH."""
     try:
+        env_override = os.environ.get("FWHISPER_FFMPEG_PATH")
+        if env_override and os.path.exists(env_override):
+            return env_override
         app_dir = get_app_directory()
         bin_dir = os.path.join(app_dir, "bin")
         exe_name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"

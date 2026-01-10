@@ -74,6 +74,72 @@ def test_should_check_update_clears_failure_on_version_change(monkeypatch):
     assert "last_failure_version" not in cleared
 
 
+def test_should_check_update_uses_provided_version_and_env(monkeypatch):
+    def fail_install_info():
+        raise AssertionError("get_ytdlp_installation_info should not be called")
+
+    monkeypatch.setattr(ytdlp_utils, "get_ytdlp_installation_info", fail_install_info)
+
+    def fake_load():
+        return {
+            "ytdlp_updates": {
+                "exe_with_python": {
+                    "last_updated_version": "2025.12.08",
+                    "last_update_timestamp": time.time(),
+                }
+            }
+        }
+
+    monkeypatch.setattr(ytdlp_utils, "load_ytdlp_update_status", fake_load)
+    monkeypatch.setattr(ytdlp_utils, "is_within_update_cooldown", lambda *_: True)
+
+    assert (
+        ytdlp_utils.should_check_ytdlp_update(
+            current_version="2025.12.08",
+            env="exe_with_python",
+        )
+        is False
+    )
+
+
+def test_should_check_update_clears_failure_with_provided_version(monkeypatch):
+    saved_payloads = []
+
+    def fail_install_info():
+        raise AssertionError("get_ytdlp_installation_info should not be called")
+
+    monkeypatch.setattr(ytdlp_utils, "get_ytdlp_installation_info", fail_install_info)
+
+    def fake_load():
+        return {
+            "ytdlp_updates": {
+                "exe_no_python": {
+                    "last_failure_version": "2025.12.01",
+                    "last_failure_timestamp": time.time(),
+                }
+            }
+        }
+
+    def fake_save(payload):
+        saved_payloads.append(payload)
+
+    monkeypatch.setattr(ytdlp_utils, "load_ytdlp_update_status", fake_load)
+    monkeypatch.setattr(ytdlp_utils, "save_ytdlp_update_status", fake_save)
+    monkeypatch.setattr(ytdlp_utils, "is_within_update_cooldown", lambda *_: False)
+
+    assert (
+        ytdlp_utils.should_check_ytdlp_update(
+            current_version="2025.12.08",
+            env="exe_no_python",
+        )
+        is True
+    )
+    assert saved_payloads, "Expected failure markers to be cleared and saved"
+    cleared = saved_payloads[-1]["ytdlp_updates"]["exe_no_python"]
+    assert "last_failure_timestamp" not in cleared
+    assert "last_failure_version" not in cleared
+
+
 def test_record_update_success_clears_failures(monkeypatch):
     data = {"ytdlp_updates": {"source": {"last_failure_version": "2025.12.01"}}}
     saved = []
