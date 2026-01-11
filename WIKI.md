@@ -86,7 +86,7 @@ These settings apply broadly to the transcription process and are crucial for pe
 
 *   **Description:** Selects the Whisper model size to use for transcription. Larger models generally offer higher accuracy but require more computational resources (CPU/GPU and RAM/VRAM).
 *   **Options:** `tiny`, `base`, `small`, `medium`, `large`, `large-v2`, `large-v3`, `large-v3-turbo`.
-*   **Note:** `large-v3-turbo` uses a community CTranslate2 conversion ([dropbox-dash/faster-whisper-large-v3-turbo](https://huggingface.co/dropbox-dash/faster-whisper-large-v3-turbo)). The official OpenAI repo is Transformers format and is not directly supported by the downloader.
+*   **Note:** `large-v3-turbo` uses a [community CTranslate2 conversion](https://huggingface.co/dropbox-dash/faster-whisper-large-v3-turbo). The official OpenAI repo is Transformers format and is not directly supported by the downloader.
 *   **Note:** The app only recognizes CTranslate2 model folders (look for a `model.bin` file). You can set the Model Directory to either the parent `_models` folder or a specific model folder.
 *   **Recommendation:**
     *   **`tiny`, `base`:** Good for quick transcriptions or systems with limited resources (e.g., older CPUs, integrated graphics). Accuracy might be lower.
