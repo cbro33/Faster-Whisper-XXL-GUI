@@ -553,7 +553,13 @@ class ModelDownloadDialog(QDialog):
         super().__init__(parent)
         self.model_name = model_name
         self.target_dir = target_dir
-        self.repo_id = f"Systran/faster-whisper-{model_name}"
+        if model_name == "large-v3-turbo":
+            self.repo_id = "dropbox-dash/faster-whisper-large-v3-turbo"
+        elif model_name.startswith("distil-"):
+            base_name = model_name[len("distil-"):]
+            self.repo_id = f"Systran/faster-distil-whisper-{base_name}"
+        else:
+            self.repo_id = f"Systran/faster-whisper-{model_name}"
         self.cancelled = False
         self.worker_thread = None
         self._active_response = None
@@ -584,7 +590,7 @@ class ModelDownloadDialog(QDialog):
 
         # 1. Header
         self.status_label = QLabel(f"Downloading model: {self.model_name}", self)
-        self.status_label.setStyleSheet("font-size: 18px; font-weight: bold; color: #ffffff;")
+        self.status_label.setStyleSheet("font-size: 18px; font-weight: bold;")
         layout.addWidget(self.status_label)
 
         layout.addSpacing(5)
@@ -592,11 +598,13 @@ class ModelDownloadDialog(QDialog):
         # 2. Info Row (Filename ... Size/Percentage)
         info_layout = QHBoxLayout()
         self.file_label = QLabel("Initializing...", self)
-        self.file_label.setStyleSheet("color: #dddddd; font-size: 14px;")
+        self.file_label.setStyleSheet("font-size: 14px;")
         
         self.details_label = QLabel("Connecting...", self)
         self.details_label.setAlignment(Qt.AlignmentFlag.AlignRight)
-        self.details_label.setStyleSheet("color: #dddddd; font-size: 14px; font-weight: bold; font-family: 'Consolas', 'Courier New', monospace;")
+        self.details_label.setStyleSheet(
+            "font-size: 14px; font-weight: bold; font-family: 'Consolas', 'Courier New', monospace;"
+        )
         
         info_layout.addWidget(self.file_label)
         info_layout.addStretch()

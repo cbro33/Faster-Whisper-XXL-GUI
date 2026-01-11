@@ -641,6 +641,10 @@ class WhisperGUI(QMainWindow):
 
         self.model_dir_path = QLineEdit()
         self.model_dir_path.setPlaceholderText("Optional override for model directory")
+        self.model_dir_path.setToolTip(
+            "CT2 models only (requires model.bin). You can select the parent _models folder "
+            "or a specific model folder."
+        )
         model_browse = QPushButton("Browse")
         model_clear = QPushButton("Clear")
         model_test = QPushButton("Test")
@@ -649,7 +653,12 @@ class WhisperGUI(QMainWindow):
         model_row.addWidget(model_browse)
         model_row.addWidget(model_clear)
         model_row.addWidget(model_test)
-        core_layout.addRow("Model Directory:", model_row)
+        model_dir_label = QLabel("Model Directory:")
+        model_dir_label.setToolTip(
+            "CT2 models only (requires model.bin). You can select the parent _models folder "
+            "or a specific model folder."
+        )
+        core_layout.addRow(model_dir_label, model_row)
 
         layout.addWidget(core_group)
 
@@ -783,9 +792,15 @@ class WhisperGUI(QMainWindow):
         self.model_combo = QComboBox()
         self.model_combo.addItems(['tiny', 'tiny.en', 'base', 'base.en', 'small', 'small.en', 'medium', 'medium.en', 'large-v1', 'large-v2', 'large-v3', 'large-v3-turbo', 'distil-large-v2', 'distil-large-v3', 'distil-medium.en', 'distil-small.en'])
         self.model_combo.setCurrentText('large-v3')
-        self.model_combo.setToolTip("Choose a model. Larger models are more accurate but use more resources.")
+        self.model_combo.setToolTip(
+            "Choose a model. Larger models are more accurate but use more resources. "
+            "large-v3-turbo downloads a community CTranslate2 conversion (dropbox-dash)."
+        )
         model_label = QLabel("Model:")
-        model_label.setToolTip("Choose a model. Larger models are more accurate but use more resources.")
+        model_label.setToolTip(
+            "Choose a model. Larger models are more accurate but use more resources. "
+            "large-v3-turbo downloads a community CTranslate2 conversion (dropbox-dash)."
+        )
         layout.addRow(model_label, self.model_combo)
         self.task_combo = QComboBox()
         self.task_combo.addItems(['transcribe', 'translate'])
@@ -1208,6 +1223,20 @@ class WhisperGUI(QMainWindow):
 
         model_entries = []
         try:
+            direct_model_bin = os.path.join(path, "model.bin")
+            if os.path.isfile(direct_model_bin):
+                size = None
+                try:
+                    size = os.path.getsize(direct_model_bin)
+                except Exception:
+                    size = None
+                model_entries.append(
+                    {
+                        "name": os.path.basename(path),
+                        "path": direct_model_bin,
+                        "size": format_size(size),
+                    }
+                )
             for entry in sorted(os.listdir(path)):
                 entry_path = os.path.join(path, entry)
                 if not os.path.isdir(entry_path):
@@ -2905,6 +2934,11 @@ class WhisperGUI(QMainWindow):
     def get_model_dirs(self):
         model_override = self.settings.get("model_dir_override")
         if model_override:
+            if os.path.isdir(model_override):
+                direct_model_bin = os.path.join(model_override, "model.bin")
+                if os.path.isfile(direct_model_bin):
+                    parent_dir = os.path.dirname(model_override)
+                    return parent_dir, parent_dir
             return model_override, model_override
         if not self.executable_path:
             return None, None

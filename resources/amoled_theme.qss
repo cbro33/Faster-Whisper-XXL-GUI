@@ -114,6 +114,7 @@ QDialog {
 }
 
 QLabel {
+    background-color: transparent;
     color: #e0e0e0;
 }
 

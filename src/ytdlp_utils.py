@@ -23,7 +23,9 @@ yt_dlp_source_override = None
 
 def get_ytdlp_debug_log_path():
     """Return path for yt-dlp update debug logging."""
-    return os.path.join(get_app_directory(), YTDLP_DEBUG_LOG_NAME)
+    log_dir = os.path.join(get_app_directory(), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    return os.path.join(log_dir, YTDLP_DEBUG_LOG_NAME)
 
 
 def log_ytdlp_update_debug(message):
