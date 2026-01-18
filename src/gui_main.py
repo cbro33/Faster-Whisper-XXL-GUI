@@ -10,6 +10,7 @@ import platform
 import re
 import ntpath
 import shlex
+from collections import deque
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QSplitter, QHBoxLayout, QVBoxLayout, QLabel, 
     QComboBox, QTabWidget, QGroupBox, QFormLayout, QPushButton, 
@@ -18,7 +19,7 @@ from PyQt6.QtWidgets import (
     QSpacerItem, QMessageBox, QApplication, QGridLayout, QLineEdit, QDialog, QInputDialog,
     QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar
 )
-from PyQt6.QtCore import Qt, QTimer, QProcess, QByteArray, QUrl, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QProcess, QProcessEnvironment, QByteArray, QUrl, QThread, pyqtSignal
 from PyQt6.QtGui import QIcon, QPalette, QColor, QTextCursor, QFont, QDesktopServices, QFontMetrics
 
 from config import APP_VERSION, SUPPORTED_EXTENSIONS
@@ -249,6 +250,7 @@ class WhisperGUI(QMainWindow):
         self.batch_total = 0
         self.batch_index = 0
         self.batch_total_known = False
+        self._download_seen_paths = set()
         
         # Use portable settings location (same directory as exe/source)
         portable_dir = get_portable_settings_directory()
@@ -256,6 +258,9 @@ class WhisperGUI(QMainWindow):
         self.old_roaming_settings_file = os.path.join(get_settings_directory(), "settings.json")  # For migration FROM roaming
         self.settings = {}
         self.load_settings_file_only()
+        self._output_basename_map_limit = 200
+        self._output_basename_map = {}
+        self._load_output_basename_map()
         
         # yt-dlp update tracking to prevent multiple checks
         self.yt_dlp_update_checked = False
@@ -281,6 +286,18 @@ class WhisperGUI(QMainWindow):
         self.last_downloaded_file = None
         self.preprocess_worker = None
         self.preprocess_dialog = None
+        self._hardware_info_cache = None
+        self._recent_stderr_lines = deque(maxlen=20)
+        self._last_run_cuda_oom = False
+        self._last_cuda_oom_snippet = None
+        self._last_run_cuda_kernel_incompatible = False
+        self._last_cuda_kernel_snippet = None
+        self._vad_cpu_fallback_active = False
+        self._vad_oom_retry_files = set()
+        self._last_command = None
+        self._last_display_command = None
+        self._debug_force_vad_oom_env = os.environ.get("FWXXL_FORCE_VAD_OOM", "").strip().lower() in {"1", "true", "yes"}
+        self._debug_force_vad_oom = self._debug_force_vad_oom_env or bool(self.settings.get("debug_force_vad_oom"))
         
         if not self.check_and_setup_dependencies():
             QTimer.singleShot(0, self.close)
@@ -642,8 +659,8 @@ class WhisperGUI(QMainWindow):
         self.model_dir_path = QLineEdit()
         self.model_dir_path.setPlaceholderText("Optional override for model directory")
         self.model_dir_path.setToolTip(
-            "CT2 models only (requires model.bin). You can select the parent _models folder "
-            "or a specific model folder."
+            "CT2 models are supported (requires model.bin). The test view can also flag "
+            "Transformers models for troubleshooting."
         )
         model_browse = QPushButton("Browse")
         model_clear = QPushButton("Clear")
@@ -655,8 +672,8 @@ class WhisperGUI(QMainWindow):
         model_row.addWidget(model_test)
         model_dir_label = QLabel("Model Directory:")
         model_dir_label.setToolTip(
-            "CT2 models only (requires model.bin). You can select the parent _models folder "
-            "or a specific model folder."
+            "CT2 models are supported (requires model.bin). The test view can also flag "
+            "Transformers models for troubleshooting."
         )
         core_layout.addRow(model_dir_label, model_row)
 
@@ -1006,6 +1023,10 @@ class WhisperGUI(QMainWindow):
         self.vad_method.addItems(['silero_v4_fw', 'silero_v5_fw', 'silero_v3', 'silero_v4', 'silero_v5', 'pyannote_v3', 'pyannote_onnx_v3', 'auditok', 'webrtc'])
         self.vad_method.setToolTip("Choose the VAD backend.")
         layout.addRow("VAD Method:", self.vad_method)
+        self.vad_device = QComboBox()
+        self.vad_device.addItems(["Auto", "CUDA", "CPU"])
+        self.vad_device.setToolTip("Choose the VAD device for pyannote VAD. Auto follows recommendations.")
+        layout.addRow("VAD Device:", self.vad_device)
         self.vad_threshold = QDoubleSpinBox()
         self.vad_threshold.setRange(0.0, 1.0)
         self.vad_threshold.setSingleStep(0.01)
@@ -1221,40 +1242,66 @@ class WhisperGUI(QMainWindow):
                 return f"{bytes_size / (1024 * 1024):.1f} MB"
             return f"{bytes_size / 1024:.0f} KB"
 
-        model_entries = []
-        try:
-            direct_model_bin = os.path.join(path, "model.bin")
-            if os.path.isfile(direct_model_bin):
+        def detect_model_entry(model_path, name_override=None):
+            if not os.path.isdir(model_path):
+                return None
+            name = name_override or os.path.basename(model_path)
+            model_bin = os.path.join(model_path, "model.bin")
+            if os.path.isfile(model_bin):
                 size = None
                 try:
-                    size = os.path.getsize(direct_model_bin)
+                    size = os.path.getsize(model_bin)
                 except Exception:
                     size = None
-                model_entries.append(
-                    {
-                        "name": os.path.basename(path),
-                        "path": direct_model_bin,
-                        "size": format_size(size),
-                    }
-                )
+                return {
+                    "name": name,
+                    "path": model_bin,
+                    "size": format_size(size),
+                    "arch": "CT2",
+                }
+            config_path = os.path.join(model_path, "config.json")
+            weight_files = []
+            try:
+                for filename in os.listdir(model_path):
+                    lowered = filename.lower()
+                    if lowered in ("model.safetensors", "pytorch_model.bin"):
+                        weight_files.append(os.path.join(model_path, filename))
+                    elif lowered.startswith("model-") and lowered.endswith(".safetensors"):
+                        weight_files.append(os.path.join(model_path, filename))
+                    elif lowered.startswith("pytorch_model-") and lowered.endswith(".bin"):
+                        weight_files.append(os.path.join(model_path, filename))
+            except Exception:
+                weight_files = []
+            if os.path.isfile(config_path) or weight_files:
+                total_size = None
+                sample_path = config_path if os.path.isfile(config_path) else None
+                if weight_files:
+                    try:
+                        total_size = sum(os.path.getsize(path) for path in weight_files if os.path.isfile(path))
+                        sample_path = weight_files[0]
+                    except Exception:
+                        total_size = None
+                        sample_path = weight_files[0]
+                return {
+                    "name": name,
+                    "path": sample_path or model_path,
+                    "size": format_size(total_size),
+                    "arch": "Transformers",
+                }
+            return None
+
+        model_entries = []
+        try:
+            direct_entry = detect_model_entry(path, os.path.basename(path))
+            if direct_entry:
+                model_entries.append(direct_entry)
             for entry in sorted(os.listdir(path)):
                 entry_path = os.path.join(path, entry)
                 if not os.path.isdir(entry_path):
                     continue
-                model_bin = os.path.join(entry_path, "model.bin")
-                if os.path.exists(model_bin):
-                    size = None
-                    try:
-                        size = os.path.getsize(model_bin)
-                    except Exception:
-                        size = None
-                    model_entries.append(
-                        {
-                            "name": entry,
-                            "path": model_bin,
-                            "size": format_size(size),
-                        }
-                    )
+                detected_entry = detect_model_entry(entry_path, entry)
+                if detected_entry:
+                    model_entries.append(detected_entry)
         except Exception as exc:
             QMessageBox.warning(self, "Model Directory", f"Failed to scan directory:\n{exc}")
             return
@@ -1275,23 +1322,25 @@ class WhisperGUI(QMainWindow):
             layout.addWidget(status_label)
 
             table = QTableWidget(dialog)
-            table.setColumnCount(3)
-            table.setHorizontalHeaderLabels(["Model", "Path", "Size"])
+            table.setColumnCount(4)
+            table.setHorizontalHeaderLabels(["Model", "Type", "Path", "Size"])
             table.setRowCount(len(model_entries))
             table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
             table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
             table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
             table.verticalHeader().setVisible(False)
             table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-            table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-            table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+            table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+            table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
 
             for row, entry in enumerate(model_entries):
                 table.setItem(row, 0, QTableWidgetItem(entry["name"]))
+                table.setItem(row, 1, QTableWidgetItem(entry.get("arch", "")))
                 path_item = QTableWidgetItem(entry["path"])
                 path_item.setToolTip(entry["path"])
-                table.setItem(row, 1, path_item)
-                table.setItem(row, 2, QTableWidgetItem(entry["size"]))
+                table.setItem(row, 2, path_item)
+                table.setItem(row, 3, QTableWidgetItem(entry["size"]))
             layout.addWidget(table)
 
             button_row = QHBoxLayout()
@@ -1811,6 +1860,10 @@ class WhisperGUI(QMainWindow):
             return original_base
         if force_suffix:
             return f"{original_base}_{original_ext}"
+        map_key = self._make_output_map_key(input_file_path, output_dir)
+        stored_base = self._output_basename_map.get(map_key)
+        if stored_base:
+            return stored_base
         registry = self._get_output_basename_registry(output_dir)
         existing_exts = registry.get(original_base, set())
         if existing_exts and original_ext not in existing_exts:
@@ -2347,6 +2400,7 @@ class WhisperGUI(QMainWindow):
             "patience": self.patience.value(),
             "vad_enabled": self.vad_filter.isChecked(),
             "vad_method": self.vad_method.currentText() if self.vad_filter.isChecked() else None,
+            "vad_device": self.vad_device.currentText() if self.vad_filter.isChecked() else None,
             "vad_threshold": self.vad_threshold.value() if self.vad_filter.isChecked() else None,
             "vad_min_speech": self.vad_min_speech.value() if self.vad_filter.isChecked() else None,
             "word_timestamps": (
@@ -2369,6 +2423,205 @@ class WhisperGUI(QMainWindow):
             "audio_lra": self.audio_lra.value(),
         }
         logger.info("[run-params] %s", json.dumps(params, separators=(",", ":")))
+
+    def _log_debug_event(self, event, **fields):
+        if not self.settings.get("debug_model_download_logging", False):
+            return
+        logger = get_model_download_logger()
+        if getattr(logger, "disabled", False):
+            return
+        payload = {"event": event}
+        for key, value in fields.items():
+            if value is not None:
+                payload[key] = value
+        try:
+            logger.info("[event] %s", json.dumps(payload, separators=(",", ":")))
+        except Exception:
+            logger.info("[event] %s", payload)
+
+    def _detect_model_arch_from_dir(self, model_path):
+        if not model_path or not os.path.isdir(model_path):
+            return None
+        model_bin = os.path.join(model_path, "model.bin")
+        if os.path.isfile(model_bin):
+            return {
+                "arch": "CT2",
+                "path": model_bin,
+                "model_dir": model_path,
+            }
+        config_path = os.path.join(model_path, "config.json")
+        weight_files = []
+        try:
+            for filename in os.listdir(model_path):
+                lowered = filename.lower()
+                if lowered in ("model.safetensors", "pytorch_model.bin"):
+                    weight_files.append(os.path.join(model_path, filename))
+                elif lowered.startswith("model-") and lowered.endswith(".safetensors"):
+                    weight_files.append(os.path.join(model_path, filename))
+                elif lowered.startswith("pytorch_model-") and lowered.endswith(".bin"):
+                    weight_files.append(os.path.join(model_path, filename))
+        except Exception:
+            weight_files = []
+        if os.path.isfile(config_path) or weight_files:
+            return {
+                "arch": "Transformers",
+                "path": config_path if os.path.isfile(config_path) else (weight_files[0] if weight_files else model_path),
+                "model_dir": model_path,
+            }
+        return None
+
+    def _get_current_model_arch_info(self):
+        info = {
+            "model": None,
+            "arch": None,
+            "model_dir": None,
+            "path": None,
+            "note": None,
+        }
+        model_name = None
+        try:
+            model_name = self.model_combo.currentText()
+        except Exception:
+            model_name = None
+        info["model"] = model_name
+        try:
+            _, local_model_dir = self.get_model_dirs()
+        except Exception:
+            local_model_dir = None
+        if not local_model_dir:
+            info["note"] = "model_dir_missing"
+            return info
+        expected_dir = None
+        if model_name:
+            expected_dir = os.path.join(local_model_dir, f"faster-whisper-{model_name}")
+        if expected_dir:
+            detected = self._detect_model_arch_from_dir(expected_dir)
+            if detected:
+                info.update(detected)
+                return info
+        matches = []
+        if model_name:
+            try:
+                for entry in sorted(os.listdir(local_model_dir)):
+                    entry_path = os.path.join(local_model_dir, entry)
+                    if not os.path.isdir(entry_path):
+                        continue
+                    if model_name.lower() not in entry.lower():
+                        continue
+                    detected = self._detect_model_arch_from_dir(entry_path)
+                    if detected:
+                        detected["name"] = entry
+                        matches.append(detected)
+            except Exception:
+                matches = []
+        if len(matches) == 1:
+            info.update(matches[0])
+            info["note"] = "matched_by_name"
+            return info
+        if matches:
+            info["note"] = "ambiguous_matches:" + ",".join(entry.get("name", "") for entry in matches)
+            return info
+        info["model_dir"] = expected_dir
+        info["note"] = "model_not_found"
+        return info
+
+    def _get_last_error_log_path(self):
+        log_dir = os.path.join(get_app_directory(), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        return os.path.join(log_dir, "last_error.txt")
+
+    def _redact_path_text(self, text):
+        if not text:
+            return text
+        redacted = text
+        redacted = re.sub(r'(["\'])([A-Za-z]:[\\/].*?)(\\1)', r'"\<path\>"', redacted)
+        redacted = re.sub(r'(["\'])(\\\\.*?)(\\1)', r'"\<path\>"', redacted)
+        redacted = re.sub(r'(["\'])(//.*?)(\\1)', r'"\<path\>"', redacted)
+        redacted = re.sub(r'(["\'])(/.*?)(\\1)', r'"\<path\>"', redacted)
+        redacted = re.sub(r"[A-Za-z]:[\\/][^\\s]+", "<path>", redacted)
+        redacted = re.sub(r"\\\\[^\\s]+", "<path>", redacted)
+        redacted = re.sub(r"//[^\\s]+", "<path>", redacted)
+        redacted = re.sub(r"(?<![A-Za-z0-9])/(?:[^\\s]+)", "<path>", redacted)
+        redacted = re.sub(r"<path>[^\\s]*", "<path>", redacted)
+        return redacted
+
+    def _looks_like_path_token(self, token):
+        if not token:
+            return False
+        if re.match(r"^[A-Za-z]:[\\/]", token):
+            return True
+        if token.startswith("\\\\") or token.startswith("//"):
+            return True
+        if token.startswith("/"):
+            return True
+        return False
+
+    def _get_sanitized_command_display(self):
+        if not self._last_command:
+            return self._redact_path_text(self._last_display_command or "")
+        safe_tokens = []
+        for token in self._last_command:
+            if token.startswith("-"):
+                safe_tokens.append(token)
+                continue
+            if self._looks_like_path_token(token):
+                safe_tokens.append("<path>")
+            else:
+                safe_tokens.append(self._redact_path_text(token))
+        quoted_parts = []
+        for token in safe_tokens:
+            if " " in token or '"' in token or "'" in token:
+                processed = token.replace('"', '\\"')
+                quoted_parts.append(f'"{processed}"')
+            else:
+                quoted_parts.append(token)
+        return " ".join(quoted_parts)
+
+    def _basename_only(self, path):
+        if not path:
+            return ""
+        try:
+            return os.path.basename(path)
+        except Exception:
+            return path
+
+    def _write_last_error_log(self, exit_code, exit_status, stderr_tail=None, error_message=None):
+        try:
+            log_path = self._get_last_error_log_path()
+            status_name = getattr(exit_status, "name", str(exit_status))
+            model_info = self._get_current_model_arch_info()
+            input_file = getattr(self, "current_input_file", "")
+            input_ext = os.path.splitext(input_file)[1].lower()
+            lines = [
+                f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+                f"Input File: {input_ext or 'unknown'}",
+                f"Exit Code: {exit_code}",
+                f"Exit Status: {status_name}",
+            ]
+            if model_info:
+                lines.append(f"Model: {model_info.get('model') or ''}")
+                lines.append(f"Model Type: {model_info.get('arch') or 'Unknown'}")
+                if model_info.get("model_dir"):
+                    lines.append(f"Model Dir: {self._basename_only(model_info.get('model_dir'))}")
+                if model_info.get("note"):
+                    lines.append(f"Model Note: {model_info.get('note')}")
+            if error_message:
+                lines.append(f"Process Error: {self._redact_path_text(error_message)}")
+            if self._last_display_command:
+                lines.append("Command:")
+                lines.append(self._get_sanitized_command_display())
+            if stderr_tail:
+                lines.append("Stderr Tail:")
+                if isinstance(stderr_tail, (list, tuple)):
+                    lines.extend(self._redact_path_text(line) for line in stderr_tail)
+                else:
+                    lines.append(self._redact_path_text(str(stderr_tail)))
+            with open(log_path, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(lines) + "\n")
+            return log_path
+        except Exception as exc:
+            logging.warning("Failed to write last_error.txt: %s", exc)
+            return None
 
     def force_hardware_optimization(self):
         """ Force hardware optimization dialog to show """
@@ -2408,6 +2661,7 @@ class WhisperGUI(QMainWindow):
             "<li>Run parameters (model, task, device, compute type)</li>"
             "<li>Output formats and advanced toggles (VAD, word timestamps, MP3)</li>"
             "</ul>"
+            "<div style='margin-top:10px;'>Optional: force VAD CPU fallback to test the OOM handler.</div>"
         )
         info_label.setWordWrap(True)
         info_label.setTextFormat(Qt.TextFormat.RichText)
@@ -2419,6 +2673,11 @@ class WhisperGUI(QMainWindow):
         enabled_checkbox.setChecked(self.settings.get("debug_model_download_logging", False))
         enabled_checkbox.setStyleSheet("margin-top: 6px; margin-bottom: 8px; font-size: 14px;")
         layout.addWidget(enabled_checkbox)
+
+        force_vad_oom_checkbox = QCheckBox("Force VAD OOM fallback (test)")
+        force_vad_oom_checkbox.setChecked(self.settings.get("debug_force_vad_oom", False))
+        force_vad_oom_checkbox.setStyleSheet("margin-top: 2px; margin-bottom: 8px; font-size: 14px;")
+        layout.addWidget(force_vad_oom_checkbox)
 
         button_row = QHBoxLayout()
         open_button = QPushButton("Open Log")
@@ -2436,8 +2695,12 @@ class WhisperGUI(QMainWindow):
         def on_toggle():
             enabled = enabled_checkbox.isChecked()
             self.settings["debug_model_download_logging"] = enabled
+            self.settings["debug_force_vad_oom"] = force_vad_oom_checkbox.isChecked()
             self.save_settings_to_file()
             set_model_download_logging_enabled(enabled)
+
+        enabled_checkbox.toggled.connect(on_toggle)
+        force_vad_oom_checkbox.toggled.connect(on_toggle)
 
         def on_open():
             log_path = get_model_download_log_path()
@@ -2458,7 +2721,6 @@ class WhisperGUI(QMainWindow):
             except Exception as exc:
                 QMessageBox.warning(self, "Debug Log", f"Unable to clear log file:\n{exc}")
 
-        enabled_checkbox.stateChanged.connect(on_toggle)
         open_button.clicked.connect(on_open)
         clear_button.clicked.connect(on_clear)
         close_button.clicked.connect(dialog.accept)
@@ -2666,6 +2928,7 @@ class WhisperGUI(QMainWindow):
         self.compute_combo.currentTextChanged.connect(self.save_combo_setting)
         self.device_combo.currentTextChanged.connect(self.save_combo_setting)
         self.vad_method.currentTextChanged.connect(self.save_combo_setting)
+        self.vad_device.currentTextChanged.connect(self.save_combo_setting)
         self.temperature.valueChanged.connect(self.save_spinbox_setting)
         self.beam_size.valueChanged.connect(self.save_spinbox_setting)
         self.best_of.valueChanged.connect(self.save_spinbox_setting)
@@ -2693,6 +2956,7 @@ class WhisperGUI(QMainWindow):
         self.settings["compute_type"] = self.compute_combo.currentText()
         self.settings["device"] = self.device_combo.currentText()
         self.settings["vad_method"] = self.vad_method.currentText()
+        self.settings["vad_device"] = self.vad_device.currentText()
         self.save_settings_to_file()
 
     def save_spinbox_setting(self):
@@ -2851,11 +3115,216 @@ class WhisperGUI(QMainWindow):
         if hasattr(self, "link_count_label"):
             self.link_count_label.setText(f"{count} {label}")
 
+    def _normalize_download_path(self, path):
+        if not path:
+            return ""
+        return os.path.normcase(os.path.normpath(path))
+
+    def _load_output_basename_map(self):
+        raw_map = self.settings.get("output_basename_map")
+        if not isinstance(raw_map, dict):
+            self._output_basename_map = {}
+            return
+        cleaned = {}
+        for key, value in raw_map.items():
+            if not isinstance(key, str) or not isinstance(value, str):
+                continue
+            normalized_key = self._normalize_download_path(key)
+            if not normalized_key:
+                continue
+            cleaned[normalized_key] = value
+        self._output_basename_map = cleaned
+        self._trim_output_basename_map()
+
+    def _make_output_map_key(self, input_file_path, output_dir):
+        normalized_input = self._normalize_download_path(input_file_path)
+        normalized_output = self._normalize_download_path(output_dir)
+        if not normalized_input or not normalized_output:
+            return ""
+        return f"{normalized_output}|{normalized_input}"
+
+    def _record_output_basename(self, input_file_path, output_dir, output_basename):
+        if not input_file_path or not output_dir or not output_basename:
+            return
+        key = self._make_output_map_key(input_file_path, output_dir)
+        if not key:
+            return
+        if key in self._output_basename_map:
+            self._output_basename_map.pop(key, None)
+        self._output_basename_map[key] = output_basename
+        self._trim_output_basename_map()
+        self.settings["output_basename_map"] = self._output_basename_map
+
+    def _trim_output_basename_map(self):
+        limit = getattr(self, "_output_basename_map_limit", 200)
+        if limit <= 0:
+            return
+        while len(self._output_basename_map) > limit:
+            oldest_key = next(iter(self._output_basename_map), None)
+            if oldest_key is None:
+                break
+            self._output_basename_map.pop(oldest_key, None)
+
+    def _get_hardware_info_cached(self):
+        if self._hardware_info_cache is None:
+            try:
+                self._hardware_info_cache = detect_hardware_capabilities()
+            except Exception as exc:
+                logging.warning("Could not detect hardware capabilities: %s", exc)
+                self._hardware_info_cache = {}
+        return self._hardware_info_cache
+
+    def _vad_method_is_pyannote(self):
+        if not self.vad_filter.isChecked():
+            return False
+        return "pyannote" in (self.vad_method.currentText() or "").lower()
+
+    def _vad_device_forced_by_user(self):
+        if not self._vad_method_is_pyannote():
+            return False
+        extra_args = self.extra_cli_args.toPlainText().strip()
+        if "--vad_device" in extra_args:
+            return True
+        selection = (self.vad_device.currentText() or "").strip().lower()
+        return selection in {"cpu", "cuda"}
+
+    def _detect_cuda_oom(self, text):
+        if not text:
+            return False
+        lowered = text.lower()
+        if "cuda out of memory" in lowered or "cuda error: out of memory" in lowered:
+            return True
+        if "cublas_status_alloc_failed" in lowered or ("cudnn" in lowered and "out of memory" in lowered):
+            return True
+        if "out of memory" in lowered and ("cuda" in lowered or "gpu" in lowered):
+            return True
+        if "out of memory" in lowered and "tried to allocate" in lowered:
+            return True
+        return False
+
+    def _detect_cuda_kernel_incompatible(self, text):
+        if not text:
+            return False
+        lowered = text.lower()
+        return "no kernel image is available for execution on the device" in lowered
+
+    def _should_retry_with_vad_cpu(self):
+        if not self._last_run_cuda_oom:
+            return False
+        if self.stop_requested:
+            return False
+        if not self._vad_method_is_pyannote():
+            return False
+        if self._vad_cpu_fallback_active:
+            return False
+        if self._vad_device_forced_by_user():
+            return False
+        input_file = getattr(self, "current_input_file", None)
+        if not input_file:
+            return False
+        key = self._normalize_download_path(input_file)
+        return key not in self._vad_oom_retry_files
+
+    def _should_retry_with_vad_cpu_for_kernel(self):
+        if not self._last_run_cuda_kernel_incompatible:
+            return False
+        if self.stop_requested:
+            return False
+        if not self._vad_method_is_pyannote():
+            return False
+        if self._vad_cpu_fallback_active:
+            return False
+        if self._vad_device_forced_by_user():
+            return False
+        input_file = getattr(self, "current_input_file", None)
+        if not input_file:
+            return False
+        key = self._normalize_download_path(input_file)
+        return key not in self._vad_oom_retry_files
+
+    def _start_vad_cpu_retry(self, reason="cuda_oom"):
+        input_file = getattr(self, "current_input_file", None)
+        if not input_file:
+            return False
+        key = self._normalize_download_path(input_file)
+        self._vad_oom_retry_files.add(key)
+        self._vad_cpu_fallback_active = True
+        self._last_run_cuda_oom = False
+        self._last_run_cuda_kernel_incompatible = False
+        retry_input = input_file
+        if self._current_processed_audio and os.path.exists(self._current_processed_audio):
+            retry_input = self._current_processed_audio
+        command = self.build_command(retry_input)
+        if not command:
+            self._vad_cpu_fallback_active = False
+            return False
+        if reason == "cuda_oom":
+            logging.info("CUDA OOM detected: retrying with VAD on CPU for %s", input_file)
+            stderr_tail = self._last_cuda_oom_snippet
+        elif reason == "cuda_kernel_incompatible":
+            logging.info("CUDA kernel incompatible: retrying with VAD on CPU for %s", input_file)
+            stderr_tail = self._last_cuda_kernel_snippet
+        else:
+            logging.info("Retrying with VAD on CPU for %s (reason=%s)", input_file, reason)
+            stderr_tail = None
+        self._log_debug_event(
+            "vad_cpu_retry",
+            reason=reason,
+            input_file=input_file,
+            stderr_tail=stderr_tail,
+        )
+        self.output_buffer = ""
+        self.last_line_was_overwrite = False
+        self.transcription_completed_successfully = False
+        self._recent_stderr_lines.clear()
+        self.process = None
+        if reason == "cuda_oom":
+            self._append_text_to_console("\nCUDA OOM detected. Retrying with VAD on CPU...\n")
+        elif reason == "cuda_kernel_incompatible":
+            self._append_text_to_console("\nCUDA kernel incompatible. Retrying with VAD on CPU...\n")
+        else:
+            self._append_text_to_console("\nRetrying with VAD on CPU...\n")
+        return self.start_transcription_process(command, clear_output=False)
+
+    def _resolve_vad_device(self):
+        if not self._vad_method_is_pyannote():
+            return None
+        extra_args = self.extra_cli_args.toPlainText().strip()
+        if "--vad_device" in extra_args:
+            return None
+        if self._vad_cpu_fallback_active:
+            return "cpu"
+        selection = (self.vad_device.currentText() or "").strip().lower()
+        if selection and selection != "auto":
+            return selection
+        hardware_info = self._get_hardware_info_cached()
+        if hardware_info.get("has_cuda") and hardware_info.get("gpu_memory_gb", 0) <= 8:
+            logging.info("Using CPU for pyannote VAD due to limited VRAM.")
+            return "cpu"
+        return None
+
+    def _maybe_set_pyannote_env(self):
+        if not self._vad_method_is_pyannote():
+            return None
+        env = QProcessEnvironment.systemEnvironment()
+        current = env.value("PYTORCH_CUDA_ALLOC_CONF", "")
+        token = "expandable_segments:True"
+        if token in current:
+            return env
+        updated = f"{current},{token}" if current else token
+        env.insert("PYTORCH_CUDA_ALLOC_CONF", updated)
+        return env
+
     def on_download_file_ready(self, file_path):
         if self.download_all_checkbox.isChecked():
             return
         if not file_path:
             return
+        normalized = self._normalize_download_path(file_path)
+        if normalized in self._download_seen_paths:
+            logging.info("Skipping duplicate download output: %s", file_path)
+            return
+        self._download_seen_paths.add(normalized)
         self.last_downloaded_file = file_path
         self.pending_files.append(file_path)
         if not self.batch_total_known:
@@ -3006,6 +3475,7 @@ class WhisperGUI(QMainWindow):
 
         cmd = [self.executable_path, input_file]
         model_dir_cli, _ = self.get_model_dirs()
+        vad_device = self._resolve_vad_device()
         options = {
             "-m": self.model_combo.currentText(), "--task": self.task_combo.currentText(),
             "-l": self.get_language_code() if self.get_language_code() != 'auto' else None,
@@ -3018,6 +3488,7 @@ class WhisperGUI(QMainWindow):
             "--model_dir": model_dir_cli,
             "--output_dir": output_dir,
             "--vad_method": self.vad_method.currentText() if self.vad_filter.isChecked() else None,
+            "--vad_device": vad_device,
             "--vad_threshold": str(self.vad_threshold.value()) if self.vad_filter.isChecked() else None,
             "--vad_min_speech_duration_ms": str(self.vad_min_speech.value()) if self.vad_filter.isChecked() else None,
         }
@@ -3136,6 +3607,13 @@ class WhisperGUI(QMainWindow):
         self.output_buffer = ""
         self.last_line_was_overwrite = False
         self.transcription_completed_successfully = False
+        self._last_run_cuda_oom = False
+        self._last_cuda_oom_snippet = None
+        self._last_run_cuda_kernel_incompatible = False
+        self._last_cuda_kernel_snippet = None
+        self._vad_cpu_fallback_active = False
+        self._vad_oom_retry_files = set()
+        self._debug_force_vad_oom = self._debug_force_vad_oom_env or bool(self.settings.get("debug_force_vad_oom"))
         self._model_download_cancelled = False
         if not self.get_output_dir():
             return
@@ -3203,6 +3681,7 @@ class WhisperGUI(QMainWindow):
             force_suffix=bool(filters)
         )
         self._register_output_basename(input_file, output_dir)
+        self._record_output_basename(input_file, output_dir, self._current_output_basename)
         if self.audio_preprocess_enable.isChecked() and filters:
             return self.start_preprocess_and_transcribe(input_file, filters, clear_output)
         command = self.build_command(input_file)
@@ -3279,6 +3758,19 @@ class WhisperGUI(QMainWindow):
 
     def start_transcription_process(self, command, clear_output):
         self._log_debug_parameters("transcribe")
+        self._last_run_cuda_oom = False
+        self._last_cuda_oom_snippet = None
+        self._last_run_cuda_kernel_incompatible = False
+        self._last_cuda_kernel_snippet = None
+        if (
+            self._debug_force_vad_oom
+            and self._vad_method_is_pyannote()
+            and not self._vad_device_forced_by_user()
+            and not self._vad_cpu_fallback_active
+        ):
+            self._debug_force_vad_oom = False
+            self._append_text_to_console("\nDebug: forcing VAD CPU fallback.\n")
+            return self._start_vad_cpu_retry(reason="forced")
 
         if clear_output:
             self.output_text.clear()
@@ -3291,6 +3783,8 @@ class WhisperGUI(QMainWindow):
             else:
                 quoted_command_parts.append(arg)
         display_command = ' '.join(quoted_command_parts)
+        self._last_command = list(command)
+        self._last_display_command = display_command
         
         logging.info(f"Starting QProcess with command: {command}")
         if self.full_console_checkbox.isChecked():
@@ -3300,10 +3794,14 @@ class WhisperGUI(QMainWindow):
         self.stop_btn.setEnabled(True)
         
         self.process = QProcess(self)
+        self._recent_stderr_lines.clear()
         self.process.readyReadStandardOutput.connect(self.handle_stdout)
         self.process.readyReadStandardError.connect(self.handle_stderr)
         self.process.finished.connect(self.on_finished)
         self.process.errorOccurred.connect(self.on_process_error)
+        env = self._maybe_set_pyannote_env()
+        if env is not None:
+            self.process.setProcessEnvironment(env)
 
         self.process.start(command[0], command[1:])
         return True
@@ -3320,6 +3818,11 @@ class WhisperGUI(QMainWindow):
         if self.downloader and self.downloader.isRunning():
             self._append_text_to_console("\nRequesting download cancellation...\n")
             self.downloader.stop()
+            if not self.process or self.process.state() != QProcess.ProcessState.Running:
+                self.run_btn.setEnabled(True)
+                self.stop_btn.setEnabled(False)
+                self.downloader = None
+                self.stop_requested = False
         if self.process and self.process.state() == QProcess.ProcessState.Running:
             self._append_text_to_console("\nTerminating process...\n")
             self.process.terminate()
@@ -3353,6 +3856,31 @@ class WhisperGUI(QMainWindow):
     def handle_stderr(self):
         data = self.process.readAllStandardError().data().decode('utf-8', errors='ignore')
         self.check_for_transcription_success(data)
+        if data and self._detect_cuda_oom(data):
+            if not self._last_run_cuda_oom:
+                lines = [line.strip() for line in data.replace("\r", "\n").split("\n") if line.strip()]
+                self._last_cuda_oom_snippet = lines[-3:] if lines else None
+                self._log_debug_event(
+                    "cuda_oom_detected",
+                    input_file=getattr(self, "current_input_file", None),
+                    stderr_tail=self._last_cuda_oom_snippet,
+                )
+            self._last_run_cuda_oom = True
+        if data and self._detect_cuda_kernel_incompatible(data):
+            if not self._last_run_cuda_kernel_incompatible:
+                lines = [line.strip() for line in data.replace("\r", "\n").split("\n") if line.strip()]
+                self._last_cuda_kernel_snippet = lines[-3:] if lines else None
+                self._log_debug_event(
+                    "cuda_kernel_incompatible_detected",
+                    input_file=getattr(self, "current_input_file", None),
+                    stderr_tail=self._last_cuda_kernel_snippet,
+                )
+            self._last_run_cuda_kernel_incompatible = True
+        if data:
+            for line in data.replace("\r", "\n").split("\n"):
+                line = line.strip()
+                if line:
+                    self._recent_stderr_lines.append(line)
         if self.full_console_checkbox.isChecked():
             self._append_text_to_console(data)
         else:
@@ -3602,8 +4130,42 @@ class WhisperGUI(QMainWindow):
                         if len(formats) > 1:
                             self._append_text_to_console(f"\nOutputs saved to: {output_dir} ({formats_label})\n")
         else:
+            remaining = ""
+            if self.process:
+                try:
+                    remaining = self.process.readAllStandardError().data().decode('utf-8', errors='ignore')
+                except Exception:
+                    remaining = ""
+            if remaining:
+                for line in remaining.replace("\r", "\n").split("\n"):
+                    line = line.strip()
+                    if line:
+                        self._recent_stderr_lines.append(line)
+            if self._should_retry_with_vad_cpu():
+                if self._start_vad_cpu_retry():
+                    return
+            if self._should_retry_with_vad_cpu_for_kernel():
+                if self._start_vad_cpu_retry(reason="cuda_kernel_incompatible"):
+                    return
             status_str = "Crashed" if exit_status == QProcess.ExitStatus.CrashExit else "Failed"
             self._append_text_to_console(f"Process {status_str} with exit code {exit_code}.\n")
+            stderr_tail = list(self._recent_stderr_lines)[-8:] if self._recent_stderr_lines else []
+            if stderr_tail:
+                self._append_text_to_console("Last error lines:\n" + "\n".join(stderr_tail) + "\n")
+            model_info = self._get_current_model_arch_info()
+            self._log_debug_event(
+                "process_failed",
+                input_file=getattr(self, "current_input_file", None),
+                exit_code=exit_code,
+                exit_status=getattr(exit_status, "name", str(exit_status)),
+                stderr_tail=stderr_tail,
+                model=model_info.get("model") if model_info else None,
+                model_arch=model_info.get("arch") if model_info else None,
+                model_note=model_info.get("note") if model_info else None,
+            )
+            log_path = self._write_last_error_log(exit_code, exit_status, stderr_tail=stderr_tail)
+            if log_path:
+                self._append_text_to_console(f"Details saved to: {log_path}\n")
 
         self.cleanup_processed_audio()
 
@@ -3676,6 +4238,7 @@ class WhisperGUI(QMainWindow):
         self.batch_total = 0
         self.batch_index = 0
         self.batch_total_known = False
+        self._download_seen_paths = set()
         
         audio_only = self.audio_only_checkbox.isChecked()
         stream_mode = not self.download_all_checkbox.isChecked()
@@ -3716,8 +4279,12 @@ class WhisperGUI(QMainWindow):
         self.downloader.start()
 
     def handle_download_progress(self, text):
-        if "Downloading:" in text:
+        if text.strip() == "Downloading with yt-dlp.exe...":
+            self._append_text_to_console(text + "\n\n")
+        elif text.startswith("Downloading"):
             self._append_text_to_console(text + "\r")
+        elif "Downloaded:" in text:
+            self._append_text_to_console(text + "\n\n")
         else:
             self._append_text_to_console(text + "\n")
 
@@ -3744,7 +4311,14 @@ class WhisperGUI(QMainWindow):
                 + "="*50
                 + "\n"
             )
-            self.pending_files = list(file_paths)
+            self.pending_files = []
+            for path in file_paths:
+                normalized = self._normalize_download_path(path)
+                if normalized in self._download_seen_paths:
+                    logging.info("Skipping duplicate download output: %s", path)
+                    continue
+                self._download_seen_paths.add(normalized)
+                self.pending_files.append(path)
             self.batch_total = len(self.pending_files)
             self.batch_index = 0
             self.batch_total_known = True
@@ -3756,7 +4330,11 @@ class WhisperGUI(QMainWindow):
 
     def on_download_error(self, error_message):
         if "cancelled by user" in error_message and self.stop_requested:
-            self.on_finished(0, QProcess.ExitStatus.NormalExit)
+            self._append_text_to_console("\nDownload cancelled by user.\n")
+            self.run_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            self.downloader = None
+            self.stop_requested = False
             return
 
         self._append_text_to_console(f"YouTube Download Error:\n{error_message}\n")
@@ -3827,6 +4405,7 @@ class WhisperGUI(QMainWindow):
         self.settings["ffmpeg_override"] = self.ffmpeg_path_input.text().strip()
         
         self.settings["vad_method"] = self.vad_method.currentText()
+        self.settings["vad_device"] = self.vad_device.currentText()
         self.settings["vad_threshold"] = self.vad_threshold.value()
         self.settings["vad_min_speech"] = self.vad_min_speech.value()
         
@@ -3921,6 +4500,7 @@ class WhisperGUI(QMainWindow):
         self.update_audio_normalize_controls(self.audio_normalize.isChecked())
         
         self.vad_method.setCurrentText(self.settings.get("vad_method", "silero_v4_fw"))
+        self.vad_device.setCurrentText(self.settings.get("vad_device", "Auto"))
         self.vad_threshold.setValue(self.settings.get("vad_threshold", 0.5))
         self.vad_min_speech.setValue(self.settings.get("vad_min_speech", 250))
 

@@ -2,6 +2,11 @@ import os
 import logging
 import subprocess
 import threading
+import json
+import re
+import time
+import queue
+import sys
 from PyQt6.QtCore import pyqtSignal, QThread
 from utils import popen_hidden_subprocess, resolve_ffmpeg_location, run_hidden_subprocess
 import ytdlp_utils
@@ -29,6 +34,35 @@ class YouTubeDownloader(QThread):
         self.stop_requested = False
         self._resume_event = threading.Event()
         self._resume_event.set()
+        self._debug_logger = None
+        self._active_ytdlp_process = None
+        self._reported_paths = set()
+        self._watch_thread = None
+        self._watch_stop_event = None
+        self._watched_files = set()
+        self._watch_start_time = None
+        self._fs_watch_new_paths = set()
+        self._fs_watch_lock = threading.Lock()
+        self._file_ready_paths = set()
+        self._started_titles = set()
+        self._download_index = 0
+        self._download_total = None
+        self._download_started_count = 0
+        self._download_completed_count = 0
+
+    def _log_debug(self, message, *args):
+        if self._debug_logger is None:
+            try:
+                from gui_components import get_model_download_logger
+            except Exception:
+                logger = logging.getLogger("model_download")
+            else:
+                logger = get_model_download_logger()
+            self._debug_logger = logger
+        logger = self._debug_logger
+        if getattr(logger, "disabled", False):
+            return
+        logger.info(message, *args)
 
     def progress_hook(self, d):
         if self.stop_requested:
@@ -64,8 +98,16 @@ class YouTubeDownloader(QThread):
             return entry
         return None
 
+    def _is_playlist_url(self, url):
+        if not url:
+            return False
+        lowered = url.lower()
+        return "list=" in lowered or "playlist" in lowered
+
     def run(self):
         try:
+            if self.ytdlp_exe:
+                self._start_output_watcher()
             output_template = os.path.join(self.output_path, '%(title)s.%(ext)s')
             ffmpeg_location = resolve_ffmpeg_location()
             if self.audio_only:
@@ -93,41 +135,75 @@ class YouTubeDownloader(QThread):
             downloaded_files = []
             total_expected = 0
             if self.ytdlp_exe:
+                self._download_index = 0
+                self._download_total = None
+                self._started_titles = set()
+                self._download_started_count = 0
+                self._download_completed_count = 0
+                if self.stream_mode:
+                    total_expected = 0
+                    total_known = True
+                    for url in self.urls:
+                        if self.stop_requested:
+                            raise RuntimeError("Download cancelled by user.")
+                        if self._is_playlist_url(url):
+                            count = self._probe_ytdlp_exe_playlist_count(url)
+                            if not count:
+                                total_known = False
+                                break
+                            total_expected += count
+                        else:
+                            total_expected += 1
+                    if total_known and total_expected > 0:
+                        self._download_total = total_expected
+                        self.total_found.emit(total_expected)
+                        self._log_debug("yt-dlp.exe preflight count: %s", total_expected)
                 for url in self.urls:
                     if self.stop_requested:
                         raise RuntimeError("Download cancelled by user.")
                     self.progress.emit("Downloading with yt-dlp.exe...")
-                    paths = self._run_ytdlp_exe(url, output_template, ffmpeg_location)
-                    for path in paths:
-                        downloaded_files.append(path)
-                        self.file_ready.emit(path)
-                        if self.serial_mode:
-                            self._resume_event.clear()
-                            while not self._resume_event.is_set():
-                                if self.stop_requested:
-                                    raise RuntimeError("Download cancelled by user.")
-                                self._resume_event.wait(0.1)
-            if ytdlp_utils.yt_dlp is None:
-                raise RuntimeError("yt-dlp module is not available.")
-            with ytdlp_utils.yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                for url in self.urls:
-                    if self.stop_requested:
-                        raise ytdlp_utils.yt_dlp.utils.DownloadError("Download cancelled by user.")
-                    if self.stream_mode:
-                        info_dict = ydl.extract_info(url, download=False)
-                        if info_dict and (info_dict.get('_type') == 'playlist' or 'entries' in info_dict):
-                            entries = list(info_dict.get('entries') or [])
-                            if entries:
-                                total_expected += len(entries)
+                    self._log_debug("yt-dlp.exe download start: %s", url)
+                    for path in self._run_ytdlp_exe(url, output_template, ffmpeg_location):
+                        if self._record_file_ready(path):
+                            downloaded_files.append(path)
+                            self.file_ready.emit(path)
+                    self._emit_fallback_outputs(downloaded_files)
+                self._emit_fallback_outputs(downloaded_files)
+            else:
+                if ytdlp_utils.yt_dlp is None:
+                    raise RuntimeError("yt-dlp module is not available.")
+                with ytdlp_utils.yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    for url in self.urls:
+                        if self.stop_requested:
+                            raise ytdlp_utils.yt_dlp.utils.DownloadError("Download cancelled by user.")
+                        if self.stream_mode:
+                            info_dict = ydl.extract_info(url, download=False)
+                            if info_dict and (info_dict.get('_type') == 'playlist' or 'entries' in info_dict):
+                                entries = list(info_dict.get('entries') or [])
+                                if entries:
+                                    total_expected += len(entries)
+                                    self.total_found.emit(total_expected)
+                                for entry in entries:
+                                    if self.stop_requested:
+                                        raise ytdlp_utils.yt_dlp.utils.DownloadError("Download cancelled by user.")
+                                    entry_url = self._entry_url(entry)
+                                    if not entry_url:
+                                        continue
+                                    entry_info = ydl.extract_info(entry_url, download=True)
+                                    for path in self._collect_filenames(ydl, entry_info):
+                                        downloaded_files.append(path)
+                                        self.file_ready.emit(path)
+                                        if self.serial_mode:
+                                            self._resume_event.clear()
+                                            while not self._resume_event.is_set():
+                                                if self.stop_requested:
+                                                    raise ytdlp_utils.yt_dlp.utils.DownloadError("Download cancelled by user.")
+                                                self._resume_event.wait(0.1)
+                            else:
+                                total_expected += 1
                                 self.total_found.emit(total_expected)
-                            for entry in entries:
-                                if self.stop_requested:
-                                    raise ytdlp_utils.yt_dlp.utils.DownloadError("Download cancelled by user.")
-                                entry_url = self._entry_url(entry)
-                                if not entry_url:
-                                    continue
-                                entry_info = ydl.extract_info(entry_url, download=True)
-                                for path in self._collect_filenames(ydl, entry_info):
+                                info_dict = ydl.extract_info(url, download=True)
+                                for path in self._collect_filenames(ydl, info_dict):
                                     downloaded_files.append(path)
                                     self.file_ready.emit(path)
                                     if self.serial_mode:
@@ -137,21 +213,8 @@ class YouTubeDownloader(QThread):
                                                 raise ytdlp_utils.yt_dlp.utils.DownloadError("Download cancelled by user.")
                                             self._resume_event.wait(0.1)
                         else:
-                            total_expected += 1
-                            self.total_found.emit(total_expected)
                             info_dict = ydl.extract_info(url, download=True)
-                            for path in self._collect_filenames(ydl, info_dict):
-                                downloaded_files.append(path)
-                                self.file_ready.emit(path)
-                                if self.serial_mode:
-                                    self._resume_event.clear()
-                                    while not self._resume_event.is_set():
-                                        if self.stop_requested:
-                                            raise ytdlp_utils.yt_dlp.utils.DownloadError("Download cancelled by user.")
-                                        self._resume_event.wait(0.1)
-                    else:
-                        info_dict = ydl.extract_info(url, download=True)
-                        downloaded_files.extend(self._collect_filenames(ydl, info_dict))
+                            downloaded_files.extend(self._collect_filenames(ydl, info_dict))
 
             missing = [path for path in downloaded_files if not os.path.exists(path)]
             if missing:
@@ -163,28 +226,528 @@ class YouTubeDownloader(QThread):
         except Exception as e:
             logging.error(f"yt-dlp thread error: {e}", exc_info=True)
             self.error.emit(str(e))
+        finally:
+            self._stop_output_watcher()
 
     def stop(self):
         self.stop_requested = True
         self._resume_event.set()
+        self._terminate_active_process()
+        self._stop_output_watcher()
 
     def allow_next_download(self):
         self._resume_event.set()
 
     def _run_ytdlp_exe(self, url, output_template, ffmpeg_location):
-        cmd = [self.ytdlp_exe, url, "-o", output_template, "--print", "after_move:filepath"]
+        return self._run_ytdlp_exe_stream(url, output_template, ffmpeg_location)
+
+    def _run_ytdlp_exe_stream(self, url, output_template, ffmpeg_location):
+        cmd = [
+            self.ytdlp_exe,
+            url,
+            "-o",
+            output_template,
+            "--print",
+            "after_move:filepath",
+            "--newline",
+            "--progress",
+            "--no-warnings",
+            "--progress-template",
+            "PROGRESS:%(info.title)s | %(progress._percent_str)s of %(progress._total_bytes_str)s at %(progress._speed_str)s ETA %(progress._eta_str)s",
+        ]
         if self.audio_only:
             cmd.extend(["-f", "bestaudio/best", "-x", "--audio-format", "mp3", "--audio-quality", "192"])
         else:
             cmd.extend(["-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"])
         if ffmpeg_location:
             cmd.extend(["--ffmpeg-location", ffmpeg_location])
-        result = run_hidden_subprocess(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            msg = (result.stderr or result.stdout or "").strip()
-            raise RuntimeError(msg or "yt-dlp.exe failed")
-        lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
-        return [line for line in lines if os.path.exists(line)]
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        process = popen_hidden_subprocess(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env=env,
+        )
+        self._active_ytdlp_process = process
+        stdout_queue = queue.Queue()
+        stderr_queue = queue.Queue()
+        stderr_lines = []
+        stdout_lines = []
+        last_progress_line = None
+        last_progress_time = 0.0
+        last_progress_title = None
+        last_activity_time = time.monotonic()
+        stderr_buffer = ""
+
+        def _drain_stream(stream, collector, out_queue=None, raw=False):
+            if raw:
+                while True:
+                    chunk = stream.read(1)
+                    if chunk == "":
+                        break
+                    if out_queue is not None:
+                        out_queue.put(chunk)
+                if out_queue is not None:
+                    out_queue.put(None)
+                return
+            for line in stream:
+                if out_queue is not None:
+                    out_queue.put(line)
+                else:
+                    collector.append(line.rstrip())
+            if out_queue is not None:
+                out_queue.put(None)
+
+        threading.Thread(
+            target=_drain_stream,
+            args=(process.stdout, stdout_lines, stdout_queue),
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=_drain_stream,
+            args=(process.stderr, stderr_lines, stderr_queue, True),
+            daemon=True,
+        ).start()
+
+        found_paths = []
+        stdout_done = False
+        stderr_done = False
+        try:
+            while True:
+                if self.stop_requested:
+                    self._terminate_active_process()
+                    raise RuntimeError("Download cancelled by user.")
+                try:
+                    item = stdout_queue.get(timeout=0.05)
+                except queue.Empty:
+                    item = False
+                if item is None:
+                    stdout_done = True
+                elif item is not False:
+                    line = item.strip().strip('"')
+                    if line:
+                        self._log_debug("yt-dlp.exe stdout: %s", line)
+                        if line.startswith("PROGRESS:"):
+                            progress_line = line[len("PROGRESS:") :].strip()
+                            title_part, details = (
+                                progress_line.split(" | ", 1) if " | " in progress_line else (progress_line, "")
+                            )
+                            title_part = title_part.strip()
+                            if title_part:
+                                key = self._normalize_title_key(title_part)
+                                display_title = self._format_display_name(title_part)
+                                if display_title != last_progress_title:
+                                    last_progress_title = display_title
+                                    last_progress_line = None
+                                    last_progress_time = 0.0
+                                if key and key not in self._started_titles:
+                                    self._started_titles.add(key)
+                                    self._download_started_count += 1
+                                index = self._download_started_count
+                                if self._download_total:
+                                    prefix = f"{index}/{self._download_total}"
+                                else:
+                                    prefix = f"{index}/?"
+                                display_line = f"Downloading ({prefix}): {display_title}"
+                                if details:
+                                    display_line += f" | {details}"
+                                if display_line != last_progress_line:
+                                    last_progress_line = display_line
+                                    self.progress.emit(display_line)
+                        else:
+                            stdout_lines.append(line)
+                            if line not in self._reported_paths:
+                                self._reported_paths.add(line)
+                                display_file = self._format_display_name(os.path.splitext(os.path.basename(line))[0])
+                                self._download_completed_count += 1
+                                index = self._download_completed_count
+                                if self._download_total:
+                                    prefix = f"{index}/{self._download_total}"
+                                else:
+                                    prefix = f"{index}/?"
+                                self.progress.emit(f"Downloaded ({prefix}): {display_file}")
+                            path = self._normalize_existing_path(line)
+                            if not path:
+                                path = self._wait_for_existing_path(line, timeout=5)
+                            if path:
+                                found_paths.append(path)
+                                try:
+                                    mtime = os.path.getmtime(path)
+                                    size = os.path.getsize(path)
+                                    self._log_debug(
+                                        "yt-dlp.exe file_ready: %s mtime=%s size=%s",
+                                        path,
+                                        mtime,
+                                        size,
+                                    )
+                                except Exception:
+                                    self._log_debug("yt-dlp.exe file_ready: %s", path)
+                                yield path
+                try:
+                    err_item = stderr_queue.get_nowait()
+                except queue.Empty:
+                    err_item = False
+                if err_item is None:
+                    stderr_done = True
+                elif err_item is not False:
+                    stderr_buffer += err_item
+                    last_activity_time = time.monotonic()
+                    while True:
+                        split_index = None
+                        for sep in ("\r", "\n"):
+                            idx = stderr_buffer.find(sep)
+                            if idx != -1:
+                                split_index = idx
+                                break
+                        if split_index is None:
+                            break
+                        err_line = stderr_buffer[:split_index].strip()
+                        stderr_buffer = stderr_buffer[split_index + 1:]
+                        if err_line:
+                            stderr_lines.append(err_line)
+                            self._log_debug("yt-dlp.exe stderr: %s", err_line)
+                            now = time.monotonic()
+                            if err_line != last_progress_line and (now - last_progress_time) >= 0.2:
+                                last_progress_line = err_line
+                                last_progress_time = now
+                                self.progress.emit(f"Downloading: {err_line}")
+                returncode = process.poll()
+                if returncode is not None and stdout_done and stderr_done:
+                    break
+            returncode = process.wait()
+            if returncode != 0:
+                msg = ("\n".join(stderr_lines) or "\n".join(stdout_lines)).strip()
+                raise RuntimeError(msg or "yt-dlp.exe failed")
+            if not found_paths and stdout_lines:
+                logging.warning("yt-dlp.exe returned paths but none exist: %s", stdout_lines)
+                self._log_debug("yt-dlp.exe returned paths but none exist: %s", stdout_lines)
+        finally:
+            self._active_ytdlp_process = None
+
+    def _normalize_existing_path(self, line):
+        if os.path.exists(line):
+            return line
+        normalized = os.path.normpath(line)
+        if normalized != line and os.path.exists(normalized):
+            return normalized
+        matched = self._find_matching_output_path(line)
+        if matched:
+            return matched
+        return None
+
+    def _wait_for_existing_path(self, line, timeout=5):
+        if not line:
+            return None
+        start_time = time.monotonic()
+        while (time.monotonic() - start_time) < timeout:
+            path = self._normalize_existing_path(line)
+            if path:
+                return path
+            time.sleep(0.1)
+        return None
+
+    def _wait_for_nonzero_size(self, path, timeout=5):
+        if not path:
+            return False
+        start_time = time.monotonic()
+        while (time.monotonic() - start_time) < timeout:
+            if not os.path.exists(path):
+                return False
+            try:
+                if os.path.getsize(path) > 0:
+                    return True
+            except OSError:
+                pass
+            time.sleep(0.1)
+        return False
+
+    def _terminate_active_process(self):
+        process = self._active_ytdlp_process
+        if process and process.poll() is None:
+            try:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                    return
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    return
+            except Exception:
+                pass
+            if sys.platform == "win32":
+                try:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                        capture_output=True,
+                        text=True,
+                    )
+                except Exception:
+                    pass
+        if sys.platform == "win32":
+            exe_name = None
+            if self.ytdlp_exe:
+                exe_name = os.path.basename(self.ytdlp_exe)
+            if not exe_name:
+                exe_name = "yt-dlp.exe"
+            try:
+                subprocess.run(
+                    ["taskkill", "/IM", exe_name, "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                )
+            except Exception:
+                pass
+
+    def _should_watch_file(self, filename):
+        if not filename:
+            return False
+        lowered = filename.lower()
+        if self.audio_only:
+            return lowered.endswith(".mp3")
+        return lowered.endswith((".mp4", ".mkv", ".webm", ".m4a"))
+
+    def _format_display_name(self, name):
+        if not name:
+            return name
+        cleaned = name.replace("｜", "|")
+        cleaned = re.sub(r"\s*\|\s*", " | ", cleaned)
+        cleaned = re.sub(r"(?<=\S)\s{2,}(?=\S)", " | ", cleaned)
+        return cleaned.strip()
+
+    def _normalize_title_key(self, name):
+        cleaned = self._format_display_name(name)
+        return cleaned.lower() if cleaned else ""
+
+    def _record_file_ready(self, path):
+        if not path:
+            return False
+        normalized = os.path.normpath(path)
+        if normalized in self._file_ready_paths:
+            return False
+        self._file_ready_paths.add(normalized)
+        return True
+
+    def _is_candidate_output_file(self, filename):
+        if not self._should_watch_file(filename):
+            return False
+        lowered = filename.lower()
+        if ".temp." in lowered:
+            return False
+        if re.search(r"\.f\d+\.", lowered):
+            return False
+        return True
+
+    def _normalize_match_key(self, name):
+        cleaned = re.sub(r"[^a-zA-Z0-9]+", " ", name or "").strip()
+        return re.sub(r"\s+", " ", cleaned).lower()
+
+    def _find_matching_output_path(self, path_text):
+        if not self.output_path or not path_text:
+            return None
+        base_name = os.path.basename(path_text)
+        stem, ext = os.path.splitext(base_name)
+        if not stem or not ext:
+            return None
+        target_key = self._normalize_match_key(stem)
+        if not target_key:
+            return None
+        matches = []
+        try:
+            for name in os.listdir(self.output_path):
+                if not self._is_candidate_output_file(name):
+                    continue
+                candidate_stem, candidate_ext = os.path.splitext(name)
+                if candidate_ext.lower() != ext.lower():
+                    continue
+                if self._normalize_match_key(candidate_stem) == target_key:
+                    matches.append(os.path.join(self.output_path, name))
+        except Exception:
+            return None
+        if len(matches) == 1 and os.path.exists(matches[0]):
+            return matches[0]
+        return None
+
+    def _gather_output_files(self, min_mtime=None):
+        if not self.output_path:
+            return []
+        results = []
+        try:
+            for name in os.listdir(self.output_path):
+                if not self._is_candidate_output_file(name):
+                    continue
+                path = os.path.join(self.output_path, name)
+                try:
+                    mtime = os.path.getmtime(path)
+                    if min_mtime is not None and mtime < min_mtime:
+                        continue
+                    if os.path.getsize(path) == 0:
+                        continue
+                except OSError:
+                    continue
+                results.append(path)
+        except Exception:
+            return []
+        return results
+
+    def _emit_fallback_outputs(self, downloaded_files):
+        min_mtime = self._watch_start_time
+        with self._fs_watch_lock:
+            fallback_paths = list(self._fs_watch_new_paths)
+        fallback_paths.extend(self._gather_output_files(min_mtime))
+        for path in fallback_paths:
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                if os.path.getsize(path) == 0:
+                    if not self._wait_for_nonzero_size(path, timeout=5):
+                        continue
+            except OSError:
+                continue
+            if self._record_file_ready(path):
+                downloaded_files.append(path)
+                self.file_ready.emit(path)
+
+    def _start_output_watcher(self):
+        if not self.output_path:
+            return
+        self._watch_stop_event = threading.Event()
+        self._watched_files = set()
+        self._fs_watch_new_paths = set()
+        self._watch_start_time = time.time()
+        try:
+            for name in os.listdir(self.output_path):
+                if self._is_candidate_output_file(name):
+                    self._watched_files.add(name)
+        except Exception:
+            pass
+        self._watch_thread = threading.Thread(target=self._watch_output_folder, daemon=True)
+        self._watch_thread.start()
+
+    def _stop_output_watcher(self):
+        if self._watch_stop_event:
+            self._watch_stop_event.set()
+        if self._watch_thread and self._watch_thread.is_alive():
+            self._watch_thread.join(timeout=1)
+        self._watch_thread = None
+        self._watch_stop_event = None
+
+    def _watch_output_folder(self):
+        while self._watch_stop_event and not self._watch_stop_event.is_set():
+            try:
+                for name in os.listdir(self.output_path):
+                    if not self._is_candidate_output_file(name):
+                        continue
+                    if name in self._watched_files:
+                        continue
+                    self._watched_files.add(name)
+                    path = os.path.join(self.output_path, name)
+                    with self._fs_watch_lock:
+                        self._fs_watch_new_paths.add(path)
+                    try:
+                        size = os.path.getsize(path)
+                        mtime = os.path.getmtime(path)
+                        self._log_debug("fs_watch new file: %s mtime=%s size=%s", path, mtime, size)
+                    except Exception:
+                        self._log_debug("fs_watch new file: %s", path)
+                    self._log_debug("fs_watch console suppressed for: %s", name)
+                time.sleep(0.5)
+            except Exception as exc:
+                self._log_debug("fs_watch error: %s", exc)
+                time.sleep(1.0)
+
+    def _probe_ytdlp_exe_total(self, url):
+        cmd = [self.ytdlp_exe, url, "--dump-single-json", "--flat-playlist", "--no-warnings"]
+        logging.info("yt-dlp.exe preflight start: %s", url)
+        self._log_debug("yt-dlp.exe preflight start: %s", url)
+        stdout, stderr, returncode = self._run_ytdlp_exe_command(cmd, timeout=60, label="preflight")
+        if returncode != 0:
+            snippet = (stderr or stdout or "").strip()
+            logging.warning("yt-dlp.exe preflight failed: %s", snippet or "no output")
+            self._log_debug("yt-dlp.exe preflight failed: %s", snippet or "no output")
+            return None
+        payload = (stdout or "").strip()
+        if not payload:
+            logging.warning("yt-dlp.exe preflight returned empty output")
+            self._log_debug("yt-dlp.exe preflight returned empty output")
+            return None
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            logging.warning("yt-dlp.exe preflight JSON parse failed")
+            self._log_debug("yt-dlp.exe preflight JSON parse failed")
+            return None
+        entries = data.get("entries") if isinstance(data, dict) else None
+        if isinstance(entries, list):
+            logging.info("yt-dlp.exe preflight count: %s", len(entries))
+            self._log_debug("yt-dlp.exe preflight count: %s", len(entries))
+            return len(entries)
+        logging.info("yt-dlp.exe preflight count: 1")
+        self._log_debug("yt-dlp.exe preflight count: 1")
+        return 1
+
+    def _run_ytdlp_exe_command(self, cmd, timeout=None, label=None):
+        process = popen_hidden_subprocess(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        start_time = time.monotonic()
+        while True:
+            if self.stop_requested:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                raise RuntimeError("Download cancelled by user.")
+            if timeout is not None and (time.monotonic() - start_time) >= timeout:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                logging.warning("yt-dlp.exe %s timed out after %ss", label or "command", timeout)
+                self._log_debug("yt-dlp.exe %s timed out after %ss", label or "command", timeout)
+                return "", f"yt-dlp.exe {label or 'command'} timed out", 124
+            returncode = process.poll()
+            if returncode is not None:
+                break
+            time.sleep(0.1)
+        stdout, stderr = process.communicate()
+        if label:
+            if returncode == 0:
+                logging.info("yt-dlp.exe %s finished", label)
+                self._log_debug("yt-dlp.exe %s finished", label)
+            else:
+                logging.warning("yt-dlp.exe %s failed: %s", label, (stderr or stdout or "").strip())
+                self._log_debug("yt-dlp.exe %s failed: %s", label, (stderr or stdout or "").strip())
+        return stdout, stderr, returncode
+
+    def _probe_ytdlp_exe_playlist_count(self, url):
+        cmd = [
+            self.ytdlp_exe,
+            url,
+            "--flat-playlist",
+            "--print",
+            "id",
+            "--no-warnings",
+            "--yes-playlist",
+        ]
+        stdout, stderr, returncode = self._run_ytdlp_exe_command(cmd, timeout=20, label="playlist_count")
+        if returncode != 0:
+            snippet = (stderr or stdout or "").strip()
+            self._log_debug("yt-dlp.exe playlist count failed: %s", snippet or "no output")
+            return None
+        lines = [line for line in (stdout or "").splitlines() if line.strip()]
+        return len(lines) if lines else None
 
 
 class YtDlpUpdateWorker(QThread):
