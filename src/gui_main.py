@@ -296,8 +296,6 @@ class WhisperGUI(QMainWindow):
         self._vad_oom_retry_files = set()
         self._last_command = None
         self._last_display_command = None
-        self._debug_force_vad_oom_env = os.environ.get("FWXXL_FORCE_VAD_OOM", "").strip().lower() in {"1", "true", "yes"}
-        self._debug_force_vad_oom = self._debug_force_vad_oom_env or bool(self.settings.get("debug_force_vad_oom"))
         
         if not self.check_and_setup_dependencies():
             QTimer.singleShot(0, self.close)
@@ -2661,7 +2659,6 @@ class WhisperGUI(QMainWindow):
             "<li>Run parameters (model, task, device, compute type)</li>"
             "<li>Output formats and advanced toggles (VAD, word timestamps, MP3)</li>"
             "</ul>"
-            "<div style='margin-top:10px;'>Optional: force VAD CPU fallback to test the OOM handler.</div>"
         )
         info_label.setWordWrap(True)
         info_label.setTextFormat(Qt.TextFormat.RichText)
@@ -2673,11 +2670,6 @@ class WhisperGUI(QMainWindow):
         enabled_checkbox.setChecked(self.settings.get("debug_model_download_logging", False))
         enabled_checkbox.setStyleSheet("margin-top: 6px; margin-bottom: 8px; font-size: 14px;")
         layout.addWidget(enabled_checkbox)
-
-        force_vad_oom_checkbox = QCheckBox("Force VAD OOM fallback (test)")
-        force_vad_oom_checkbox.setChecked(self.settings.get("debug_force_vad_oom", False))
-        force_vad_oom_checkbox.setStyleSheet("margin-top: 2px; margin-bottom: 8px; font-size: 14px;")
-        layout.addWidget(force_vad_oom_checkbox)
 
         button_row = QHBoxLayout()
         open_button = QPushButton("Open Log")
@@ -2695,12 +2687,10 @@ class WhisperGUI(QMainWindow):
         def on_toggle():
             enabled = enabled_checkbox.isChecked()
             self.settings["debug_model_download_logging"] = enabled
-            self.settings["debug_force_vad_oom"] = force_vad_oom_checkbox.isChecked()
             self.save_settings_to_file()
             set_model_download_logging_enabled(enabled)
 
         enabled_checkbox.toggled.connect(on_toggle)
-        force_vad_oom_checkbox.toggled.connect(on_toggle)
 
         def on_open():
             log_path = get_model_download_log_path()
@@ -3613,7 +3603,6 @@ class WhisperGUI(QMainWindow):
         self._last_cuda_kernel_snippet = None
         self._vad_cpu_fallback_active = False
         self._vad_oom_retry_files = set()
-        self._debug_force_vad_oom = self._debug_force_vad_oom_env or bool(self.settings.get("debug_force_vad_oom"))
         self._model_download_cancelled = False
         if not self.get_output_dir():
             return
@@ -3762,15 +3751,6 @@ class WhisperGUI(QMainWindow):
         self._last_cuda_oom_snippet = None
         self._last_run_cuda_kernel_incompatible = False
         self._last_cuda_kernel_snippet = None
-        if (
-            self._debug_force_vad_oom
-            and self._vad_method_is_pyannote()
-            and not self._vad_device_forced_by_user()
-            and not self._vad_cpu_fallback_active
-        ):
-            self._debug_force_vad_oom = False
-            self._append_text_to_console("\nDebug: forcing VAD CPU fallback.\n")
-            return self._start_vad_cpu_retry(reason="forced")
 
         if clear_output:
             self.output_text.clear()
