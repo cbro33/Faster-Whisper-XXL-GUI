@@ -73,6 +73,24 @@ QCheckBox::indicator:checked {
     background-color: #007acc;
     image: url(check.png);
 }
+QTableView::indicator {
+    width: 16px;
+    height: 16px;
+    border: 1px solid #3d3d3d;
+    background-color: #1e1e1e;
+    border-radius: 3px;
+}
+QTableView::indicator:focus {
+    border: 1px solid #3d3d3d;
+    background-color: #1e1e1e;
+}
+QTableView::indicator:checked {
+    background-color: #007acc;
+    image: url(check.png);
+}
+QTableView::item:focus {
+    outline: none;
+}
 QScrollBar:vertical {
     background-color: #2d2d2d;
     width: 12px;

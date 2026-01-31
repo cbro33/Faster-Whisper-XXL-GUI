@@ -549,17 +549,23 @@ class ModelDownloadDialog(QDialog):
     error_occurred = pyqtSignal(str)
     _debug_counter = 0
 
-    def __init__(self, model_name, target_dir, parent=None):
+    def __init__(self, model_name, target_dir, parent=None, repo_id=None, display_name=None, download_all_files=False):
         super().__init__(parent)
         self.model_name = model_name
         self.target_dir = target_dir
-        if model_name == "large-v3-turbo":
-            self.repo_id = "dropbox-dash/faster-whisper-large-v3-turbo"
-        elif model_name.startswith("distil-"):
-            base_name = model_name[len("distil-"):]
-            self.repo_id = f"Systran/faster-distil-whisper-{base_name}"
+        self.display_name = display_name or model_name
+        if repo_id:
+            self.repo_id = repo_id
         else:
-            self.repo_id = f"Systran/faster-whisper-{model_name}"
+            if model_name == "large-v3-turbo":
+                self.repo_id = "dropbox-dash/faster-whisper-large-v3-turbo"
+            elif model_name.startswith("distil-"):
+                base_name = model_name[len("distil-"):]
+                self.repo_id = f"Systran/faster-distil-whisper-{base_name}"
+            else:
+                self.repo_id = f"Systran/faster-whisper-{model_name}"
+        self.download_all_files = download_all_files
+        self.files_to_download = None
         self.cancelled = False
         self.worker_thread = None
         self._active_response = None
@@ -589,7 +595,7 @@ class ModelDownloadDialog(QDialog):
         layout.setSpacing(10)
 
         # 1. Header
-        self.status_label = QLabel(f"Downloading model: {self.model_name}", self)
+        self.status_label = QLabel(f"Downloading model: {self.display_name}", self)
         self.status_label.setStyleSheet("font-size: 18px; font-weight: bold;")
         layout.addWidget(self.status_label)
 
@@ -760,40 +766,76 @@ class ModelDownloadDialog(QDialog):
             
         return 0  # Return 0 if size is unknown
 
+    def _fetch_repo_file_list(self):
+        api_url = f"https://huggingface.co/api/models/{self.repo_id}"
+        resp = requests.get(api_url, timeout=10)
+        if resp.status_code != 200:
+            raise RuntimeError("Failed to fetch repo file list.")
+        data = resp.json()
+        files = []
+        for sibling in data.get("siblings", []):
+            fname = sibling.get("rfilename")
+            if not fname or "/" in fname:
+                continue
+            files.append(fname)
+            fsize = sibling.get("size")
+            if fsize:
+                self.file_sizes[fname] = fsize
+        if not files:
+            raise RuntimeError("Repo appears to be empty.")
+        files_sorted = sorted([f for f in files if f != "model.bin"])
+        if "model.bin" in files:
+            files_sorted.append("model.bin")
+        return files_sorted
+
     def download_worker(self):
         try:
             self._debug_logger.info("[%s] download_worker started", self._debug_id)
             os.makedirs(self.target_dir, exist_ok=True)
             
-            # Fetch all sizes at the start
             self.download_progress.emit(0, 0, "Fetching metadata...@@")
-            self.file_sizes["config.json"] = self._fetch_file_size("config.json")
-            self.file_sizes["tokenizer.json"] = self._fetch_file_size("tokenizer.json")
-            self.file_sizes["preprocessor_config.json"] = self._fetch_file_size("preprocessor_config.json")
-            self.file_sizes["vocabulary.json"] = self._fetch_file_size("vocabulary.json")
-            self.file_sizes["vocabulary.txt"] = self._fetch_file_size("vocabulary.txt")
-            self.file_sizes["model.bin"] = self._fetch_file_size("model.bin")
+            if self.download_all_files:
+                self.files_to_download = self._fetch_repo_file_list()
+                if "model.bin" not in self.files_to_download:
+                    raise FileNotFoundError("model.bin not found in repo.")
+            else:
+                # Fetch all sizes at the start
+                self.file_sizes["config.json"] = self._fetch_file_size("config.json")
+                self.file_sizes["tokenizer.json"] = self._fetch_file_size("tokenizer.json")
+                self.file_sizes["preprocessor_config.json"] = self._fetch_file_size("preprocessor_config.json")
+                self.file_sizes["vocabulary.json"] = self._fetch_file_size("vocabulary.json")
+                self.file_sizes["vocabulary.txt"] = self._fetch_file_size("vocabulary.txt")
+                self.file_sizes["model.bin"] = self._fetch_file_size("model.bin")
             
             if self.cancelled:
                 raise RuntimeError("Cancelled")
 
-            # Download small files
-            for filename in ["config.json", "tokenizer.json", "preprocessor_config.json"]:
+            if self.download_all_files and self.files_to_download:
+                for filename in self.files_to_download:
+                    if self.cancelled:
+                        raise RuntimeError("Cancelled")
+                    if filename == "model.bin":
+                        self._download_model_bin()
+                    else:
+                        self._download_file(filename, required=True)
+            else:
+                # Download small files
+                for filename in ["config.json", "tokenizer.json", "preprocessor_config.json"]:
+                    if self.cancelled:
+                        raise RuntimeError("Cancelled")
+                    required = (filename != "preprocessor_config.json")
+                    self._download_file(filename, required=required)
+
+                # Vocabulary
                 if self.cancelled:
                     raise RuntimeError("Cancelled")
-                required = (filename != "preprocessor_config.json")
-                self._download_file(filename, required=required)
+                if not self._download_file("vocabulary.json", required=False):
+                    self._download_file("vocabulary.txt", required=False)
 
-            # Vocabulary
-            if self.cancelled:
-                raise RuntimeError("Cancelled")
-            if not self._download_file("vocabulary.json", required=False):
-                self._download_file("vocabulary.txt", required=False)
-
-            # Model Binary
-            if self.cancelled:
-                raise RuntimeError("Cancelled")
-            self._download_model_bin()
+                # Model Binary
+                if self.cancelled:
+                    raise RuntimeError("Cancelled")
+                self._download_model_bin()
 
             if not self.cancelled:
                 self.download_finished_signal.emit()

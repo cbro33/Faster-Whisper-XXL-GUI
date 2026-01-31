@@ -4,6 +4,8 @@ import json
 import logging
 import time
 import shutil
+import tempfile
+import threading
 import requests
 import webbrowser
 import platform
@@ -17,9 +19,9 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QCheckBox, QTextEdit, QDoubleSpinBox, QSpinBox, 
     QScrollArea, QFileDialog, QCompleter, QListWidget, QAbstractItemView,
     QSpacerItem, QMessageBox, QApplication, QGridLayout, QLineEdit, QDialog, QInputDialog,
-    QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar
+    QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar, QProgressDialog
 )
-from PyQt6.QtCore import Qt, QTimer, QProcess, QProcessEnvironment, QByteArray, QUrl, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QProcess, QProcessEnvironment, QByteArray, QUrl, QThread, pyqtSignal, QModelIndex
 from PyQt6.QtGui import QIcon, QPalette, QColor, QTextCursor, QFont, QDesktopServices, QFontMetrics
 
 from config import APP_VERSION, SUPPORTED_EXTENSIONS
@@ -49,6 +51,14 @@ from gui_components import (
 )
 from gpu_utils import detect_hardware_capabilities
 
+MODEL_DIR_PREFIX = "faster-whisper-"
+BUILTIN_MODELS = [
+    "tiny", "tiny.en", "base", "base.en", "small", "small.en", "medium", "medium.en",
+    "large-v1", "large-v2", "large-v3", "large-v3-turbo",
+    "distil-large-v2", "distil-large-v3", "distil-medium.en", "distil-small.en",
+]
+GITHUB_HEADERS = {"User-Agent": f"Faster-Whisper-XXL-GUI/{APP_VERSION}"}
+
 class YtDlpVersionCheckWorker(QThread):
     finished = pyqtSignal(dict)
 
@@ -60,7 +70,7 @@ class YtDlpVersionCheckWorker(QThread):
     def run(self):
         result = {"ok": False, "status_code": None, "latest_version": None, "error": None}
         try:
-            response = requests.get(self.url, timeout=self.timeout)
+            response = requests.get(self.url, timeout=self.timeout, headers=GITHUB_HEADERS)
             result["status_code"] = response.status_code
             if response.status_code == 200:
                 data = response.json()
@@ -237,6 +247,417 @@ class AudioPreprocessDialog(QDialog):
         button_layout.addStretch()
         layout.addLayout(button_layout)
 
+class VerifyModelsWorker(QThread):
+    progress = pyqtSignal(int, int, str)
+    finished = pyqtSignal(list)
+
+    def __init__(self, executable_path, checks, audio_path, device_type, compute_type, parent=None):
+        super().__init__(parent)
+        self.executable_path = executable_path
+        self.checks = list(checks)
+        self.audio_path = audio_path
+        self.device_type = device_type
+        self.compute_type = compute_type
+        self._cancel_event = threading.Event()
+
+    def cancel(self):
+        self._cancel_event.set()
+
+    def run(self):
+        results = []
+        total = len(self.checks)
+        for index, item in enumerate(self.checks, start=1):
+            if self._cancel_event.is_set():
+                results.append((item["name"], "Cancelled", "Verification cancelled by user."))
+                break
+            self.progress.emit(index, total, item["name"])
+            temp_dir = tempfile.mkdtemp(prefix="fw-verify-")
+            cmd = [
+                self.executable_path,
+                "--check_files",
+                "-m",
+                item["name"],
+                "--model_dir",
+                item["model_dir_cli"],
+                "--device",
+                self.device_type,
+                "--compute_type",
+                self.compute_type,
+                "--output_dir",
+                temp_dir,
+                self.audio_path,
+            ]
+            try:
+                result = run_hidden_subprocess(cmd, capture_output=True, text=True, timeout=45)
+            except Exception as exc:
+                results.append((item["name"], "Failed", f"Failed to run check: {exc}"))
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                continue
+            output = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
+            output = output.strip()
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            if result.returncode == 0:
+                results.append((item["name"], "OK", output or "Model check passed."))
+            else:
+                message = output or "Model check failed."
+                if result.returncode == -1073741819:
+                    message += (
+                        "\nThe backend crashed while loading the model. This usually means the model "
+                        "conversion is incompatible with the bundled faster-whisper-xxl binary."
+                    )
+                results.append((item["name"], "Failed", message))
+        self.finished.emit(results)
+
+class ModelManagerDialog(QDialog):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.parent = parent
+        self._loading_table = False
+        self.setWindowTitle("Manage Models")
+        self.setModal(True)
+        self.setMinimumSize(720, 420)
+
+        layout = QVBoxLayout(self)
+        info_label = QLabel(
+            "Enable models to show them in the dropdown. Built-in models can be disabled too.\n"
+            "Custom models are stored in the _models/custom folder."
+        )
+        info_label.setWordWrap(True)
+        layout.addWidget(info_label)
+
+        self.table = QTableWidget(self)
+        self.table.setColumnCount(5)
+        self.table.setHorizontalHeaderLabels(["Enabled", "Model", "Status", "Source", "Location"])
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.table.verticalHeader().setVisible(False)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.itemChanged.connect(self._handle_item_changed)
+        layout.addWidget(self.table)
+
+        button_row = QHBoxLayout()
+        self.add_hf_button = QPushButton("Add from HF...")
+        self.import_button = QPushButton("Import Local...")
+        self.refresh_button = QPushButton("Rescan")
+        self.enable_all_button = QPushButton("Enable All")
+        self.disable_all_button = QPushButton("Disable All")
+        self.verify_button = QPushButton("Verify Enabled")
+        self.close_button = QPushButton("Close")
+        button_row.addWidget(self.add_hf_button)
+        button_row.addWidget(self.import_button)
+        button_row.addWidget(self.refresh_button)
+        button_row.addWidget(self.enable_all_button)
+        button_row.addWidget(self.disable_all_button)
+        button_row.addWidget(self.verify_button)
+        button_row.addStretch()
+        button_row.addWidget(self.close_button)
+        layout.addLayout(button_row)
+
+        self.add_hf_button.clicked.connect(self._add_from_hf)
+        self.import_button.clicked.connect(self._import_local_model)
+        self.refresh_button.clicked.connect(self._rescan_models)
+        self.enable_all_button.clicked.connect(self._enable_all_models)
+        self.disable_all_button.clicked.connect(self._disable_all_models)
+        self.verify_button.clicked.connect(self._verify_selected_model)
+        self.close_button.clicked.connect(self.accept)
+
+        self._load_table()
+        QTimer.singleShot(0, self._clear_table_focus)
+
+    def _clear_table_focus(self):
+        self.table.setCurrentIndex(QModelIndex())
+        self.table.clearSelection()
+        if self.close_button:
+            self.close_button.setFocus()
+
+    def _sorted_entries(self):
+        priority = {
+            "builtin": 0,
+            "hf": 1,
+            "local": 2,
+        }
+        entries = list(self.parent._get_models_registry())
+        return sorted(
+            entries,
+            key=lambda entry: (
+                priority.get(entry.get("source", "unknown"), 99),
+                (entry.get("display_name") or entry.get("name") or "").lower(),
+            ),
+        )
+
+    def _load_table(self):
+        entries = self._sorted_entries()
+        self._loading_table = True
+        self.table.setRowCount(len(entries))
+        for row, entry in enumerate(entries):
+            enabled_item = QTableWidgetItem()
+            enabled_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            enabled_item.setCheckState(Qt.CheckState.Checked if entry.get("enabled") else Qt.CheckState.Unchecked)
+            enabled_item.setData(Qt.ItemDataRole.UserRole, entry.get("name"))
+            self.table.setItem(row, 0, enabled_item)
+
+            display_name = entry.get("display_name") or entry.get("name") or ""
+            name_item = QTableWidgetItem(display_name)
+            name_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            tooltip_parts = [f"Internal name: {entry.get('name', '')}"]
+            if entry.get("repo_id"):
+                tooltip_parts.append(f"Repo: {entry.get('repo_id')}")
+            name_item.setToolTip("\n".join(part for part in tooltip_parts if part))
+            self.table.setItem(row, 1, name_item)
+
+            status_value = entry.get("verify_status")
+            status_label = "Unknown"
+            if status_value == "ok":
+                status_label = "OK"
+            elif status_value == "failed":
+                status_label = "Failed"
+            elif status_value == "missing":
+                status_label = "Not Downloaded"
+            elif status_value == "skipped":
+                status_label = "Skipped"
+            status_item = QTableWidgetItem(status_label)
+            status_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            if entry.get("verify_message"):
+                status_item.setToolTip(entry.get("verify_message"))
+            self.table.setItem(row, 2, status_item)
+
+            source_value = entry.get("source", "unknown")
+            source_label = {
+                "builtin": "Built-in",
+                "hf": "HF",
+                "local": "Local",
+            }.get(source_value, "Unknown")
+            source_item = QTableWidgetItem(source_label)
+            source_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.table.setItem(row, 3, source_item)
+
+            location_label = "Custom" if entry.get("root") == "custom" else "Default"
+            location_item = QTableWidgetItem(location_label)
+            location_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.table.setItem(row, 4, location_item)
+        self._loading_table = False
+
+    def _handle_item_changed(self, item):
+        if self._loading_table or item.column() != 0:
+            return
+        model_name = item.data(Qt.ItemDataRole.UserRole)
+        entry = self.parent._find_model_entry(model_name)
+        if not entry:
+            return
+        new_enabled = item.checkState() == Qt.CheckState.Checked
+        if not new_enabled:
+            enabled_count = sum(1 for e in self.parent._get_models_registry() if e.get("enabled"))
+            if enabled_count <= 1:
+                QMessageBox.information(
+                    self,
+                    "Model Required",
+                    "At least one model must remain enabled.",
+                )
+                self._loading_table = True
+                item.setCheckState(Qt.CheckState.Checked)
+                self._loading_table = False
+                return
+        entry["enabled"] = new_enabled
+        self.parent._models_registry_dirty = True
+
+    def _add_from_hf(self):
+        repo_text, ok = QInputDialog.getText(
+            self,
+            "Add Model from Hugging Face",
+            "Enter Hugging Face repo ID or URL:",
+        )
+        if not ok or not repo_text.strip():
+            return
+        repo_id = self.parent._parse_hf_repo_id(repo_text)
+        if not repo_id:
+            QMessageBox.warning(self, "Invalid Repo", "Please enter a valid Hugging Face repo ID or URL.")
+            return
+        default_name = repo_id.split("/", 1)[-1]
+        display_name, ok = QInputDialog.getText(
+            self,
+            "Model Name",
+            "Display name (used for folder and dropdown):",
+            text=default_name,
+        )
+        if not ok:
+            return
+        display_name = (display_name or "").strip() or default_name
+        model_name = self.parent._sanitize_model_name(display_name)
+        if not model_name:
+            QMessageBox.warning(self, "Invalid Name", "Please provide a valid model name.")
+            return
+        if self.parent._find_model_entry(model_name):
+            QMessageBox.warning(
+                self,
+                "Duplicate Model",
+                f"A model named '{model_name}' already exists.",
+            )
+            return
+        _, base_local = self.parent.get_model_dirs()
+        if not base_local:
+            QMessageBox.warning(self, "Model Directory", "Model directory is not available yet.")
+            return
+        custom_root = os.path.join(base_local, "custom")
+        target_dir = os.path.join(custom_root, self.parent._get_model_folder_name(model_name))
+        if os.path.exists(target_dir):
+            QMessageBox.warning(
+                self,
+                "Folder Exists",
+                f"The folder already exists:\n{target_dir}",
+            )
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Download Model",
+            f"Download '{display_name}' from {repo_id} to:\n{target_dir}\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        dialog = ModelDownloadDialog(
+            model_name,
+            target_dir,
+            parent=self,
+            repo_id=repo_id,
+            display_name=display_name,
+            download_all_files=True,
+        )
+        result = dialog.exec()
+        if result != QDialog.DialogCode.Accepted:
+            return
+        self.parent._get_models_registry().append({
+            "name": model_name,
+            "display_name": display_name,
+            "source": "hf",
+            "enabled": True,
+            "root": "custom",
+            "repo_id": repo_id,
+        })
+        self.parent._models_registry_dirty = True
+        self._load_table()
+
+    def _import_local_model(self):
+        source_dir = QFileDialog.getExistingDirectory(self, "Select a CTranslate2 Model Folder")
+        if not source_dir:
+            return
+        model_bin = os.path.join(source_dir, "model.bin")
+        if not os.path.isfile(model_bin):
+            QMessageBox.warning(self, "Invalid Model", "model.bin was not found in that folder.")
+            return
+        default_name = os.path.basename(source_dir)
+        if default_name.startswith(MODEL_DIR_PREFIX):
+            default_name = default_name[len(MODEL_DIR_PREFIX):]
+        display_name, ok = QInputDialog.getText(
+            self,
+            "Model Name",
+            "Display name (used for folder and dropdown):",
+            text=default_name,
+        )
+        if not ok:
+            return
+        display_name = (display_name or "").strip() or default_name
+        model_name = self.parent._sanitize_model_name(display_name)
+        if not model_name:
+            QMessageBox.warning(self, "Invalid Name", "Please provide a valid model name.")
+            return
+        if self.parent._find_model_entry(model_name):
+            QMessageBox.warning(
+                self,
+                "Duplicate Model",
+                f"A model named '{model_name}' already exists.",
+            )
+            return
+        _, base_local = self.parent.get_model_dirs()
+        if not base_local:
+            QMessageBox.warning(self, "Model Directory", "Model directory is not available yet.")
+            return
+        custom_root = os.path.join(base_local, "custom")
+        target_dir = os.path.join(custom_root, self.parent._get_model_folder_name(model_name))
+        if os.path.exists(target_dir):
+            QMessageBox.warning(
+                self,
+                "Folder Exists",
+                f"The folder already exists:\n{target_dir}",
+            )
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Import Model",
+            "This will copy the selected model folder into:\n"
+            f"{target_dir}\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            shutil.copytree(source_dir, target_dir)
+        except Exception as exc:
+            QMessageBox.warning(self, "Import Failed", f"Failed to copy model:\n{exc}")
+            return
+        self.parent._get_models_registry().append({
+            "name": model_name,
+            "display_name": display_name,
+            "source": "local",
+            "enabled": True,
+            "root": "custom",
+        })
+        self.parent._models_registry_dirty = True
+        self._load_table()
+
+    def _rescan_models(self):
+        self.parent._sync_models_from_disk()
+        self._load_table()
+
+    def _enable_all_models(self):
+        entries = self.parent._get_models_registry()
+        for entry in entries:
+            entry["enabled"] = True
+        self.parent._models_registry_dirty = True
+        self._load_table()
+
+    def _disable_all_models(self):
+        entries = self.parent._get_models_registry()
+        if not entries:
+            return
+        keep_name = self.parent._get_selected_model_name()
+        keep_entry = self.parent._find_model_entry(keep_name)
+        if not keep_entry and entries:
+            keep_entry = entries[0]
+        for entry in entries:
+            entry["enabled"] = False
+        if keep_entry:
+            keep_entry["enabled"] = True
+        self.parent._models_registry_dirty = True
+        self._load_table()
+
+    def _get_selected_table_models(self):
+        selected_rows = set()
+        for item in self.table.selectedItems():
+            selected_rows.add(item.row())
+        models = []
+        for row in sorted(selected_rows):
+            name_item = self.table.item(row, 0)
+            if name_item:
+                model_name = name_item.data(Qt.ItemDataRole.UserRole)
+                if model_name:
+                    models.append(model_name)
+        return models
+
+    def _verify_selected_model(self):
+        model_names = [entry.get("name") for entry in self.parent._get_enabled_model_entries()]
+        model_names = [name for name in model_names if name]
+        if not model_names:
+            QMessageBox.warning(self, "Verify Model", "No model selected.")
+            return
+        self.parent.verify_model_files(model_names, parent=self)
+        self._load_table()
+
 class WhisperGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -258,6 +679,8 @@ class WhisperGUI(QMainWindow):
         self.old_roaming_settings_file = os.path.join(get_settings_directory(), "settings.json")  # For migration FROM roaming
         self.settings = {}
         self.load_settings_file_only()
+        self._models_registry_dirty = False
+        self._ensure_models_registry()
         self._output_basename_map_limit = 200
         self._output_basename_map = {}
         self._load_output_basename_map()
@@ -296,6 +719,9 @@ class WhisperGUI(QMainWindow):
         self._vad_oom_retry_files = set()
         self._last_command = None
         self._last_display_command = None
+        self._custom_model_retry_attempted = False
+        self._compute_type_override = None
+        self._cpu_compute_override_applied = False
         
         if not self.check_and_setup_dependencies():
             QTimer.singleShot(0, self.close)
@@ -805,8 +1231,6 @@ class WhisperGUI(QMainWindow):
         output_dir_layout.addWidget(self.browse_out_btn)
         layout.addRow(output_dir_label, output_dir_container)
         self.model_combo = QComboBox()
-        self.model_combo.addItems(['tiny', 'tiny.en', 'base', 'base.en', 'small', 'small.en', 'medium', 'medium.en', 'large-v1', 'large-v2', 'large-v3', 'large-v3-turbo', 'distil-large-v2', 'distil-large-v3', 'distil-medium.en', 'distil-small.en'])
-        self.model_combo.setCurrentText('large-v3')
         self.model_combo.setToolTip(
             "Choose a model. Larger models are more accurate but use more resources. "
             "large-v3-turbo downloads a community CTranslate2 conversion (dropbox-dash)."
@@ -816,7 +1240,17 @@ class WhisperGUI(QMainWindow):
             "Choose a model. Larger models are more accurate but use more resources. "
             "large-v3-turbo downloads a community CTranslate2 conversion (dropbox-dash)."
         )
-        layout.addRow(model_label, self.model_combo)
+        self.model_manage_button = QPushButton("Manage")
+        self.model_manage_button.setToolTip("Download, import, and enable models.")
+        self.model_manage_button.setObjectName("manage_model_button")
+        self.model_manage_button.setFixedWidth(90)
+        model_row = QHBoxLayout()
+        model_row.setContentsMargins(0, 0, 0, 0)
+        model_row.setSpacing(6)
+        model_row.addWidget(self.model_combo)
+        model_row.addWidget(self.model_manage_button)
+        layout.addRow(model_label, model_row)
+        self.model_manage_button.clicked.connect(self.show_model_manager)
         self.task_combo = QComboBox()
         self.task_combo.addItems(['transcribe', 'translate'])
         self.task_combo.setToolTip("Transcribe keeps the original language; translate outputs English.")
@@ -2247,7 +2681,8 @@ class WhisperGUI(QMainWindow):
 
             response = requests.get(
                 "https://api.github.com/repos/cbro33/Faster-Whisper-XXL-GUI/releases/latest",
-                timeout=5
+                timeout=5,
+                headers=GITHUB_HEADERS
             )
             if response.status_code != 200:
                 return
@@ -2308,6 +2743,143 @@ class WhisperGUI(QMainWindow):
         except Exception as e:
             logging.error(f"Error showing hardware optimization dialog: {e}")
 
+    def show_model_manager(self):
+        dialog = ModelManagerDialog(self)
+        dialog.exec()
+        self._refresh_model_combo(preferred_name=self._get_selected_model_name())
+        self.settings["model"] = self._get_selected_model_name()
+        if self._models_registry_dirty:
+            self.save_settings_to_file()
+            self._models_registry_dirty = False
+
+    def verify_model_files(self, model_names, parent=None):
+        if isinstance(model_names, str):
+            model_names = [model_names]
+        model_names = [name for name in model_names if name]
+        if not model_names:
+            return
+        if not self.executable_path or not os.path.exists(self.executable_path):
+            QMessageBox.warning(self, "Verify Model", "Backend executable not found.")
+            return
+        audio_path = getattr(self, "current_input_file", None)
+        if not audio_path or not os.path.isfile(audio_path):
+            audio_path, _ = QFileDialog.getOpenFileName(
+                parent or self,
+                "Select an audio/video file for model check",
+                "",
+                "Audio/Video Files (*.*)"
+            )
+        if not audio_path:
+            return
+        compute_type = self._get_effective_compute_type()
+        device_type = self.device_combo.currentText()
+        if device_type == "cpu" and compute_type in ("float16", "int8_float16", "int8_bfloat16", "bfloat16"):
+            compute_type = "float32"
+
+        registry_entries = {entry.get("name"): entry for entry in self._get_models_registry() if entry.get("name")}
+        immediate_results = []
+        checks = []
+        for model_name in model_names:
+            _, local_model_dir, _ = self._get_model_root_dirs(model_name)
+            if not local_model_dir:
+                immediate_results.append((model_name, "Skipped", "Model directory is not available yet."))
+                entry = registry_entries.get(model_name)
+                if entry:
+                    entry["verify_status"] = "skipped"
+                    entry["verify_message"] = "Model directory is not available yet."
+                continue
+            model_dir_cli, _, _ = self._get_model_root_dirs(model_name)
+            model_folder = self._get_model_folder_name(model_name)
+            model_path = os.path.join(local_model_dir, model_folder)
+            model_bin = os.path.join(model_path, "model.bin")
+            if not os.path.isfile(model_bin):
+                immediate_results.append(
+                    (model_name, "Not Downloaded", "Model files not found. Download the model to verify.")
+                )
+                entry = registry_entries.get(model_name)
+                if entry:
+                    entry["verify_status"] = "missing"
+                    entry["verify_message"] = "Model files not found. Download the model to verify."
+                continue
+            checks.append({
+                "name": model_name,
+                "model_dir_cli": model_dir_cli,
+            })
+
+        total_count = len(model_names)
+        progress = QProgressDialog("Verifying models...", "Cancel", 0, total_count, parent or self)
+        progress.setWindowTitle("Verify Models")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(len(immediate_results))
+
+        if not checks:
+            progress.setValue(total_count)
+            summary_lines = [f"{model_name}: {status}" for model_name, status, _detail in immediate_results]
+            summary_text = "\n".join(summary_lines).strip()
+            if summary_text:
+                summary_text += "\n\nDetails are shown in Manage Models > Status."
+            QMessageBox.information(parent or self, "Verify Models", summary_text or "No models were verified.")
+            if registry_entries:
+                self._models_registry_dirty = True
+                self.save_settings_to_file()
+                self._models_registry_dirty = False
+            return
+
+        self._verify_progress_dialog = progress
+        worker = VerifyModelsWorker(
+            self.executable_path,
+            checks,
+            audio_path,
+            device_type,
+            compute_type,
+            parent=self,
+        )
+        self._verify_worker = worker
+
+        def on_progress(index, total, name):
+            progress.setLabelText(f"Verifying {name} ({len(immediate_results) + index}/{total_count})")
+            progress.setValue(len(immediate_results) + index)
+
+        def on_cancel():
+            if self._verify_worker:
+                self._verify_worker.cancel()
+
+        def on_finished(results):
+            if self._verify_progress_dialog:
+                self._verify_progress_dialog.setValue(total_count)
+                self._verify_progress_dialog.close()
+                self._verify_progress_dialog = None
+            combined = immediate_results + results
+            for model_name, status, detail in combined:
+                entry = registry_entries.get(model_name)
+                if not entry:
+                    continue
+                normalized = (status or "").strip().lower()
+                if normalized == "ok":
+                    entry["verify_status"] = "ok"
+                elif normalized in ("not downloaded", "missing"):
+                    entry["verify_status"] = "missing"
+                elif normalized in ("skipped", "cancelled", "canceled"):
+                    entry["verify_status"] = "skipped"
+                else:
+                    entry["verify_status"] = "failed"
+                entry["verify_message"] = detail
+            if registry_entries:
+                self._models_registry_dirty = True
+                self.save_settings_to_file()
+                self._models_registry_dirty = False
+            summary_lines = [f"{model_name}: {status}" for model_name, status, _detail in combined]
+            summary_text = "\n".join(summary_lines).strip()
+            if summary_text:
+                summary_text += "\n\nDetails are shown in Manage Models > Status."
+            QMessageBox.information(parent or self, "Verify Models", summary_text or "No models were verified.")
+
+        progress.canceled.connect(on_cancel)
+        worker.progress.connect(on_progress)
+        worker.finished.connect(on_finished)
+        worker.start()
+
     def apply_hardware_recommendations(self, recommendations, hardware_info):
         """ Apply hardware recommendations to the UI """
         try:
@@ -2321,9 +2893,10 @@ class WhisperGUI(QMainWindow):
             
             if "model" in recommendations:
                 model_text = recommendations["model"]
-                index = self.model_combo.findText(model_text)
-                if index >= 0:
-                    self.model_combo.setCurrentIndex(index)
+                if not self._set_model_selection_by_name(model_text):
+                    index = self.model_combo.findText(model_text)
+                    if index >= 0:
+                        self.model_combo.setCurrentIndex(index)
             
             if "compute_type" in recommendations:
                 compute_text = recommendations["compute_type"]
@@ -2386,11 +2959,11 @@ class WhisperGUI(QMainWindow):
             return
         params = {
             "context": context,
-            "model": self.model_combo.currentText(),
+            "model": self._get_selected_model_name(),
             "task": self.task_combo.currentText(),
             "language": self.get_language_code(),
             "device": self.device_combo.currentText(),
-            "compute_type": self.compute_combo.currentText(),
+            "compute_type": self._get_effective_compute_type(),
             "output_formats": getattr(self, "last_output_formats", []),
             "temperature": self.temperature.value(),
             "beam_size": self.beam_size.value(),
@@ -2478,12 +3051,12 @@ class WhisperGUI(QMainWindow):
         }
         model_name = None
         try:
-            model_name = self.model_combo.currentText()
+            model_name = self._get_selected_model_name()
         except Exception:
             model_name = None
         info["model"] = model_name
         try:
-            _, local_model_dir = self.get_model_dirs()
+            _, local_model_dir, _ = self._get_model_root_dirs(model_name)
         except Exception:
             local_model_dir = None
         if not local_model_dir:
@@ -2491,7 +3064,7 @@ class WhisperGUI(QMainWindow):
             return info
         expected_dir = None
         if model_name:
-            expected_dir = os.path.join(local_model_dir, f"faster-whisper-{model_name}")
+            expected_dir = os.path.join(local_model_dir, self._get_model_folder_name(model_name))
         if expected_dir:
             detected = self._detect_model_arch_from_dir(expected_dir)
             if detected:
@@ -2940,7 +3513,7 @@ class WhisperGUI(QMainWindow):
 
     def save_combo_setting(self):
         """Save combo box settings immediately"""
-        self.settings["model"] = self.model_combo.currentText()
+        self.settings["model"] = self._get_selected_model_name()
         self.settings["task"] = self.task_combo.currentText()
         self.settings["language"] = self.get_language_code()
         self.settings["compute_type"] = self.compute_combo.currentText()
@@ -3390,6 +3963,227 @@ class WhisperGUI(QMainWindow):
         rest = path[2:].replace("\\", "/").lstrip("/")
         return f"/mnt/{drive}/{rest}"
 
+    def _get_models_registry(self):
+        registry = self.settings.get("models_registry")
+        if isinstance(registry, list):
+            return registry
+        return []
+
+    def _ensure_models_registry(self):
+        registry = self.settings.get("models_registry")
+        changed = False
+        if not isinstance(registry, list):
+            registry = []
+            changed = True
+        existing = {}
+        for entry in registry:
+            name = entry.get("name")
+            if not name:
+                continue
+            existing[name] = entry
+            if not entry.get("display_name"):
+                entry["display_name"] = name
+                changed = True
+            if "enabled" not in entry:
+                entry["enabled"] = True
+                changed = True
+            if "root" not in entry:
+                entry["root"] = "default"
+                changed = True
+            if "source" not in entry:
+                entry["source"] = "unknown"
+                changed = True
+        for name in BUILTIN_MODELS:
+            if name in existing:
+                entry = existing[name]
+                if entry.get("source") != "builtin":
+                    entry["source"] = "builtin"
+                    changed = True
+                if entry.get("root") != "default":
+                    entry["root"] = "default"
+                    changed = True
+                if "enabled" not in entry:
+                    entry["enabled"] = True
+                    changed = True
+                if not entry.get("display_name"):
+                    entry["display_name"] = name
+                    changed = True
+                continue
+            registry.append({
+                "name": name,
+                "display_name": name,
+                "source": "builtin",
+                "enabled": True,
+                "root": "default",
+            })
+            changed = True
+        if changed:
+            self.settings["models_registry"] = registry
+            self._models_registry_dirty = True
+
+    def _sanitize_model_name(self, name):
+        if not name:
+            return ""
+        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", name.strip())
+        cleaned = cleaned.strip("-._")
+        return cleaned.lower()
+
+    def _get_enabled_model_entries(self):
+        return [entry for entry in self._get_models_registry() if entry.get("enabled")]
+
+    def _find_model_entry(self, model_name):
+        if not model_name:
+            return None
+        for entry in self._get_models_registry():
+            if entry.get("name") == model_name:
+                return entry
+        return None
+
+    def _get_selected_model_name(self):
+        data = self.model_combo.currentData()
+        if data:
+            return str(data)
+        return self.model_combo.currentText().strip()
+
+    def _set_model_selection_by_name(self, model_name):
+        if not model_name:
+            return False
+        index = self.model_combo.findData(model_name)
+        if index >= 0:
+            self.model_combo.setCurrentIndex(index)
+            return True
+        return False
+
+    def _refresh_model_combo(self, preferred_name=None):
+        enabled_entries = self._get_enabled_model_entries()
+        current_name = preferred_name or self.settings.get("model") or self._get_selected_model_name()
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        for entry in enabled_entries:
+            display_name = entry.get("display_name") or entry.get("name") or ""
+            self.model_combo.addItem(display_name, entry.get("name"))
+        if enabled_entries:
+            if not self._set_model_selection_by_name(current_name):
+                self.model_combo.setCurrentIndex(0)
+        self.model_combo.blockSignals(False)
+
+    def _join_cli_path(self, base_path, child):
+        if not base_path:
+            return None
+        if self._is_windows_path(base_path):
+            return ntpath.join(base_path, child)
+        return os.path.join(base_path, child)
+
+    def _get_model_root_dirs(self, model_name=None):
+        cli_model_dir, local_model_dir = self.get_model_dirs()
+        entry = self._find_model_entry(model_name or self._get_selected_model_name())
+        if entry and entry.get("root") == "custom":
+            cli_model_dir = self._join_cli_path(cli_model_dir, "custom")
+            local_model_dir = os.path.join(local_model_dir, "custom") if local_model_dir else None
+        return cli_model_dir, local_model_dir, entry
+
+    def _get_effective_compute_type(self):
+        return self._compute_type_override or self.compute_combo.currentText()
+
+    def _should_retry_custom_model_on_crash(self, exit_code, exit_status):
+        if exit_status != QProcess.ExitStatus.CrashExit:
+            return False
+        if exit_code != -1073741819:
+            return False
+        if self._custom_model_retry_attempted:
+            return False
+        model_name = self._get_selected_model_name()
+        entry = self._find_model_entry(model_name)
+        if not entry or entry.get("source") not in ("hf", "local"):
+            return False
+        current_compute = self._get_effective_compute_type()
+        if current_compute in ("auto", "float32"):
+            return False
+        return True
+
+    def _start_custom_model_retry(self):
+        self._custom_model_retry_attempted = True
+        self._compute_type_override = "float32"
+        self._append_text_to_console(
+            "Custom model crashed; retrying once with compute_type=float32.\n"
+        )
+        command = self.build_command(self.current_input_file)
+        self._compute_type_override = None
+        if not command:
+            return False
+        return self.start_transcription_process(command, clear_output=False)
+
+    def _get_model_folder_name(self, model_name):
+        return f"{MODEL_DIR_PREFIX}{model_name}"
+
+    def _parse_hf_repo_id(self, value):
+        if not value:
+            return None
+        text = value.strip()
+        if not text:
+            return None
+        if text.startswith("http://") or text.startswith("https://"):
+            marker = "huggingface.co/"
+            if marker not in text:
+                return None
+            text = text.split(marker, 1)[1]
+        elif text.startswith("huggingface.co/"):
+            text = text.split("huggingface.co/", 1)[1]
+        text = text.split("?", 1)[0].split("#", 1)[0].strip("/")
+        for marker in ("/blob/", "/tree/"):
+            if marker in text:
+                text = text.split(marker, 1)[0]
+        parts = [part for part in text.split("/") if part]
+        if len(parts) < 2:
+            return None
+        repo_id = "/".join(parts[:2])
+        if re.match(r"^[^/]+/[^/]+$", repo_id):
+            return repo_id
+        return None
+
+    def _sync_models_from_disk(self):
+        registry = self._get_models_registry()
+        if not registry:
+            return
+        cli_model_dir, local_model_dir = self.get_model_dirs()
+        if not local_model_dir or not os.path.isdir(local_model_dir):
+            return
+        roots = [("default", local_model_dir)]
+        custom_root = os.path.join(local_model_dir, "custom")
+        if os.path.isdir(custom_root):
+            roots.append(("custom", custom_root))
+        existing = {(entry.get("name"), entry.get("root")) for entry in registry if entry.get("name")}
+        changed = False
+        for root_type, root_path in roots:
+            try:
+                for entry_name in sorted(os.listdir(root_path)):
+                    if not entry_name.startswith(MODEL_DIR_PREFIX):
+                        continue
+                    entry_path = os.path.join(root_path, entry_name)
+                    if not os.path.isdir(entry_path):
+                        continue
+                    model_bin = os.path.join(entry_path, "model.bin")
+                    if not os.path.isfile(model_bin):
+                        continue
+                    model_name = entry_name[len(MODEL_DIR_PREFIX):]
+                    key = (model_name, root_type)
+                    if key in existing:
+                        continue
+                    registry.append({
+                        "name": model_name,
+                        "display_name": model_name,
+                        "source": "local",
+                        "enabled": True,
+                        "root": root_type,
+                    })
+                    existing.add(key)
+                    changed = True
+            except Exception:
+                continue
+        if changed:
+            self.settings["models_registry"] = registry
+            self._models_registry_dirty = True
+
     def get_model_dirs(self):
         model_override = self.settings.get("model_dir_override")
         if model_override:
@@ -3415,19 +4209,27 @@ class WhisperGUI(QMainWindow):
         return cli_model_dir, local_model_dir
 
     def ensure_model_available(self):
-        model_name = self.model_combo.currentText()
-        cli_model_dir, local_model_dir = self.get_model_dirs()
+        model_name = self._get_selected_model_name()
+        cli_model_dir, local_model_dir, entry = self._get_model_root_dirs(model_name)
         if not local_model_dir:
             return True
         if getattr(self, "_model_download_cancelled", False):
             logging.info("ensure_model_available: skip dialog (recent cancel)")
             return False
-        model_folder = f"faster-whisper-{model_name}"
+        model_folder = self._get_model_folder_name(model_name)
         target_dir = os.path.join(local_model_dir, model_folder)
         model_bin = os.path.join(target_dir, "model.bin")
         if os.path.exists(model_bin) and os.path.getsize(model_bin) > 0:
             logging.info("ensure_model_available: model present %s", model_bin)
             return True
+        if entry and entry.get("source") == "local":
+            QMessageBox.warning(
+                self,
+                "Model Missing",
+                "This model was imported from a local folder but files are missing.\n"
+                "Please re-import the model from the Models manager."
+            )
+            return False
         if not hasattr(self, "_model_dialog_count"):
             self._model_dialog_count = 0
         self._model_dialog_count += 1
@@ -3437,7 +4239,17 @@ class WhisperGUI(QMainWindow):
             model_name,
             target_dir,
         )
-        dialog = ModelDownloadDialog(model_name, target_dir, parent=self)
+        repo_id = entry.get("repo_id") if entry else None
+        if entry and entry.get("source") == "hf" and repo_id:
+            dialog = ModelDownloadDialog(
+                model_name,
+                target_dir,
+                parent=self,
+                repo_id=repo_id,
+                download_all_files=True,
+            )
+        else:
+            dialog = ModelDownloadDialog(model_name, target_dir, parent=self)
         result = dialog.exec()
         logging.info(
             "ensure_model_available: dialog #%s result=%s",
@@ -3464,12 +4276,21 @@ class WhisperGUI(QMainWindow):
             return None
 
         cmd = [self.executable_path, input_file]
-        model_dir_cli, _ = self.get_model_dirs()
+        model_dir_cli, _, _ = self._get_model_root_dirs()
         vad_device = self._resolve_vad_device()
+        compute_type = self._get_effective_compute_type()
+        device_type = self.device_combo.currentText()
+        if device_type == "cpu" and compute_type in ("float16", "int8_float16", "int8_bfloat16", "bfloat16"):
+            compute_type = "float32"
+            if not self._cpu_compute_override_applied:
+                self._cpu_compute_override_applied = True
+                self._append_text_to_console(
+                    "CPU does not support float16/bfloat16 compute. Using float32 instead.\n"
+                )
         options = {
-            "-m": self.model_combo.currentText(), "--task": self.task_combo.currentText(),
+            "-m": self._get_selected_model_name(), "--task": self.task_combo.currentText(),
             "-l": self.get_language_code() if self.get_language_code() != 'auto' else None,
-            "--compute_type": self.compute_combo.currentText(), "--device": self.device_combo.currentText(),
+            "--compute_type": compute_type, "--device": device_type,
             "--temperature": str(self.temperature.value()) if self.temperature.value() > 0 else None,
             "--beam_size": str(self.beam_size.value()) if self.beam_size.value() != 5 else None,
             "--best_of": str(self.best_of.value()) if self.best_of.value() != 5 else None,
@@ -3603,6 +4424,9 @@ class WhisperGUI(QMainWindow):
         self._last_cuda_kernel_snippet = None
         self._vad_cpu_fallback_active = False
         self._vad_oom_retry_files = set()
+        self._custom_model_retry_attempted = False
+        self._compute_type_override = None
+        self._cpu_compute_override_applied = False
         self._model_download_cancelled = False
         if not self.get_output_dir():
             return
@@ -4127,12 +4951,20 @@ class WhisperGUI(QMainWindow):
             if self._should_retry_with_vad_cpu_for_kernel():
                 if self._start_vad_cpu_retry(reason="cuda_kernel_incompatible"):
                     return
+            if self._should_retry_custom_model_on_crash(exit_code, exit_status):
+                if self._start_custom_model_retry():
+                    return
             status_str = "Crashed" if exit_status == QProcess.ExitStatus.CrashExit else "Failed"
             self._append_text_to_console(f"Process {status_str} with exit code {exit_code}.\n")
             stderr_tail = list(self._recent_stderr_lines)[-8:] if self._recent_stderr_lines else []
             if stderr_tail:
                 self._append_text_to_console("Last error lines:\n" + "\n".join(stderr_tail) + "\n")
             model_info = self._get_current_model_arch_info()
+            model_entry = self._find_model_entry(model_info.get("model") if model_info else None)
+            if model_entry and model_entry.get("verify_status") == "failed":
+                self._append_text_to_console(
+                    "Note: This model is marked as incompatible by Verify Models.\n"
+                )
             self._log_debug_event(
                 "process_failed",
                 input_file=getattr(self, "current_input_file", None),
@@ -4359,7 +5191,7 @@ class WhisperGUI(QMainWindow):
         self.settings["geometry"] = self.saveGeometry().data().hex()
         self.settings["splitter_sizes"] = self.main_splitter.sizes()
         self.settings["output_dir"] = self.output_dir.text()
-        self.settings["model"] = self.model_combo.currentText()
+        self.settings["model"] = self._get_selected_model_name()
         self.settings["task"] = self.task_combo.currentText()
         self.settings["language"] = self.get_language_code()
         self.settings["compute_type"] = self.compute_combo.currentText()
@@ -4452,7 +5284,9 @@ class WhisperGUI(QMainWindow):
                 self._enforce_splitter_sizes_for_frozen()
 
         self.output_dir.setText(self.settings.get("output_dir", ""))
-        self.model_combo.setCurrentText(self.settings.get("model", "large-v3"))
+        self._ensure_models_registry()
+        self._sync_models_from_disk()
+        self._refresh_model_combo(preferred_name=self.settings.get("model", "large-v3"))
         self.task_combo.setCurrentText(self.settings.get("task", "transcribe"))
         language_code = self.settings.get("language", "auto")
         language_index = self.language_combo.findData(language_code)
@@ -4506,6 +5340,9 @@ class WhisperGUI(QMainWindow):
         if index >= 0:
             self.ytdlp_source_combo.setCurrentIndex(index)
         self.apply_config_settings()
+        if self._models_registry_dirty:
+            self.save_settings_to_file()
+            self._models_registry_dirty = False
 
     def load_settings_file_only(self):
         """Load settings from disk before UI init (no widget access)."""
