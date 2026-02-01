@@ -27,6 +27,8 @@ from PyQt6.QtGui import QDragEnterEvent, QDropEvent
 from utils import get_window_stays_on_top_flag, run_hidden_subprocess, get_app_directory
 from gpu_utils import detect_hardware_capabilities, get_recommended_settings
 from config import SUPPORTED_EXTENSIONS
+from converter_utils import find_transformers_weight_files
+from workers import ModelConversionWorker
 
 def create_always_on_top_message_box(parent, icon, title, text, buttons=None, default_button=None):
     """ Create a message box that always stays on top """
@@ -272,6 +274,120 @@ class UpdateProgressDialog(QDialog):
             else:
                 self.status_label.setText("Update failed")
             self.cancel_button.setText("Close")
+
+
+class ConverterProgressDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Converting Model")
+        self.setModal(True)
+        self.setMinimumSize(420, 150)
+
+        stay_on_top_flag = get_window_stays_on_top_flag()
+        if stay_on_top_flag is not None:
+            try:
+                self.setWindowFlags(self.windowFlags() | stay_on_top_flag)
+            except Exception as e:
+                logging.warning(f"Could not set always-on-top flag for ConverterProgressDialog: {e}")
+
+        layout = QVBoxLayout(self)
+        self.status_label = QLabel("Preparing conversion...", self)
+        layout.addWidget(self.status_label)
+
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setRange(0, 0)
+        layout.addWidget(self.progress_bar)
+
+        self.cancel_button = QPushButton("Cancel", self)
+        self.cancel_button.clicked.connect(self.reject)
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        button_layout.addWidget(self.cancel_button)
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
+
+    def update_progress(self, message, percent=None):
+        if percent is not None:
+            try:
+                percent_value = int(percent)
+            except Exception:
+                percent_value = None
+            if percent_value is not None:
+                self.progress_bar.setRange(0, 100)
+                self.progress_bar.setValue(max(0, min(100, percent_value)))
+        self.status_label.setText(message)
+        from PyQt6.QtCore import QCoreApplication
+        QCoreApplication.processEvents()
+
+    def set_completion_state(self, success, message=None):
+        self.progress_bar.setRange(0, 1)
+        self.progress_bar.setValue(1 if success else 0)
+        if message:
+            self.status_label.setText(message)
+        else:
+            self.status_label.setText("Conversion complete." if success else "Conversion failed.")
+        self.cancel_button.setText("Close")
+
+
+def confirm_transformers_conversion(parent, auto_convert=False, use_bundle=False):
+    if auto_convert:
+        return True
+    env_note = (
+        "This will download a converter bundle (~250 MB) and use it to convert the model."
+        if use_bundle
+        else "This will use your current Python environment to convert the model."
+    )
+    text = (
+        "This model contains Transformers weights (model.safetensors / pytorch_model.bin) "
+        "but no model.bin file.\n\n"
+        "Faster-Whisper-XXL requires a CTranslate2 model (model.bin). "
+        "Convert this model now?\n\n"
+        f"{env_note}\n\n"
+        "You can enable Auto-convert in Settings to skip this prompt."
+    )
+    reply = QMessageBox.question(
+        parent,
+        "Convert Model",
+        text,
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        QMessageBox.StandardButton.Yes,
+    )
+    return reply == QMessageBox.StandardButton.Yes
+
+
+def run_transformers_conversion_dialog(parent, model_dir, use_bundle=False):
+    dialog = ConverterProgressDialog(parent)
+    result = {"ok": False, "message": "Conversion cancelled."}
+    worker = ModelConversionWorker(model_dir, use_bundle=use_bundle, parent=dialog)
+
+    def on_progress(message):
+        dialog.update_progress(message)
+
+    def on_progress_stats(message, percent):
+        dialog.update_progress(message, percent=percent)
+
+    def on_finished(success, message):
+        result["ok"] = success
+        result["message"] = message
+        dialog.set_completion_state(success, message if message else None)
+        QTimer.singleShot(900, dialog.accept)
+
+    worker.progress.connect(on_progress)
+    worker.progress_stats.connect(on_progress_stats)
+    worker.finished.connect(on_finished)
+    dialog.rejected.connect(worker.stop)
+    worker.start()
+    dialog.exec()
+    if worker.isRunning():
+        worker.stop()
+        worker.wait(2000)
+    if result["ok"]:
+        QMessageBox.information(
+            parent,
+            "Conversion Complete",
+            "Model conversion finished successfully.",
+        )
+    return result["ok"], result["message"]
 
 
 class DownloadManager(QDialog):
@@ -547,9 +663,10 @@ class ModelDownloadDialog(QDialog):
     download_progress = pyqtSignal(object, object, str)
     download_finished_signal = pyqtSignal()
     error_occurred = pyqtSignal(str)
+    conversion_request = pyqtSignal()
     _debug_counter = 0
 
-    def __init__(self, model_name, target_dir, parent=None, repo_id=None, display_name=None, download_all_files=False):
+    def __init__(self, model_name, target_dir, parent=None, repo_id=None, display_name=None, download_all_files=False, auto_convert_transformers=False):
         super().__init__(parent)
         self.model_name = model_name
         self.target_dir = target_dir
@@ -571,6 +688,12 @@ class ModelDownloadDialog(QDialog):
         self._active_response = None
         self.file_sizes = {}  # Cache for API sizes
         self._logged_zero_total = set()
+        self._transformers_weight_files = []
+        self._transformers_only = False
+        self.auto_convert_transformers = bool(auto_convert_transformers)
+        self._conversion_decision = None
+        self._conversion_event = threading.Event()
+        self._conversion_allowed = False
         self._debug_logger = get_model_download_logger()
         ModelDownloadDialog._debug_counter += 1
         self._debug_id = f"model-dialog-{ModelDownloadDialog._debug_counter}"
@@ -643,6 +766,7 @@ class ModelDownloadDialog(QDialog):
         self.download_progress.connect(self.update_download_progress)
         self.download_finished_signal.connect(self.on_download_finished)
         self.error_occurred.connect(self.on_error)
+        self.conversion_request.connect(self._handle_conversion_request)
         self.finished.connect(self._log_finished)
         self.rejected.connect(self._log_rejected)
         self.accepted.connect(self._log_accepted)
@@ -783,6 +907,8 @@ class ModelDownloadDialog(QDialog):
                 self.file_sizes[fname] = fsize
         if not files:
             raise RuntimeError("Repo appears to be empty.")
+        self._transformers_weight_files = find_transformers_weight_files(files)
+        self._transformers_only = bool(self._transformers_weight_files) and "model.bin" not in files
         files_sorted = sorted([f for f in files if f != "model.bin"])
         if "model.bin" in files:
             files_sorted.append("model.bin")
@@ -796,7 +922,18 @@ class ModelDownloadDialog(QDialog):
             self.download_progress.emit(0, 0, "Fetching metadata...@@")
             if self.download_all_files:
                 self.files_to_download = self._fetch_repo_file_list()
-                if "model.bin" not in self.files_to_download:
+                if self._transformers_only:
+                    if self.auto_convert_transformers:
+                        self._conversion_allowed = True
+                    else:
+                        self.conversion_request.emit()
+                        while not self._conversion_event.wait(0.1):
+                            if self.cancelled:
+                                raise RuntimeError("Cancelled")
+                        if not self._conversion_decision:
+                            raise RuntimeError("Conversion declined by user.")
+                        self._conversion_allowed = True
+                if "model.bin" not in self.files_to_download and not self._transformers_only:
                     raise FileNotFoundError("model.bin not found in repo.")
             else:
                 # Fetch all sizes at the start
@@ -1003,12 +1140,39 @@ class ModelDownloadDialog(QDialog):
     def on_download_finished(self):
         if self.cancelled:
             return
+        if self._transformers_only:
+            model_bin = os.path.join(self.target_dir, "model.bin")
+            if not os.path.isfile(model_bin):
+                if not self._conversion_allowed:
+                    self.reject()
+                    return
+                use_bundle = getattr(sys, "frozen", False)
+                success, message = run_transformers_conversion_dialog(
+                    self, self.target_dir, use_bundle=use_bundle
+                )
+                if not success:
+                    QMessageBox.warning(
+                        self,
+                        "Conversion Failed",
+                        message or "Model conversion failed.",
+                    )
+                    self.reject()
+                    return
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(1)
         self.file_label.setText("Download complete")
         self.details_label.setText("100%")
         self._debug_logger.info("[%s] download_finished", self._debug_id)
         self.accept()
+
+    def _handle_conversion_request(self):
+        use_bundle = getattr(sys, "frozen", False)
+        self._conversion_decision = confirm_transformers_conversion(
+            self,
+            auto_convert=False,
+            use_bundle=use_bundle,
+        )
+        self._conversion_event.set()
 
     def on_error(self, message):
         if self.cancelled:

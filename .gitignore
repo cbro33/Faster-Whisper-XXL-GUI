@@ -6,3 +6,8 @@ __pycache__
 faster-whisper-xxl-gui.spec
 *.json
 *.txt
+bundle/
+conv_env/
+fwxxl-converter-win-x64.zip
+fwxxl-converter-win-x64.sha256
+tools/

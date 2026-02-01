@@ -19,7 +19,8 @@ from PyQt6.QtWidgets import (
     QSizePolicy, QCheckBox, QTextEdit, QDoubleSpinBox, QSpinBox, 
     QScrollArea, QFileDialog, QCompleter, QListWidget, QAbstractItemView,
     QSpacerItem, QMessageBox, QApplication, QGridLayout, QLineEdit, QDialog, QInputDialog,
-    QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar, QProgressDialog
+    QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar, QProgressDialog,
+    QMenu, QToolButton
 )
 from PyQt6.QtCore import Qt, QTimer, QProcess, QProcessEnvironment, QByteArray, QUrl, QThread, pyqtSignal, QModelIndex
 from PyQt6.QtGui import QIcon, QPalette, QColor, QTextCursor, QFont, QDesktopServices, QFontMetrics
@@ -47,9 +48,15 @@ from gui_components import (
     FileDropWidget, LinkDropGroupBox, LinkDropListWidget, UpdateProgressDialog, show_setup_critical,
     show_setup_question, show_setup_warning, show_setup_information,
     show_yt_dlp_unavailable, ModelDownloadDialog, set_model_download_logging_enabled,
-    get_model_download_log_path, get_model_download_logger
+    get_model_download_log_path, get_model_download_logger,
+    confirm_transformers_conversion, run_transformers_conversion_dialog
 )
 from gpu_utils import detect_hardware_capabilities
+from converter_utils import (
+    scan_transformers_weights,
+    get_converter_bundle_dir,
+    get_converter_python_path,
+)
 
 MODEL_DIR_PREFIX = "faster-whisper-"
 BUILTIN_MODELS = [
@@ -345,16 +352,22 @@ class ModelManagerDialog(QDialog):
         self.add_hf_button = QPushButton("Add from HF...")
         self.import_button = QPushButton("Import Local...")
         self.refresh_button = QPushButton("Rescan")
-        self.enable_all_button = QPushButton("Enable All")
-        self.disable_all_button = QPushButton("Disable All")
         self.verify_button = QPushButton("Verify Enabled")
+        self.more_button = QToolButton()
+        self.more_button.setText("More")
+        self.more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        more_menu = QMenu(self.more_button)
+        self.enable_all_action = more_menu.addAction("Enable All")
+        self.disable_all_action = more_menu.addAction("Disable All")
+        more_menu.addSeparator()
+        self.delete_selected_action = more_menu.addAction("Delete Selected...")
+        self.more_button.setMenu(more_menu)
         self.close_button = QPushButton("Close")
         button_row.addWidget(self.add_hf_button)
         button_row.addWidget(self.import_button)
         button_row.addWidget(self.refresh_button)
-        button_row.addWidget(self.enable_all_button)
-        button_row.addWidget(self.disable_all_button)
         button_row.addWidget(self.verify_button)
+        button_row.addWidget(self.more_button)
         button_row.addStretch()
         button_row.addWidget(self.close_button)
         layout.addLayout(button_row)
@@ -362,8 +375,9 @@ class ModelManagerDialog(QDialog):
         self.add_hf_button.clicked.connect(self._add_from_hf)
         self.import_button.clicked.connect(self._import_local_model)
         self.refresh_button.clicked.connect(self._rescan_models)
-        self.enable_all_button.clicked.connect(self._enable_all_models)
-        self.disable_all_button.clicked.connect(self._disable_all_models)
+        self.enable_all_action.triggered.connect(self._enable_all_models)
+        self.disable_all_action.triggered.connect(self._disable_all_models)
+        self.delete_selected_action.triggered.connect(self._delete_selected_models)
         self.verify_button.clicked.connect(self._verify_selected_model)
         self.close_button.clicked.connect(self.accept)
 
@@ -527,6 +541,7 @@ class ModelManagerDialog(QDialog):
             repo_id=repo_id,
             display_name=display_name,
             download_all_files=True,
+            auto_convert_transformers=self.parent._should_auto_convert_transformers(),
         )
         result = dialog.exec()
         if result != QDialog.DialogCode.Accepted:
@@ -548,8 +563,9 @@ class ModelManagerDialog(QDialog):
             return
         model_bin = os.path.join(source_dir, "model.bin")
         if not os.path.isfile(model_bin):
-            QMessageBox.warning(self, "Invalid Model", "model.bin was not found in that folder.")
-            return
+            if not self.parent._maybe_convert_transformers_model(source_dir, parent=self):
+                QMessageBox.warning(self, "Invalid Model", "model.bin was not found in that folder.")
+                return
         default_name = os.path.basename(source_dir)
         if default_name.startswith(MODEL_DIR_PREFIX):
             default_name = default_name[len(MODEL_DIR_PREFIX):]
@@ -657,6 +673,93 @@ class ModelManagerDialog(QDialog):
             return
         self.parent.verify_model_files(model_names, parent=self)
         self._load_table()
+
+    def _delete_selected_models(self):
+        model_names = self._get_selected_table_models()
+        if not model_names:
+            QMessageBox.warning(self, "Delete Models", "No models selected.")
+            return
+
+        custom_names = []
+        blocked_names = []
+        for name in model_names:
+            entry = self.parent._find_model_entry(name)
+            if not entry:
+                continue
+            if entry.get("root") != "custom":
+                blocked_names.append(name)
+                continue
+            custom_names.append(name)
+
+        if blocked_names and not custom_names:
+            QMessageBox.information(
+                self,
+                "Delete Models",
+                "Only custom models can be deleted from disk.",
+            )
+            return
+
+        if not custom_names:
+            QMessageBox.warning(self, "Delete Models", "No custom models selected.")
+            return
+
+        message = (
+            "Delete selected custom models?\n\n"
+            "• Delete Files: removes model folders from disk (recommended to free space)\n"
+            "• Remove Only: removes from the list but keeps files on disk (may reappear after Rescan)\n"
+        )
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Delete Models")
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setText(message)
+        delete_button = dialog.addButton("Delete Files", QMessageBox.ButtonRole.DestructiveRole)
+        remove_button = dialog.addButton("Remove Only", QMessageBox.ButtonRole.ActionRole)
+        dialog.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+        dialog.exec()
+        clicked = dialog.clickedButton()
+
+        if clicked not in (delete_button, remove_button):
+            return
+
+        delete_files = clicked is delete_button
+        errors = []
+        removed = 0
+
+        registry = self.parent._get_models_registry()
+        remaining = []
+        _, base_local = self.parent.get_model_dirs()
+        custom_root = os.path.join(base_local, "custom") if base_local else None
+
+        for entry in registry:
+            entry_name = entry.get("name")
+            entry_root = entry.get("root")
+            if entry_name in custom_names and entry_root == "custom":
+                removed += 1
+                if delete_files and custom_root:
+                    folder = self.parent._get_model_folder_name(entry_name)
+                    target_dir = os.path.join(custom_root, folder)
+                    if os.path.isdir(target_dir):
+                        try:
+                            shutil.rmtree(target_dir)
+                        except Exception as exc:
+                            errors.append(f"{entry_name}: {exc}")
+                continue
+            remaining.append(entry)
+
+        if removed:
+            self.parent.settings["models_registry"] = remaining
+            self.parent._models_registry_dirty = True
+            self.parent.save_settings_to_file()
+            self.parent._models_registry_dirty = False
+            self._load_table()
+            self.parent._refresh_model_combo(preferred_name=None)
+
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Delete Models",
+                "Some models could not be deleted:\n" + "\n".join(errors),
+            )
 
 class WhisperGUI(QMainWindow):
     def __init__(self):
@@ -1396,6 +1499,30 @@ class WhisperGUI(QMainWindow):
         self.tooltips_checkbox.setToolTip("Toggle help tooltips throughout the app.")
         self.tooltips_checkbox.setChecked(True)
         scroll_layout.addRow(self.tooltips_checkbox)
+        self.auto_convert_transformers_checkbox = QCheckBox(
+            "Auto-convert Transformers models (downloads converter bundle)"
+        )
+        self.auto_convert_transformers_checkbox.setObjectName("auto_convert_transformers_checkbox")
+        self.auto_convert_transformers_checkbox.setToolTip(
+            "When a model repo only has Transformers weights (model.safetensors / pytorch_model.bin), "
+            "automatically convert it to CTranslate2 (model.bin)."
+        )
+        self.auto_convert_transformers_checkbox.setChecked(False)
+        scroll_layout.addRow(self.auto_convert_transformers_checkbox)
+        self.converter_python_path_input = QLineEdit()
+        self.converter_python_path_input.setPlaceholderText("Optional: override converter Python")
+        self.converter_python_path_input.setToolTip(
+            "Use a specific Python for model conversion (e.g., your conda env python.exe). "
+            "Leave empty to use the current Python."
+        )
+        converter_browse = QPushButton("Browse")
+        converter_browse.setToolTip("Select a Python executable for conversion.")
+        converter_row = QHBoxLayout()
+        converter_row.addWidget(self.converter_python_path_input)
+        converter_row.addWidget(converter_browse)
+        scroll_layout.addRow("Converter Python:", converter_row)
+        converter_browse.clicked.connect(self.browse_converter_python)
+        self.converter_python_path_input.textChanged.connect(self.save_converter_python_path)
         self.word_timestamps_checkbox = QCheckBox("Word timestamps")
         self.word_timestamps_checkbox.setObjectName("word_timestamps_checkbox")
         self.word_timestamps_checkbox.setToolTip(
@@ -2824,6 +2951,8 @@ class WhisperGUI(QMainWindow):
                 self._models_registry_dirty = True
                 self.save_settings_to_file()
                 self._models_registry_dirty = False
+            if parent and hasattr(parent, "_load_table"):
+                parent._load_table()
             return
 
         self._verify_progress_dialog = progress
@@ -2869,6 +2998,8 @@ class WhisperGUI(QMainWindow):
                 self._models_registry_dirty = True
                 self.save_settings_to_file()
                 self._models_registry_dirty = False
+            if parent and hasattr(parent, "_load_table"):
+                parent._load_table()
             summary_lines = [f"{model_name}: {status}" for model_name, status, _detail in combined]
             summary_text = "\n".join(summary_lines).strip()
             if summary_text:
@@ -3040,6 +3171,43 @@ class WhisperGUI(QMainWindow):
                 "model_dir": model_path,
             }
         return None
+
+    def _should_auto_convert_transformers(self):
+        checkbox = getattr(self, "auto_convert_transformers_checkbox", None)
+        if checkbox is not None:
+            return bool(checkbox.isChecked())
+        checkbox_settings = self.settings.get("checkboxes", {})
+        return bool(checkbox_settings.get("auto_convert_transformers_checkbox", False))
+
+    def _maybe_convert_transformers_model(self, model_dir, parent=None):
+        if not model_dir:
+            return False
+        model_bin = os.path.join(model_dir, "model.bin")
+        if os.path.isfile(model_bin):
+            return True
+        weight_files = scan_transformers_weights(model_dir)
+        if not weight_files:
+            return False
+        if not confirm_transformers_conversion(
+            parent or self,
+            auto_convert=self._should_auto_convert_transformers(),
+            use_bundle=getattr(sys, "frozen", False),
+        ):
+            return False
+        use_bundle = getattr(sys, "frozen", False)
+        success, message = run_transformers_conversion_dialog(
+            parent or self,
+            model_dir,
+            use_bundle=use_bundle,
+        )
+        if not success:
+            QMessageBox.warning(
+                parent or self,
+                "Conversion Failed",
+                message or "Model conversion failed.",
+            )
+            return False
+        return os.path.isfile(model_bin)
 
     def _get_current_model_arch_info(self):
         info = {
@@ -3341,6 +3509,15 @@ class WhisperGUI(QMainWindow):
 
             runtimes = enumerate_python_runtimes()
             info_lines.append("")
+            bundle_dir = get_converter_bundle_dir()
+            bundle_python = get_converter_python_path(bundle_dir)
+            info_lines.append("Converter Bundle:")
+            info_lines.append(f"• Bundle Directory: {format_path_for_display(bundle_dir)}")
+            if bundle_python:
+                info_lines.append(f"• Python: {format_path_for_display(bundle_python)}")
+            else:
+                info_lines.append("• Python: Not found (bundle not installed)")
+            info_lines.append("")
             info_lines.append("Detected Python Interpreters:")
             if runtimes:
                 for runtime in runtimes:
@@ -3538,6 +3715,17 @@ class WhisperGUI(QMainWindow):
         self.settings["initial_prompt"] = self.initial_prompt.toPlainText()
         self.save_settings_to_file()
 
+    def save_converter_python_path(self):
+        converter_path = ""
+        if getattr(self, "converter_python_path_input", None):
+            converter_path = self.converter_python_path_input.text().strip()
+        self.settings["converter_python_path"] = converter_path
+        if converter_path:
+            os.environ["FWHISPER_CONVERTER_PYTHON"] = converter_path
+        else:
+            os.environ.pop("FWHISPER_CONVERTER_PYTHON", None)
+        self.save_settings_to_file()
+
     def save_checkbox_setting(self):
         """Save checkbox settings immediately"""
         checkbox_settings = {cb.objectName(): cb.isChecked() for cb in self.findChildren(QCheckBox) if cb.objectName()}
@@ -3606,6 +3794,24 @@ class WhisperGUI(QMainWindow):
             self.file_list.addItem(normalized)
             existing.add(normalized)
         self.update_file_count_label()
+
+    def browse_converter_python(self):
+        start_dir = ""
+        current = self.converter_python_path_input.text().strip()
+        if current and os.path.isdir(current):
+            start_dir = current
+        elif current and os.path.isfile(current):
+            start_dir = os.path.dirname(current)
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Python Executable",
+            start_dir,
+            "Python Executable (python.exe);;All Files (*.*)"
+        )
+        if not path:
+            return
+        self.converter_python_path_input.setText(path)
+        self.save_converter_python_path()
 
     def _extract_links(self, text):
         if not text:
@@ -4247,9 +4453,15 @@ class WhisperGUI(QMainWindow):
                 parent=self,
                 repo_id=repo_id,
                 download_all_files=True,
+                auto_convert_transformers=self._should_auto_convert_transformers(),
             )
         else:
-            dialog = ModelDownloadDialog(model_name, target_dir, parent=self)
+            dialog = ModelDownloadDialog(
+                model_name,
+                target_dir,
+                parent=self,
+                auto_convert_transformers=self._should_auto_convert_transformers(),
+            )
         result = dialog.exec()
         logging.info(
             "ensure_model_available: dialog #%s result=%s",
@@ -5202,6 +5414,11 @@ class WhisperGUI(QMainWindow):
         self.settings["patience"] = self.patience.value()
         self.settings["initial_prompt"] = self.initial_prompt.toPlainText()
         self.settings["extra_cli_args"] = self.extra_cli_args.toPlainText()
+        self.settings["converter_python_path"] = (
+            self.converter_python_path_input.text().strip()
+            if getattr(self, "converter_python_path_input", None)
+            else ""
+        )
         self.settings["audio_preprocess_enabled"] = self.audio_preprocess_enable.isChecked()
         self.settings["audio_gain_db"] = self.audio_gain.value()
         self.settings["audio_normalize_enabled"] = self.audio_normalize.isChecked()
@@ -5302,6 +5519,13 @@ class WhisperGUI(QMainWindow):
         self.patience.setValue(self.settings.get("patience", 1.0))
         self.initial_prompt.setPlainText(self.settings.get("initial_prompt", ""))
         self.extra_cli_args.setPlainText(self.settings.get("extra_cli_args", ""))
+        converter_path = self.settings.get("converter_python_path", "")
+        if getattr(self, "converter_python_path_input", None):
+            self.converter_python_path_input.setText(converter_path)
+        if converter_path:
+            os.environ["FWHISPER_CONVERTER_PYTHON"] = converter_path
+        else:
+            os.environ.pop("FWHISPER_CONVERTER_PYTHON", None)
         self.audio_gain.setValue(self.settings.get("audio_gain_db", 0.0))
         self.audio_lufs_target.setValue(self.settings.get("audio_lufs_target", -16.0))
         self.audio_true_peak.setValue(self.settings.get("audio_true_peak_db", -1.5))

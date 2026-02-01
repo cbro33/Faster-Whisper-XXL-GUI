@@ -3,12 +3,15 @@ import logging
 import subprocess
 import threading
 import json
+from collections import deque
 import re
 import time
 import queue
 import sys
+import shutil
 from PyQt6.QtCore import pyqtSignal, QThread
 from utils import popen_hidden_subprocess, resolve_ffmpeg_location, run_hidden_subprocess
+from converter_utils import ensure_converter_bundle, get_fallback_python, scan_transformers_weights
 import ytdlp_utils
 from ytdlp_utils import log_ytdlp_update_debug
 from python_utils import refresh_python_detection_cache
@@ -880,3 +883,295 @@ class YtDlpUpdateWorker(QThread):
                     self.current_process.kill()
                 except Exception:
                     pass
+
+
+class ModelConversionWorker(QThread):
+    progress = pyqtSignal(str)
+    progress_stats = pyqtSignal(str, int)
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, model_dir, use_bundle=False, parent=None):
+        super().__init__(parent)
+        self.model_dir = model_dir
+        self.use_bundle = use_bundle
+        self.stop_requested = False
+        self.current_process = None
+        self._last_percent = None
+        self._stdout_tail = deque(maxlen=12)
+        self._stderr_tail = deque(maxlen=12)
+        self._last_metric_time = None
+        self._last_output_size = 0
+        self._total_input_bytes = 0
+
+    def stop(self):
+        self.stop_requested = True
+        if self.current_process and self.current_process.poll() is None:
+            try:
+                self.current_process.terminate()
+            except Exception:
+                try:
+                    self.current_process.kill()
+                except Exception:
+                    pass
+
+    def _is_cancelled(self):
+        return self.stop_requested
+
+    def _bundle_progress(self, message, downloaded, total):
+        if self.stop_requested:
+            return
+        if total and downloaded:
+            percent = int((downloaded / total) * 100)
+            if percent != self._last_percent:
+                self._last_percent = percent
+                self.progress.emit(f"{message} ({percent}%)")
+        else:
+            self.progress.emit(message)
+
+    def _run_command(self, command):
+        if not command:
+            return False, "Missing conversion command."
+        try:
+            self.current_process = popen_hidden_subprocess(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                env=self._build_subprocess_env()
+            )
+            def _stream(pipe, target, label):
+                if pipe is None:
+                    return
+                try:
+                    for line in iter(pipe.readline, ""):
+                        if not line:
+                            break
+                        cleaned = line.strip()
+                        if cleaned:
+                            target.append(cleaned)
+                            self.progress.emit(f"{label}: {cleaned}")
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
+
+            stdout_thread = threading.Thread(
+                target=_stream,
+                args=(self.current_process.stdout, self._stdout_tail, "converter"),
+                daemon=True
+            )
+            stderr_thread = threading.Thread(
+                target=_stream,
+                args=(self.current_process.stderr, self._stderr_tail, "converter"),
+                daemon=True
+            )
+            stdout_thread.start()
+            stderr_thread.start()
+
+            while True:
+                if self.stop_requested:
+                    self.current_process.terminate()
+                    return False, "Conversion cancelled by user."
+                self._emit_progress_metrics()
+                return_code = self.current_process.poll()
+                if return_code is not None:
+                    break
+                time.sleep(0.2)
+            stdout_thread.join(timeout=1)
+            stderr_thread.join(timeout=1)
+        except FileNotFoundError as exc:
+            return False, f"Converter executable not found: {exc}"
+        except Exception as exc:
+            return False, str(exc)
+        finally:
+            self.current_process = None
+
+        if return_code != 0:
+            snippet = list(self._stderr_tail) or list(self._stdout_tail)
+            tail = "\n".join(snippet[-12:]) if snippet else "Conversion failed."
+            return False, tail
+        return True, ""
+
+    def _build_subprocess_env(self):
+        env = os.environ.copy()
+        for key in ("PYTHONHOME", "PYTHONPATH"):
+            env.pop(key, None)
+        return env
+
+    def _emit_progress_metrics(self):
+        if not self._total_input_bytes:
+            return
+        output_dir = os.path.join(self.model_dir, "_ct2_conversion")
+        if not os.path.isdir(output_dir):
+            return
+        now = time.time()
+        if self._last_metric_time and now - self._last_metric_time < 0.8:
+            return
+        output_size = 0
+        try:
+            for root, _, files in os.walk(output_dir):
+                for filename in files:
+                    path = os.path.join(root, filename)
+                    try:
+                        output_size += os.path.getsize(path)
+                    except Exception:
+                        continue
+        except Exception:
+            return
+
+        percent = int((output_size / self._total_input_bytes) * 100)
+        if percent < 0:
+            percent = 0
+        if percent > 95:
+            percent = 95
+        eta_text = ""
+        if self._last_metric_time:
+            dt = now - self._last_metric_time
+            delta = output_size - self._last_output_size
+            if dt > 0 and delta > 0:
+                rate = delta / dt
+                remaining = max(self._total_input_bytes - output_size, 0)
+                eta_seconds = int(remaining / rate) if rate > 0 else 0
+                if eta_seconds > 0:
+                    minutes = eta_seconds // 60
+                    seconds = eta_seconds % 60
+                    if minutes:
+                        eta_text = f" • ETA {minutes}m {seconds:02d}s"
+                    else:
+                        eta_text = f" • ETA {seconds}s"
+        self._last_metric_time = now
+        self._last_output_size = output_size
+        message = f"Converting model... {percent}%{eta_text}"
+        self.progress_stats.emit(message, percent)
+
+    def _check_python_deps(self, python_path):
+        if not python_path:
+            return False, "Python interpreter not found."
+        cmd = [
+            python_path,
+            "-c",
+            "import ctranslate2, transformers, torch, safetensors"
+        ]
+        try:
+            result = run_hidden_subprocess(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=20,
+                env=self._build_subprocess_env(),
+            )
+        except Exception as exc:
+            return False, f"Failed to probe Python dependencies: {exc}"
+        if result.returncode == 0:
+            return True, ""
+        stderr = (result.stderr or result.stdout or "").strip()
+        env = os.environ.get("CONDA_DEFAULT_ENV")
+        if self.use_bundle:
+            base_hint = (
+                "The converter bundle is missing required packages.\n"
+                "Rebuild the bundle (Python 3.11 recommended) and re-upload it."
+            )
+            override_hint = ""
+        else:
+            base_hint = (
+                "Conda detected. Install deps in the active env:\n"
+                "  conda install -c conda-forge ctranslate2\n"
+                "  pip install transformers[torch] safetensors"
+            ) if env else (
+                "Install deps:\n"
+                "  pip install ctranslate2 transformers[torch] safetensors"
+            )
+            override_hint = (
+                "If deps are installed in another environment, set:\n"
+                "  FWHISPER_CONVERTER_PYTHON=<path to python.exe>\n"
+                "or configure it in Advanced Settings (Converter Python)."
+            )
+        detail = stderr or "Missing conversion dependencies."
+        if override_hint:
+            return False, f"{detail}\n\n{base_hint}\n\n{override_hint}"
+        return False, f"{detail}\n\n{base_hint}"
+
+    def run(self):
+        try:
+            if not self.model_dir or not os.path.isdir(self.model_dir):
+                self.finished.emit(False, "Model directory not found.")
+                return
+            model_bin = os.path.join(self.model_dir, "model.bin")
+            if os.path.isfile(model_bin):
+                self.finished.emit(True, "Model already converted.")
+                return
+
+            if self.use_bundle:
+                self.progress.emit("Preparing converter bundle...")
+                python_path = ensure_converter_bundle(
+                    progress_cb=self._bundle_progress,
+                    cancel_cb=self._is_cancelled
+                )
+            else:
+                python_path = get_fallback_python()
+
+            if not python_path or not os.path.isfile(python_path):
+                self.finished.emit(False, "Python interpreter not found.")
+                return
+            ok, detail = self._check_python_deps(python_path)
+            if not ok:
+                self.finished.emit(False, detail)
+                return
+
+            output_dir = os.path.join(self.model_dir, "_ct2_conversion")
+            if os.path.exists(output_dir):
+                shutil.rmtree(output_dir, ignore_errors=True)
+            os.makedirs(output_dir, exist_ok=True)
+
+            weight_files = scan_transformers_weights(self.model_dir)
+            if weight_files:
+                total = 0
+                for name in weight_files:
+                    path = os.path.join(self.model_dir, name)
+                    try:
+                        total += os.path.getsize(path)
+                    except Exception:
+                        continue
+                self._total_input_bytes = total
+                self._last_metric_time = time.time()
+                self._last_output_size = 0
+
+            self.progress.emit("Converting model (this can take a while)...")
+            command = [
+                python_path,
+                "-m",
+                "ctranslate2.converters.transformers",
+                "--model",
+                self.model_dir,
+                "--output_dir",
+                output_dir,
+                "--force",
+            ]
+            success, message = self._run_command(command)
+            if not success:
+                self.finished.emit(False, message)
+                return
+
+            self.progress.emit("Finalizing model files...")
+            for name in os.listdir(output_dir):
+                source_path = os.path.join(output_dir, name)
+                dest_path = os.path.join(self.model_dir, name)
+                if os.path.isdir(dest_path):
+                    shutil.rmtree(dest_path, ignore_errors=True)
+                elif os.path.exists(dest_path):
+                    os.remove(dest_path)
+                shutil.move(source_path, dest_path)
+            shutil.rmtree(output_dir, ignore_errors=True)
+
+            if not os.path.isfile(model_bin):
+                self.finished.emit(False, "Conversion finished but model.bin was not created.")
+                return
+
+            self.finished.emit(True, "Conversion complete.")
+        except Exception as exc:
+            logging.error(f"Model conversion failed: {exc}")
+            self.finished.emit(False, f"Conversion failed: {exc}")
