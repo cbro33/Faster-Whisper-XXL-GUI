@@ -9,6 +9,7 @@ Faster Whisper XXL GUI is a desktop interface for the Faster Whisper XXL transcr
 - File and YouTube transcription (audio-only or full video).
 - Automatic dependency setup (Faster Whisper XXL + FFmpeg).
 - Model/task/language controls plus VAD and audio options.
+- Model Manager with custom HF/local models and Transformers -> CT2 conversion.
 - Multiple output formats (SRT, VTT, JSON, TXT, etc.).
 - Light/Dark/AMOLED themes.
 - Persistent settings.
@@ -35,6 +36,10 @@ Faster Whisper XXL GUI is a desktop interface for the Faster Whisper XXL transcr
    cd Faster-Whisper-XXL-GUI
    pip install -r requirements.txt
    ```
+   If you want Transformers model conversion from source:
+   ```bash
+   pip install ctranslate2 transformers[torch] safetensors sentencepiece
+   ```
 3. Launch:
    ```bash
    python src/faster-whisper-xxl-gui.py
@@ -55,8 +60,19 @@ If extraction fails on Windows, install [7-Zip](https://www.7-zip.org/).
 
 1. Add files in the **File** tab or provide a URL in **yt-dlp**.
 2. Adjust settings in **Global Settings**, **Advanced**, **VAD**, or **Audio** tabs.
-3. Click **Run** and check the console output for progress.
-4. Outputs are saved to your chosen output directory (defaults to `output` in the app folder).
+3. Manage models in **Manage Models** (download, import, enable, verify).
+4. Click **Run** and check the console output for progress.
+5. Outputs are saved to your chosen output directory (defaults to `output` in the app folder).
+
+## Custom Models (HF + Local)
+
+Open **Manage Models** to add custom models from Hugging Face or import local CT2 folders.
+
+- HF repos with `model.bin` (CTranslate2) download directly.
+- HF repos with `model.safetensors` / `pytorch_model.bin` will prompt to convert to CT2.
+  - EXE: downloads a converter bundle (~250 MB) once.
+  - Source: uses your current Python environment (install deps above).
+- Advanced setting: **Converter Python** lets you point conversion at a specific Python (useful for conda).
 
 ## Docs
 

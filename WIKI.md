@@ -11,6 +11,8 @@ This document provides an in-depth explanation of all the settings and options a
     *   [yt-dlp Tab](#yt-dlp-tab)
 4.  [Global Settings](#4-global-settings)
     *   [Model](#model)
+    *   [Model Manager (Custom Models)](#model-manager-custom-models)
+    *   [Transformers -> CTranslate2 Conversion](#transformers---ctranslate2-conversion)
     *   [Task](#task)
     *   [Language](#language)
     *   [Compute Type](#compute-type)
@@ -22,6 +24,7 @@ This document provides an in-depth explanation of all the settings and options a
     *   [Best Of](#best-of)
     *   [Patience](#patience)
     *   [Initial Prompt](#initial-prompt)
+    *   [Extra CLI Args](#extra-cli-args)
     *   [Word Timestamps](#word-timestamps)
     *   [Without Timestamps](#without-timestamps)
     *   [Verbose](#verbose)
@@ -87,11 +90,32 @@ These settings apply broadly to the transcription process and are crucial for pe
 *   **Description:** Selects the Whisper model size to use for transcription. Larger models generally offer higher accuracy but require more computational resources (CPU/GPU and RAM/VRAM).
 *   **Options:** `tiny`, `base`, `small`, `medium`, `large`, `large-v2`, `large-v3`, `large-v3-turbo`.
 *   **Note:** `large-v3-turbo` uses a [community CTranslate2 conversion](https://huggingface.co/dropbox-dash/faster-whisper-large-v3-turbo). The official OpenAI repo is Transformers format and is not directly supported by the downloader.
-*   **Note:** The app only recognizes CTranslate2 model folders (look for a `model.bin` file). You can set the Model Directory to either the parent `_models` folder or a specific model folder.
+*   **Note:** The app recognizes CTranslate2 model folders (look for a `model.bin` file). You can set the Model Directory to either the parent `_models` folder or a specific model folder.
 *   **Recommendation:**
     *   **`tiny`, `base`:** Good for quick transcriptions or systems with limited resources (e.g., older CPUs, integrated graphics). Accuracy might be lower.
     *   **`small`, `medium`:** A good balance between speed and accuracy for most modern systems.
     *   **`large`, `large-v2`, `large-v3`:** Highest accuracy, but demand significant resources. Recommended for systems with dedicated GPUs (especially NVIDIA with CUDA) and ample VRAM (8GB+). `large-v3` is the latest and most accurate.
+
+### Model Manager (Custom Models)
+
+Use **Manage Models** to download, import, enable, verify, and delete custom models.
+
+*   **Add from HF:** Downloads all files in the repo and registers the model.
+    *   CTranslate2 repos (with `model.bin`) work directly.
+    *   Transformers repos (with `model.safetensors` / `pytorch_model.bin`) will prompt to convert to CT2.
+*   **Import Local:** Copies a local CT2 folder (must contain `model.bin`).
+*   **Verify Enabled:** Runs a quick backend check for enabled models and updates the Status column.
+*   **Delete Selected:** Available from the **More** menu (custom models only).
+
+### Transformers -> CTranslate2 Conversion
+
+When a repo only has Transformers weights, the app can convert it to CT2 automatically.
+
+*   **EXE build:** Downloads a converter bundle (~250 MB) on first use.
+*   **Source:** Uses your current Python environment. Install:
+    *   `ctranslate2`, `transformers[torch]`, `safetensors`, `sentencepiece`
+*   **Advanced Setting:** **Converter Python** lets you point conversions at a specific interpreter (useful for conda).
+*   **Auto-convert:** Optional toggle in Advanced Settings to skip the conversion prompt.
 
 ### Task
 
