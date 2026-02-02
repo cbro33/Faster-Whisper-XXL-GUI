@@ -169,7 +169,14 @@ def ensure_converter_bundle(progress_cb=None, cancel_cb=None):
         extract_dir = os.path.join(temp_dir, "extract")
         os.makedirs(extract_dir, exist_ok=True)
         with zipfile.ZipFile(zip_path, "r") as archive:
-            archive.extractall(extract_dir)
+            members = archive.infolist()
+            total_members = len(members)
+            for index, member in enumerate(members, start=1):
+                if cancel_cb and cancel_cb():
+                    raise RuntimeError("Converter extraction cancelled.")
+                archive.extract(member, extract_dir)
+                if progress_cb and total_members:
+                    progress_cb("Extracting converter bundle...", index, total_members)
 
         extracted_root = extract_dir
         entries = os.listdir(extract_dir)

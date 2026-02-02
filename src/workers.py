@@ -11,7 +11,7 @@ import sys
 import shutil
 from PyQt6.QtCore import pyqtSignal, QThread
 from utils import popen_hidden_subprocess, resolve_ffmpeg_location, run_hidden_subprocess
-from converter_utils import ensure_converter_bundle, get_fallback_python, scan_transformers_weights
+from converter_utils import ensure_converter_bundle, get_converter_bundle_dir, get_fallback_python, scan_transformers_weights
 import ytdlp_utils
 from ytdlp_utils import log_ytdlp_update_debug
 from python_utils import refresh_python_detection_cache
@@ -1022,6 +1022,10 @@ class ModelConversionWorker(QThread):
                         continue
         except Exception:
             return
+        if output_size <= 0:
+            self._last_metric_time = now
+            self.progress_stats.emit("Converting model...", -1)
+            return
 
         percent = int((output_size / self._total_input_bytes) * 100)
         if percent < 0:
@@ -1118,7 +1122,21 @@ class ModelConversionWorker(QThread):
                 self.finished.emit(False, "Python interpreter not found.")
                 return
             ok, detail = self._check_python_deps(python_path)
+            if not ok and self.use_bundle:
+                self.progress.emit("Converter bundle invalid. Re-downloading...")
+                bundle_dir = get_converter_bundle_dir()
+                if bundle_dir:
+                    shutil.rmtree(bundle_dir, ignore_errors=True)
+                python_path = ensure_converter_bundle(
+                    progress_cb=self._bundle_progress,
+                    cancel_cb=self._is_cancelled
+                )
+                ok, detail = self._check_python_deps(python_path)
             if not ok:
+                if self.use_bundle:
+                    bundle_dir = get_converter_bundle_dir()
+                    if bundle_dir:
+                        detail = f"{detail}\n\nBundle cache:\n  {bundle_dir}"
                 self.finished.emit(False, detail)
                 return
 
@@ -1171,7 +1189,7 @@ class ModelConversionWorker(QThread):
                 self.finished.emit(False, "Conversion finished but model.bin was not created.")
                 return
 
-            self.finished.emit(True, "Conversion complete.")
+            self.finished.emit(True, "Conversion completed successfully.")
         except Exception as exc:
             logging.error(f"Model conversion failed: {exc}")
             self.finished.emit(False, f"Conversion failed: {exc}")

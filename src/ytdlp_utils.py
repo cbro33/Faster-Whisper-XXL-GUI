@@ -20,6 +20,11 @@ from python_utils import (
 # Global cache for yt-dlp module to avoid repeated imports
 yt_dlp = None
 yt_dlp_source_override = None
+_YTDLP_DEBUG_ENABLED = False
+
+def set_ytdlp_debug_logging_enabled(enabled):
+    global _YTDLP_DEBUG_ENABLED
+    _YTDLP_DEBUG_ENABLED = bool(enabled)
 
 def get_ytdlp_debug_log_path():
     """Return path for yt-dlp update debug logging."""
@@ -30,6 +35,8 @@ def get_ytdlp_debug_log_path():
 
 def log_ytdlp_update_debug(message):
     """Append a debug entry for yt-dlp updates."""
+    if not _YTDLP_DEBUG_ENABLED:
+        return
     try:
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         log_path = get_ytdlp_debug_log_path()

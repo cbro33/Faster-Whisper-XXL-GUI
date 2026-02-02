@@ -40,7 +40,7 @@ from ytdlp_utils import (
     get_python_update_plan, should_check_ytdlp_update, record_ytdlp_update_success,
     record_ytdlp_update_failure, clear_ytdlp_update_failure, is_within_update_cooldown,
     get_ytdlp_installation_info, refresh_yt_dlp_module_after_update, remove_external_yt_dlp,
-    select_yt_dlp_source
+    select_yt_dlp_source, set_ytdlp_debug_logging_enabled
 )
 from workers import YouTubeDownloader, YtDlpUpdateWorker
 from gui_components import (
@@ -49,10 +49,11 @@ from gui_components import (
     show_setup_question, show_setup_warning, show_setup_information,
     show_yt_dlp_unavailable, ModelDownloadDialog, set_model_download_logging_enabled,
     get_model_download_log_path, get_model_download_logger,
-    confirm_transformers_conversion, run_transformers_conversion_dialog
+    confirm_transformers_conversion, run_transformers_conversion_dialog, ConverterProgressDialog
 )
 from gpu_utils import detect_hardware_capabilities
 from converter_utils import (
+    ensure_converter_bundle,
     scan_transformers_weights,
     get_converter_bundle_dir,
     get_converter_python_path,
@@ -87,6 +88,104 @@ class YtDlpVersionCheckWorker(QThread):
             result["error"] = str(exc)
         self.finished.emit(result)
 
+class ConverterBundleRepairWorker(QThread):
+    progress = pyqtSignal(str, int)
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.stop_requested = False
+
+    def stop(self):
+        self.stop_requested = True
+
+    def run(self):
+        try:
+            self.progress.emit("Clearing converter bundle cache...", -1)
+            bundle_dir = get_converter_bundle_dir()
+            if bundle_dir and os.path.isdir(bundle_dir):
+                shutil.rmtree(bundle_dir, ignore_errors=True)
+            if self.stop_requested:
+                self.finished.emit(False, "Repair cancelled.")
+                return
+
+            def progress_cb(message, downloaded, total):
+                if self.stop_requested:
+                    return
+                percent = -1
+                if total:
+                    try:
+                        percent = int((downloaded / total) * 100)
+                    except Exception:
+                        percent = -1
+                self.progress.emit(message, percent)
+
+            ensure_converter_bundle(progress_cb=progress_cb, cancel_cb=lambda: self.stop_requested)
+            if self.stop_requested:
+                self.finished.emit(False, "Repair cancelled.")
+            else:
+                self.finished.emit(True, "Converter bundle repaired.")
+        except Exception as exc:
+            if self.stop_requested:
+                self.finished.emit(False, "Repair cancelled.")
+            else:
+                self.finished.emit(False, str(exc))
+
+class ConverterBundleVerifyWorker(QThread):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.stop_requested = False
+
+    def stop(self):
+        self.stop_requested = True
+
+    def _build_env(self):
+        env = os.environ.copy()
+        for key in ("PYTHONHOME", "PYTHONPATH"):
+            env.pop(key, None)
+        return env
+
+    def run(self):
+        try:
+            bundle_dir = get_converter_bundle_dir()
+            python_path = get_converter_python_path(bundle_dir)
+            if not python_path or not os.path.isfile(python_path):
+                self.finished.emit(False, "Converter bundle not installed.")
+                return
+            self.progress.emit("Verifying converter bundle...")
+            result = run_hidden_subprocess(
+                [
+                    python_path,
+                    "-c",
+                    (
+                        "import ctranslate2, transformers, torch, safetensors;"
+                        "import ctranslate2.converters.transformers;"
+                        "print('ctranslate2', ctranslate2.__version__);"
+                        "print('transformers', transformers.__version__);"
+                        "print('torch', torch.__version__);"
+                        "print('safetensors', safetensors.__version__)"
+                    )
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                env=self._build_env(),
+            )
+            if result.returncode == 0:
+                self.finished.emit(True, "Converter bundle is ready.")
+            else:
+                detail = (result.stderr or result.stdout or "").strip()
+                if not detail:
+                    detail = "Missing required packages."
+                self.finished.emit(False, detail)
+        except Exception as exc:
+            if self.stop_requested:
+                self.finished.emit(False, "Verification cancelled.")
+            else:
+                self.finished.emit(False, str(exc))
 class LoudnessAnalysisWorker(QThread):
     progress = pyqtSignal(int, int, str)
     finished = pyqtSignal(object, object, bool)
@@ -322,7 +421,7 @@ class ModelManagerDialog(QDialog):
         self._loading_table = False
         self.setWindowTitle("Manage Models")
         self.setModal(True)
-        self.setMinimumSize(720, 420)
+        self.setMinimumSize(720, 720)
 
         layout = QVBoxLayout(self)
         info_label = QLabel(
@@ -331,6 +430,53 @@ class ModelManagerDialog(QDialog):
         )
         info_label.setWordWrap(True)
         layout.addWidget(info_label)
+
+        conversion_group = QGroupBox("Conversion Settings")
+        conversion_layout = QFormLayout(conversion_group)
+        self.auto_convert_checkbox = QCheckBox("Auto-convert Transformers models")
+        self.auto_convert_checkbox.setToolTip(
+            "When a model repo only has Transformers weights (model.safetensors / pytorch_model.bin), "
+            "automatically convert it to CTranslate2 (model.bin)."
+        )
+        conversion_layout.addRow(self.auto_convert_checkbox)
+
+        self.converter_python_path_input = QLineEdit()
+        self.converter_python_path_input.setPlaceholderText("Optional: override converter Python")
+        self.converter_python_path_input.setToolTip(
+            "Use a specific Python for model conversion (e.g., your conda env python.exe). "
+            "Leave empty to use the current Python."
+        )
+        self.converter_pick_button = QToolButton()
+        self.converter_pick_button.setText("Detect ▾")
+        self.converter_pick_button.setToolTip("Select from detected Python installations.")
+        self.converter_pick_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.converter_pick_menu = QMenu(self.converter_pick_button)
+        self.converter_pick_button.setMenu(self.converter_pick_menu)
+        self.converter_pick_button.setStyleSheet(
+            "QToolButton { padding-right: 6px; }"
+            "QToolButton::menu-indicator { image: none; width: 0px; }"
+        )
+        converter_browse = QPushButton("Browse")
+        converter_browse.setToolTip("Select a Python executable for conversion.")
+        self.converter_python_row_widget = QWidget()
+        converter_row = QHBoxLayout(self.converter_python_row_widget)
+        converter_row.setContentsMargins(0, 0, 0, 0)
+        converter_row.addWidget(self.converter_python_path_input)
+        converter_row.addWidget(self.converter_pick_button)
+        converter_row.addWidget(converter_browse)
+        self.converter_python_label = QLabel("Converter Python:")
+        conversion_layout.addRow(self.converter_python_label, self.converter_python_row_widget)
+
+        self.verify_bundle_button = QPushButton("Verify Bundle")
+        self.verify_bundle_button.setToolTip("Check if the converter bundle is healthy.")
+        self.repair_bundle_button = QPushButton("Repair Bundle")
+        self.repair_bundle_button.setToolTip("Delete and re-download the converter bundle.")
+        bundle_row = QHBoxLayout()
+        bundle_row.addWidget(self.verify_bundle_button)
+        bundle_row.addWidget(self.repair_bundle_button)
+        bundle_row.addStretch()
+        conversion_layout.addRow("Converter Bundle:", bundle_row)
+        layout.addWidget(conversion_group)
 
         self.table = QTableWidget(self)
         self.table.setColumnCount(5)
@@ -354,7 +500,7 @@ class ModelManagerDialog(QDialog):
         self.refresh_button = QPushButton("Rescan")
         self.verify_button = QPushButton("Verify Enabled")
         self.more_button = QToolButton()
-        self.more_button.setText("More")
+        self.more_button.setText("More ▾")
         self.more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         more_menu = QMenu(self.more_button)
         self.enable_all_action = more_menu.addAction("Enable All")
@@ -362,6 +508,10 @@ class ModelManagerDialog(QDialog):
         more_menu.addSeparator()
         self.delete_selected_action = more_menu.addAction("Delete Selected...")
         self.more_button.setMenu(more_menu)
+        self.more_button.setStyleSheet(
+            "QToolButton { padding-right: 6px; }"
+            "QToolButton::menu-indicator { image: none; width: 0px; }"
+        )
         self.close_button = QPushButton("Close")
         button_row.addWidget(self.add_hf_button)
         button_row.addWidget(self.import_button)
@@ -380,8 +530,32 @@ class ModelManagerDialog(QDialog):
         self.delete_selected_action.triggered.connect(self._delete_selected_models)
         self.verify_button.clicked.connect(self._verify_selected_model)
         self.close_button.clicked.connect(self.accept)
+        self.auto_convert_checkbox.toggled.connect(self._save_auto_convert_setting)
+        self.converter_python_path_input.textChanged.connect(self._save_converter_python_path)
+        self.converter_pick_menu.aboutToShow.connect(self._populate_converter_python_menu)
+        self.converter_pick_menu.triggered.connect(self._select_converter_python_action)
+        converter_browse.clicked.connect(self._browse_converter_python)
+        if getattr(sys, "frozen", False):
+            self.converter_python_row_widget.setVisible(False)
+            self.converter_python_label.setVisible(False)
+            self.converter_python_hint = QLabel(
+                "EXE builds use the converter bundle by default."
+            )
+            self.converter_python_hint.setWordWrap(True)
+            self.converter_python_hint.setStyleSheet("color: #a0a0a0; font-size: 12px;")
+            self.converter_python_link = QPushButton("Use custom Python anyway...")
+            self.converter_python_link.setFlat(True)
+            self.converter_python_link.setStyleSheet(
+                "QPushButton { color: #4da3ff; text-decoration: underline; border: none; padding: 0; }"
+            )
+            conversion_layout.addRow(self.converter_python_hint)
+            conversion_layout.addRow(self.converter_python_link)
+            self.converter_python_link.clicked.connect(self._show_converter_python_row)
+        self.verify_bundle_button.clicked.connect(self.parent.verify_converter_bundle)
+        self.repair_bundle_button.clicked.connect(self.parent.repair_converter_bundle)
 
         self._load_table()
+        self._load_conversion_settings()
         QTimer.singleShot(0, self._clear_table_focus)
 
     def _clear_table_focus(self):
@@ -389,6 +563,97 @@ class ModelManagerDialog(QDialog):
         self.table.clearSelection()
         if self.close_button:
             self.close_button.setFocus()
+
+    def _load_conversion_settings(self):
+        checkbox_settings = self.parent.settings.get("checkboxes", {})
+        auto_convert = bool(checkbox_settings.get("auto_convert_transformers_checkbox", False))
+        self.auto_convert_checkbox.blockSignals(True)
+        self.auto_convert_checkbox.setChecked(auto_convert)
+        self.auto_convert_checkbox.blockSignals(False)
+
+        converter_path = self.parent.settings.get("converter_python_path", "")
+        self.converter_python_path_input.blockSignals(True)
+        self.converter_python_path_input.setText(converter_path)
+        self.converter_python_path_input.blockSignals(False)
+
+    def _save_auto_convert_setting(self, checked):
+        checkbox_settings = dict(self.parent.settings.get("checkboxes", {}))
+        checkbox_settings["auto_convert_transformers_checkbox"] = bool(checked)
+        self.parent.settings["checkboxes"] = checkbox_settings
+        self.parent.save_settings_to_file()
+
+    def _save_converter_python_path(self):
+        converter_path = self.converter_python_path_input.text().strip()
+        self.parent.settings["converter_python_path"] = converter_path
+        if converter_path:
+            os.environ["FWHISPER_CONVERTER_PYTHON"] = converter_path
+        else:
+            os.environ.pop("FWHISPER_CONVERTER_PYTHON", None)
+        self.parent.save_settings_to_file()
+
+    def _browse_converter_python(self):
+        start_dir = ""
+        current = self.converter_python_path_input.text().strip()
+        if current and os.path.isdir(current):
+            start_dir = current
+        elif current and os.path.isfile(current):
+            start_dir = os.path.dirname(current)
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Python Executable",
+            start_dir,
+            "Python Executable (python.exe);;All Files (*.*)"
+        )
+        if not path:
+            return
+        self.converter_python_path_input.setText(path)
+        self._save_converter_python_path()
+
+    def _show_converter_python_row(self):
+        if getattr(self, "converter_python_row_widget", None):
+            self.converter_python_row_widget.setVisible(True)
+        if getattr(self, "converter_python_label", None):
+            self.converter_python_label.setVisible(True)
+        if getattr(self, "converter_python_hint", None):
+            self.converter_python_hint.setVisible(False)
+        if getattr(self, "converter_python_link", None):
+            self.converter_python_link.setVisible(False)
+
+    def _populate_converter_python_menu(self):
+        self.converter_pick_menu.clear()
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            runtimes = enumerate_python_runtimes()
+        finally:
+            QApplication.restoreOverrideCursor()
+        items = []
+        for runtime in runtimes:
+            exe = runtime.get("executable")
+            version = runtime.get("version") or "unknown"
+            if not exe:
+                continue
+            label = f"Python {version} - {exe}"
+            if getattr(sys, "frozen", False):
+                try:
+                    if os.path.abspath(exe) == os.path.abspath(sys.executable):
+                        label = f"Bundled (EXE) - Python {version} - {exe}"
+                except Exception:
+                    pass
+            items.append((label, exe))
+        if not items:
+            action = self.converter_pick_menu.addAction("No Python installations found")
+            action.setEnabled(False)
+            return
+        for label, exe in items:
+            action = self.converter_pick_menu.addAction(label)
+            action.setData(exe)
+
+    def _select_converter_python_action(self, action):
+        path = action.data()
+        if not path:
+            return
+        self.converter_python_path_input.setText(str(path))
+        self._save_converter_python_path()
 
     def _sorted_entries(self):
         priority = {
@@ -506,26 +771,138 @@ class ModelManagerDialog(QDialog):
         if not model_name:
             QMessageBox.warning(self, "Invalid Name", "Please provide a valid model name.")
             return
-        if self.parent._find_model_entry(model_name):
-            QMessageBox.warning(
-                self,
-                "Duplicate Model",
-                f"A model named '{model_name}' already exists.",
-            )
-            return
         _, base_local = self.parent.get_model_dirs()
         if not base_local:
             QMessageBox.warning(self, "Model Directory", "Model directory is not available yet.")
             return
         custom_root = os.path.join(base_local, "custom")
         target_dir = os.path.join(custom_root, self.parent._get_model_folder_name(model_name))
+        existing_entry = self.parent._find_model_entry(model_name)
+        if existing_entry:
+            folder_exists = os.path.isdir(target_dir)
+            has_model_bin = folder_exists and os.path.isfile(os.path.join(target_dir, "model.bin"))
+            has_weights = folder_exists and bool(scan_transformers_weights(target_dir))
+            dialog = QMessageBox(self)
+            dialog.setWindowTitle("Model Already Exists")
+            dialog.setIcon(QMessageBox.Icon.Warning)
+            if has_model_bin:
+                dialog.setText(
+                    "A model with this name already exists and contains model.bin:\n"
+                    f"{target_dir}"
+                )
+                dialog.setInformativeText(
+                    "Replace the folder to re-download a clean copy."
+                )
+            elif has_weights:
+                dialog.setText(
+                    "A model with this name already exists, but it still needs conversion:\n"
+                    f"{target_dir}"
+                )
+                dialog.setInformativeText(
+                    "Convert the existing files now, or replace the folder to re-download."
+                )
+            else:
+                dialog.setText(
+                    "A model with this name already exists, but the folder looks incomplete:\n"
+                    f"{target_dir}"
+                )
+                dialog.setInformativeText(
+                    "Replace the folder to download a clean copy."
+                )
+            convert_button = None
+            if has_weights and not has_model_bin:
+                convert_button = dialog.addButton("Convert existing files", QMessageBox.ButtonRole.ActionRole)
+            replace_button = dialog.addButton("Replace folder", QMessageBox.ButtonRole.DestructiveRole)
+            dialog.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            dialog.setDefaultButton(replace_button)
+            dialog.exec()
+            clicked = dialog.clickedButton()
+            if convert_button and clicked is convert_button:
+                self.parent._maybe_convert_transformers_model(target_dir, parent=self)
+                return
+            if clicked is replace_button:
+                registry = self.parent._get_models_registry()
+                registry[:] = [entry for entry in registry if entry.get("name") != model_name]
+                self.parent._models_registry_dirty = True
+                self.parent.save_settings_to_file()
+                if folder_exists:
+                    try:
+                        shutil.rmtree(target_dir)
+                    except Exception as exc:
+                        QMessageBox.warning(
+                            self,
+                            "Delete Failed",
+                            f"Could not delete existing folder:\n{exc}",
+                        )
+                        return
+            else:
+                return
         if os.path.exists(target_dir):
-            QMessageBox.warning(
-                self,
-                "Folder Exists",
-                f"The folder already exists:\n{target_dir}",
-            )
-            return
+            has_model_bin = os.path.isfile(os.path.join(target_dir, "model.bin"))
+            has_weights = bool(scan_transformers_weights(target_dir))
+            dialog = QMessageBox(self)
+            dialog.setWindowTitle("Folder Exists")
+            dialog.setIcon(QMessageBox.Icon.Warning)
+            if has_model_bin or has_weights:
+                dialog.setText(
+                    "A model folder already exists for this name:\n"
+                    f"{target_dir}"
+                )
+                dialog.setInformativeText(
+                    "Replace it to re-download a clean copy (recommended). "
+                    "Use existing only if you trust the current files."
+                )
+            else:
+                dialog.setText(
+                    "A model folder already exists, but it looks incomplete:\n"
+                    f"{target_dir}"
+                )
+                dialog.setInformativeText(
+                    "Replace it to download a clean copy."
+                )
+            use_button = None
+            if has_model_bin or has_weights:
+                use_button = dialog.addButton("Use existing files", QMessageBox.ButtonRole.ActionRole)
+            delete_button = dialog.addButton("Replace folder", QMessageBox.ButtonRole.DestructiveRole)
+            dialog.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            dialog.setDefaultButton(delete_button)
+            dialog.exec()
+            clicked = dialog.clickedButton()
+            if clicked is delete_button:
+                try:
+                    shutil.rmtree(target_dir)
+                except Exception as exc:
+                    QMessageBox.warning(
+                        self,
+                        "Delete Failed",
+                        f"Could not delete existing folder:\n{exc}",
+                    )
+                    return
+            elif use_button and clicked is use_button:
+                model_bin = os.path.join(target_dir, "model.bin")
+                if not os.path.isfile(model_bin) and not scan_transformers_weights(target_dir):
+                    QMessageBox.warning(
+                        self,
+                        "Invalid Model Folder",
+                        "No model.bin or Transformers weights were found in that folder.\n"
+                        "Please delete it and re-download.",
+                    )
+                    return
+                self.parent._get_models_registry().append({
+                    "name": model_name,
+                    "display_name": display_name,
+                    "source": "hf",
+                    "enabled": True,
+                    "root": "custom",
+                    "repo_id": repo_id,
+                })
+                self.parent._models_registry_dirty = True
+                self._load_table()
+                if not os.path.isfile(model_bin):
+                    self.parent._maybe_convert_transformers_model(target_dir, parent=self)
+                return
+            else:
+                return
         confirm = QMessageBox.question(
             self,
             "Download Model",
@@ -582,19 +959,72 @@ class ModelManagerDialog(QDialog):
         if not model_name:
             QMessageBox.warning(self, "Invalid Name", "Please provide a valid model name.")
             return
-        if self.parent._find_model_entry(model_name):
-            QMessageBox.warning(
-                self,
-                "Duplicate Model",
-                f"A model named '{model_name}' already exists.",
-            )
-            return
         _, base_local = self.parent.get_model_dirs()
         if not base_local:
             QMessageBox.warning(self, "Model Directory", "Model directory is not available yet.")
             return
         custom_root = os.path.join(base_local, "custom")
         target_dir = os.path.join(custom_root, self.parent._get_model_folder_name(model_name))
+        existing_entry = self.parent._find_model_entry(model_name)
+        if existing_entry:
+            folder_exists = os.path.isdir(target_dir)
+            has_model_bin = folder_exists and os.path.isfile(os.path.join(target_dir, "model.bin"))
+            has_weights = folder_exists and bool(scan_transformers_weights(target_dir))
+            dialog = QMessageBox(self)
+            dialog.setWindowTitle("Model Already Exists")
+            dialog.setIcon(QMessageBox.Icon.Warning)
+            if has_model_bin:
+                dialog.setText(
+                    "A model with this name already exists and contains model.bin:\n"
+                    f"{target_dir}"
+                )
+                dialog.setInformativeText(
+                    "Replace the folder to re-import a clean copy."
+                )
+            elif has_weights:
+                dialog.setText(
+                    "A model with this name already exists, but it still needs conversion:\n"
+                    f"{target_dir}"
+                )
+                dialog.setInformativeText(
+                    "Convert the existing files now, or replace the folder to re-import."
+                )
+            else:
+                dialog.setText(
+                    "A model with this name already exists, but the folder looks incomplete:\n"
+                    f"{target_dir}"
+                )
+                dialog.setInformativeText(
+                    "Replace the folder to import a clean copy."
+                )
+            convert_button = None
+            if has_weights and not has_model_bin:
+                convert_button = dialog.addButton("Convert existing files", QMessageBox.ButtonRole.ActionRole)
+            replace_button = dialog.addButton("Replace folder", QMessageBox.ButtonRole.DestructiveRole)
+            dialog.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
+            dialog.setDefaultButton(replace_button)
+            dialog.exec()
+            clicked = dialog.clickedButton()
+            if convert_button and clicked is convert_button:
+                self.parent._maybe_convert_transformers_model(target_dir, parent=self)
+                return
+            if clicked is replace_button:
+                registry = self.parent._get_models_registry()
+                registry[:] = [entry for entry in registry if entry.get("name") != model_name]
+                self.parent._models_registry_dirty = True
+                self.parent.save_settings_to_file()
+                if folder_exists:
+                    try:
+                        shutil.rmtree(target_dir)
+                    except Exception as exc:
+                        QMessageBox.warning(
+                            self,
+                            "Delete Failed",
+                            f"Could not delete existing folder:\n{exc}",
+                        )
+                        return
+            else:
+                return
         if os.path.exists(target_dir):
             QMessageBox.warning(
                 self,
@@ -833,6 +1263,7 @@ class WhisperGUI(QMainWindow):
         self.init_ui()
         self.load_settings()
         set_model_download_logging_enabled(self.settings.get("debug_model_download_logging", False))
+        set_ytdlp_debug_logging_enabled(self.settings.get("debug_model_download_logging", False))
         self.setup_realtime_saving()
         
         # Check for hardware optimization on first run
@@ -1499,30 +1930,6 @@ class WhisperGUI(QMainWindow):
         self.tooltips_checkbox.setToolTip("Toggle help tooltips throughout the app.")
         self.tooltips_checkbox.setChecked(True)
         scroll_layout.addRow(self.tooltips_checkbox)
-        self.auto_convert_transformers_checkbox = QCheckBox(
-            "Auto-convert Transformers models (downloads converter bundle)"
-        )
-        self.auto_convert_transformers_checkbox.setObjectName("auto_convert_transformers_checkbox")
-        self.auto_convert_transformers_checkbox.setToolTip(
-            "When a model repo only has Transformers weights (model.safetensors / pytorch_model.bin), "
-            "automatically convert it to CTranslate2 (model.bin)."
-        )
-        self.auto_convert_transformers_checkbox.setChecked(False)
-        scroll_layout.addRow(self.auto_convert_transformers_checkbox)
-        self.converter_python_path_input = QLineEdit()
-        self.converter_python_path_input.setPlaceholderText("Optional: override converter Python")
-        self.converter_python_path_input.setToolTip(
-            "Use a specific Python for model conversion (e.g., your conda env python.exe). "
-            "Leave empty to use the current Python."
-        )
-        converter_browse = QPushButton("Browse")
-        converter_browse.setToolTip("Select a Python executable for conversion.")
-        converter_row = QHBoxLayout()
-        converter_row.addWidget(self.converter_python_path_input)
-        converter_row.addWidget(converter_browse)
-        scroll_layout.addRow("Converter Python:", converter_row)
-        converter_browse.clicked.connect(self.browse_converter_python)
-        self.converter_python_path_input.textChanged.connect(self.save_converter_python_path)
         self.word_timestamps_checkbox = QCheckBox("Word timestamps")
         self.word_timestamps_checkbox.setObjectName("word_timestamps_checkbox")
         self.word_timestamps_checkbox.setToolTip(
@@ -3430,6 +3837,7 @@ class WhisperGUI(QMainWindow):
             self.settings["debug_model_download_logging"] = enabled
             self.save_settings_to_file()
             set_model_download_logging_enabled(enabled)
+            set_ytdlp_debug_logging_enabled(enabled)
 
         enabled_checkbox.toggled.connect(on_toggle)
 
@@ -3812,6 +4220,94 @@ class WhisperGUI(QMainWindow):
             return
         self.converter_python_path_input.setText(path)
         self.save_converter_python_path()
+
+    def repair_converter_bundle(self):
+        if getattr(self, "_converter_bundle_repair_in_progress", False):
+            QMessageBox.information(self, "Repair Converter Bundle", "A repair is already in progress.")
+            return
+        if not getattr(sys, "frozen", False):
+            reply = QMessageBox.question(
+                self,
+                "Repair Converter Bundle",
+                "This bundle is only required for the Windows EXE build.\n\n"
+                "Download a fresh converter bundle anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        reply = QMessageBox.question(
+            self,
+            "Repair Converter Bundle",
+            "This will delete the cached converter bundle and re-download it (~250 MB).\n\n"
+            "Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self._converter_bundle_repair_in_progress = True
+        dialog = ConverterProgressDialog(self)
+        dialog.setWindowTitle("Repairing Converter Bundle")
+        dialog.update_progress("Preparing converter bundle...")
+
+        worker = ConverterBundleRepairWorker(parent=dialog)
+        self._converter_bundle_worker = worker
+
+        def on_progress(message, percent):
+            cleaned = re.sub(r"\s*\(\d{1,3}%\)\s*$", "", (message or "")).strip()
+            lowered = cleaned.lower()
+            if "extracting converter bundle" in lowered or "preparing converter bundle" in lowered:
+                dialog.update_progress(cleaned, percent=-1)
+                return
+            if percent is not None and percent >= 0:
+                dialog.update_progress(cleaned, percent=percent)
+            else:
+                dialog.update_progress(cleaned, percent=-1)
+
+        def on_finished(success, message):
+            self._converter_bundle_repair_in_progress = False
+            dialog.set_completion_state(success, message if message else None)
+
+        worker.progress.connect(on_progress)
+        worker.finished.connect(on_finished)
+        dialog.rejected.connect(worker.stop)
+        worker.start()
+        dialog.exec()
+        if worker.isRunning():
+            worker.stop()
+            worker.wait(2000)
+
+    def verify_converter_bundle(self):
+        if getattr(self, "_converter_bundle_verify_in_progress", False):
+            QMessageBox.information(self, "Verify Converter Bundle", "A verification is already in progress.")
+            return
+
+        dialog = ConverterProgressDialog(self)
+        dialog.setWindowTitle("Verifying Converter Bundle")
+        dialog.update_progress("Preparing verification...")
+
+        self._converter_bundle_verify_in_progress = True
+        worker = ConverterBundleVerifyWorker(parent=dialog)
+        self._converter_bundle_verify_worker = worker
+
+        def on_progress(message):
+            dialog.update_progress(message)
+
+        def on_finished(success, message):
+            self._converter_bundle_verify_in_progress = False
+            dialog.set_completion_state(success, message if message else None)
+
+        worker.progress.connect(on_progress)
+        worker.finished.connect(on_finished)
+        dialog.rejected.connect(worker.stop)
+        worker.start()
+        dialog.exec()
+        if worker.isRunning():
+            worker.stop()
+            worker.wait(2000)
 
     def _extract_links(self, text):
         if not text:
@@ -5414,11 +5910,8 @@ class WhisperGUI(QMainWindow):
         self.settings["patience"] = self.patience.value()
         self.settings["initial_prompt"] = self.initial_prompt.toPlainText()
         self.settings["extra_cli_args"] = self.extra_cli_args.toPlainText()
-        self.settings["converter_python_path"] = (
-            self.converter_python_path_input.text().strip()
-            if getattr(self, "converter_python_path_input", None)
-            else ""
-        )
+        if getattr(self, "converter_python_path_input", None):
+            self.settings["converter_python_path"] = self.converter_python_path_input.text().strip()
         self.settings["audio_preprocess_enabled"] = self.audio_preprocess_enable.isChecked()
         self.settings["audio_gain_db"] = self.audio_gain.value()
         self.settings["audio_normalize_enabled"] = self.audio_normalize.isChecked()
@@ -5438,7 +5931,10 @@ class WhisperGUI(QMainWindow):
         self.settings["vad_threshold"] = self.vad_threshold.value()
         self.settings["vad_min_speech"] = self.vad_min_speech.value()
         
-        checkbox_settings = {cb.objectName(): cb.isChecked() for cb in self.findChildren(QCheckBox) if cb.objectName()}
+        checkbox_settings = dict(self.settings.get("checkboxes", {}))
+        checkbox_settings.update(
+            {cb.objectName(): cb.isChecked() for cb in self.findChildren(QCheckBox) if cb.objectName()}
+        )
         self.settings["checkboxes"] = checkbox_settings
 
         output_formats = [fmt for fmt, cb in self.output_format_checkboxes.items() if cb.isChecked()]

@@ -27,7 +27,7 @@ from PyQt6.QtGui import QDragEnterEvent, QDropEvent
 from utils import get_window_stays_on_top_flag, run_hidden_subprocess, get_app_directory
 from gpu_utils import detect_hardware_capabilities, get_recommended_settings
 from config import SUPPORTED_EXTENSIONS
-from converter_utils import find_transformers_weight_files
+from converter_utils import find_transformers_weight_files, get_converter_bundle_dir, get_converter_python_path
 from workers import ModelConversionWorker
 
 def create_always_on_top_message_box(parent, icon, title, text, buttons=None, default_button=None):
@@ -313,11 +313,13 @@ class ConverterProgressDialog(QDialog):
             except Exception:
                 percent_value = None
             if percent_value is not None:
+                if percent_value < 0:
+                    self.progress_bar.setRange(0, 0)
+                    self.status_label.setText(message)
+                    return
                 self.progress_bar.setRange(0, 100)
                 self.progress_bar.setValue(max(0, min(100, percent_value)))
         self.status_label.setText(message)
-        from PyQt6.QtCore import QCoreApplication
-        QCoreApplication.processEvents()
 
     def set_completion_state(self, success, message=None):
         self.progress_bar.setRange(0, 1)
@@ -332,18 +334,20 @@ class ConverterProgressDialog(QDialog):
 def confirm_transformers_conversion(parent, auto_convert=False, use_bundle=False):
     if auto_convert:
         return True
-    env_note = (
-        "This will download a converter bundle (~250 MB) and use it to convert the model."
-        if use_bundle
-        else "This will use your current Python environment to convert the model."
-    )
+    env_note = "This will use your current Python environment to convert the model."
+    if use_bundle:
+        bundle_ready = bool(get_converter_python_path(get_converter_bundle_dir()))
+        if bundle_ready:
+            env_note = "This will use the converter bundle already installed on this machine."
+        else:
+            env_note = "This will download a converter bundle (~250 MB) and use it to convert the model."
     text = (
         "This model contains Transformers weights (model.safetensors / pytorch_model.bin) "
         "but no model.bin file.\n\n"
         "Faster-Whisper-XXL requires a CTranslate2 model (model.bin). "
         "Convert this model now?\n\n"
         f"{env_note}\n\n"
-        "You can enable Auto-convert in Settings to skip this prompt."
+        "You can enable Auto-convert in Manage Models → Conversion Settings to skip this prompt."
     )
     reply = QMessageBox.question(
         parent,
@@ -361,7 +365,16 @@ def run_transformers_conversion_dialog(parent, model_dir, use_bundle=False):
     worker = ModelConversionWorker(model_dir, use_bundle=use_bundle, parent=dialog)
 
     def on_progress(message):
-        dialog.update_progress(message)
+        cleaned = re.sub(r"\s*\(\d{1,3}%\)\s*$", "", message).strip()
+        lowered = cleaned.lower()
+        if "extracting converter bundle" in lowered or "preparing converter bundle" in lowered:
+            dialog.update_progress(cleaned, percent=-1)
+            return
+        match = re.search(r"\((\d{1,3})%\)", message)
+        if match:
+            dialog.update_progress(cleaned, percent=int(match.group(1)))
+        else:
+            dialog.update_progress(cleaned)
 
     def on_progress_stats(message, percent):
         dialog.update_progress(message, percent=percent)
@@ -370,7 +383,6 @@ def run_transformers_conversion_dialog(parent, model_dir, use_bundle=False):
         result["ok"] = success
         result["message"] = message
         dialog.set_completion_state(success, message if message else None)
-        QTimer.singleShot(900, dialog.accept)
 
     worker.progress.connect(on_progress)
     worker.progress_stats.connect(on_progress_stats)
@@ -381,12 +393,6 @@ def run_transformers_conversion_dialog(parent, model_dir, use_bundle=False):
     if worker.isRunning():
         worker.stop()
         worker.wait(2000)
-    if result["ok"]:
-        QMessageBox.information(
-            parent,
-            "Conversion Complete",
-            "Model conversion finished successfully.",
-        )
     return result["ok"], result["message"]
 
 
@@ -1146,6 +1152,7 @@ class ModelDownloadDialog(QDialog):
                 if not self._conversion_allowed:
                     self.reject()
                     return
+                self.hide()
                 use_bundle = getattr(sys, "frozen", False)
                 success, message = run_transformers_conversion_dialog(
                     self, self.target_dir, use_bundle=use_bundle
