@@ -20,10 +20,10 @@ from PyQt6.QtWidgets import (
     QScrollArea, QFileDialog, QCompleter, QListWidget, QAbstractItemView,
     QSpacerItem, QMessageBox, QApplication, QGridLayout, QLineEdit, QDialog, QInputDialog,
     QTableWidget, QTableWidgetItem, QHeaderView, QProgressBar, QProgressDialog,
-    QMenu, QToolButton
+    QMenu, QToolButton, QDialogButtonBox, QStyle, QFrame, QToolTip, QToolBar
 )
 from PyQt6.QtCore import Qt, QTimer, QProcess, QProcessEnvironment, QByteArray, QUrl, QThread, pyqtSignal, QModelIndex
-from PyQt6.QtGui import QIcon, QPalette, QColor, QTextCursor, QFont, QDesktopServices, QFontMetrics
+from PyQt6.QtGui import QIcon, QPalette, QColor, QTextCursor, QFont, QDesktopServices, QFontMetrics, QAction
 
 from config import APP_VERSION, SUPPORTED_EXTENSIONS
 from utils import (
@@ -542,7 +542,7 @@ class ModelManagerDialog(QDialog):
                 "EXE builds use the converter bundle by default."
             )
             self.converter_python_hint.setWordWrap(True)
-            self.converter_python_hint.setStyleSheet("color: #a0a0a0; font-size: 12px;")
+            self.converter_python_hint.setStyleSheet("color: #a0a0a0;")
             self.converter_python_link = QPushButton("Use custom Python anyway...")
             self.converter_python_link.setFlat(True)
             self.converter_python_link.setStyleSheet(
@@ -1255,6 +1255,10 @@ class WhisperGUI(QMainWindow):
         self._custom_model_retry_attempted = False
         self._compute_type_override = None
         self._cpu_compute_override_applied = False
+        self._review_link_ready = False
+        self._last_review_output_dir = None
+        self._last_review_output_base = None
+        self._shown_ytdlp_403_hint = False
         
         if not self.check_and_setup_dependencies():
             QTimer.singleShot(0, self.close)
@@ -1337,10 +1341,11 @@ class WhisperGUI(QMainWindow):
 
     def init_ui(self):
         self.setWindowTitle(f"Faster Whisper XXL GUI v{APP_VERSION}")
+        QToolTip.setFont(QApplication.font())
         if getattr(sys, "frozen", False):
-            self.setGeometry(100, 100, 1303, 800)
+            self.setGeometry(100, 100, 1331, 880)
         else:
-            self.setGeometry(100, 100, 1500, 1000)
+            self.setGeometry(100, 100, 1331, 880)
         self.setMinimumSize(1250, 800)
 
         # Create menu bar
@@ -1405,7 +1410,13 @@ class WhisperGUI(QMainWindow):
         global_settings_layout = QFormLayout(global_settings_group)
         self.setup_global_settings(global_settings_layout)
         global_settings_group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        left_layout.addWidget(global_settings_group)
+        self.global_settings_scroll = QScrollArea()
+        self.global_settings_scroll.setWidgetResizable(True)
+        self.global_settings_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.global_settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.global_settings_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.global_settings_scroll.setWidget(global_settings_group)
+        left_layout.addWidget(self.global_settings_scroll)
 
         button_layout = self.create_button_layout()
         left_layout.addLayout(button_layout)
@@ -1497,9 +1508,9 @@ class WhisperGUI(QMainWindow):
         hint_row = QHBoxLayout()
         hint_row.setContentsMargins(0, 0, 0, 0)
         hint_label = QLabel("Drag & drop files or folders here.")
-        hint_label.setStyleSheet("color: #a0a0a0; font-size: 12px;")
+        hint_label.setStyleSheet("color: #a0a0a0;")
         self.file_count_label = QLabel("0 files")
-        self.file_count_label.setStyleSheet("color: #a0a0a0; font-size: 12px; font-weight: bold;")
+        self.file_count_label.setStyleSheet("color: #a0a0a0; font-weight: bold;")
         hint_row.addWidget(hint_label)
         hint_row.addStretch()
         hint_row.addWidget(self.file_count_label)
@@ -1511,8 +1522,8 @@ class WhisperGUI(QMainWindow):
         self.file_list.setDefaultDropAction(Qt.DropAction.CopyAction)
         self.file_list.setAcceptDrops(True)
         self.file_list.viewport().setAcceptDrops(True)
-        self.file_list.setMinimumHeight(80)
-        self.file_list.setMaximumHeight(90)
+        self.file_list.setMinimumHeight(92)
+        self.file_list.setMaximumHeight(104)
         self.file_list.setFrameShape(QListWidget.Shape.NoFrame)
         input_layout.addWidget(self.file_list)
 
@@ -1535,10 +1546,15 @@ class WhisperGUI(QMainWindow):
         layout.addRow(input_group)
 
     def setup_youtube_tab(self, tab):
-        layout = QFormLayout(tab)
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
         link_group = LinkDropGroupBox("Links", add_links_callback=self.add_input_links)
         link_layout = QVBoxLayout(link_group)
+        link_layout.setContentsMargins(8, 6, 8, 4)
+        link_layout.setSpacing(2)
         hint_row = QHBoxLayout()
+        hint_row.setContentsMargins(0, 0, 0, 0)
         hint_label = QLabel("Paste one link per line or drop URLs.")
         hint_label.setStyleSheet("color: gray;")
         self.link_count_label = QLabel("0 links")
@@ -1553,8 +1569,8 @@ class WhisperGUI(QMainWindow):
         self.link_list.setDefaultDropAction(Qt.DropAction.CopyAction)
         self.link_list.setAcceptDrops(True)
         self.link_list.viewport().setAcceptDrops(True)
-        self.link_list.setMinimumHeight(80)
-        self.link_list.setMaximumHeight(90)
+        self.link_list.setMinimumHeight(92)
+        self.link_list.setMaximumHeight(104)
         self.link_list.setFrameShape(QListWidget.Shape.NoFrame)
         link_layout.addWidget(self.link_list)
 
@@ -1572,21 +1588,28 @@ class WhisperGUI(QMainWindow):
         link_button_layout.addWidget(self.remove_link_btn)
         link_button_layout.addWidget(self.clear_links_btn)
         link_layout.addLayout(link_button_layout)
-        link_group.setMaximumHeight(190)
-        layout.addRow(link_group)
+        link_group.setFixedHeight(190)
+        layout.addWidget(link_group)
+
+        options_widget = QWidget()
+        options_layout = QVBoxLayout(options_widget)
+        options_layout.setContentsMargins(0, 6, 0, 0)
+        options_layout.setSpacing(2)
 
         self.audio_only_checkbox = QCheckBox("Audio Only (Download faster)")
         self.audio_only_checkbox.setChecked(True)
         self.audio_only_checkbox.setObjectName("audio_only_checkbox")
         self.audio_only_checkbox.setToolTip("Downloads audio only for faster processing.")
-        layout.addRow(self.audio_only_checkbox)
+        options_layout.addWidget(self.audio_only_checkbox)
         self.download_all_checkbox = QCheckBox("Download all before transcribing")
         self.download_all_checkbox.setChecked(False)
         self.download_all_checkbox.setToolTip(
             "When enabled, downloads all items first, then transcribes. "
             "When disabled, items are transcribed as soon as they finish downloading."
         )
-        layout.addRow(self.download_all_checkbox)
+        options_layout.addWidget(self.download_all_checkbox)
+        options_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        layout.addWidget(options_widget)
 
     def setup_overrides_tab(self, tab):
         scroll = QScrollArea()
@@ -1595,6 +1618,21 @@ class WhisperGUI(QMainWindow):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(10)
 
+        def _compact_path_button(text, tooltip=""):
+            button = QPushButton(text)
+            if tooltip:
+                button.setToolTip(tooltip)
+            button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            button.setMinimumHeight(28)
+            button.setMaximumHeight(32)
+            metrics = QFontMetrics(button.font())
+            width = metrics.horizontalAdvance(text) + 22
+            width = max(56, min(width, 100))
+            button.setMinimumWidth(width)
+            button.setMaximumWidth(width)
+            button.setStyleSheet("QPushButton { padding: 4px 8px; }")
+            return button
+
         core_group = QGroupBox("Core Paths")
         core_layout = QFormLayout(core_group)
         core_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
@@ -1602,12 +1640,13 @@ class WhisperGUI(QMainWindow):
 
         self.fw_exe_path = QLineEdit()
         self.fw_exe_path.setPlaceholderText("Optional override for faster-whisper-xxl executable")
-        fw_browse = QPushButton("Browse")
-        fw_clear = QPushButton("Clear")
-        fw_test = QPushButton("Test")
-        fw_find = QPushButton("Find PATH")
+        fw_browse = _compact_path_button("Browse", "Browse for executable")
+        fw_clear = _compact_path_button("Clear", "Clear override")
+        fw_test = _compact_path_button("Test", "Validate executable")
+        fw_find = _compact_path_button("Find", "Find from system PATH")
         fw_row = QHBoxLayout()
-        fw_row.addWidget(self.fw_exe_path)
+        fw_row.setSpacing(4)
+        fw_row.addWidget(self.fw_exe_path, 1)
         fw_row.addWidget(fw_browse)
         fw_row.addWidget(fw_clear)
         fw_row.addWidget(fw_test)
@@ -1620,11 +1659,12 @@ class WhisperGUI(QMainWindow):
             "CT2 models are supported (requires model.bin). The test view can also flag "
             "Transformers models for troubleshooting."
         )
-        model_browse = QPushButton("Browse")
-        model_clear = QPushButton("Clear")
-        model_test = QPushButton("Test")
+        model_browse = _compact_path_button("Browse", "Browse for model directory")
+        model_clear = _compact_path_button("Clear", "Clear override")
+        model_test = _compact_path_button("Test", "Validate model directory")
         model_row = QHBoxLayout()
-        model_row.addWidget(self.model_dir_path)
+        model_row.setSpacing(4)
+        model_row.addWidget(self.model_dir_path, 1)
         model_row.addWidget(model_browse)
         model_row.addWidget(model_clear)
         model_row.addWidget(model_test)
@@ -1648,7 +1688,7 @@ class WhisperGUI(QMainWindow):
             else "Uses bundled Python module."
         )
         ytdlp_hint = QLabel(bundled_label)
-        ytdlp_hint.setStyleSheet("color: #a0a0a0; font-size: 12px;")
+        ytdlp_hint.setStyleSheet("color: #a0a0a0;")
         ytdlp_hint.setWordWrap(True)
         ytdlp_layout.addRow(ytdlp_hint)
         self.ytdlp_source_combo = QComboBox()
@@ -1659,12 +1699,13 @@ class WhisperGUI(QMainWindow):
 
         self.ytdlp_exe_path = QLineEdit()
         self.ytdlp_exe_path.setPlaceholderText("Optional override for yt-dlp.exe (manual use)")
-        ytdlp_browse = QPushButton("Browse")
-        ytdlp_clear = QPushButton("Clear")
-        ytdlp_test = QPushButton("Test")
-        ytdlp_find = QPushButton("Find PATH")
+        ytdlp_browse = _compact_path_button("Browse", "Browse for yt-dlp executable")
+        ytdlp_clear = _compact_path_button("Clear", "Clear override")
+        ytdlp_test = _compact_path_button("Test", "Validate yt-dlp executable")
+        ytdlp_find = _compact_path_button("Find", "Find from system PATH")
         ytdlp_row = QHBoxLayout()
-        ytdlp_row.addWidget(self.ytdlp_exe_path)
+        ytdlp_row.setSpacing(4)
+        ytdlp_row.addWidget(self.ytdlp_exe_path, 1)
         ytdlp_row.addWidget(ytdlp_browse)
         ytdlp_row.addWidget(ytdlp_clear)
         ytdlp_row.addWidget(ytdlp_test)
@@ -1680,12 +1721,13 @@ class WhisperGUI(QMainWindow):
 
         self.ffmpeg_path_input = QLineEdit()
         self.ffmpeg_path_input.setPlaceholderText("Optional override for ffmpeg executable")
-        ffmpeg_browse = QPushButton("Browse")
-        ffmpeg_clear = QPushButton("Clear")
-        ffmpeg_test = QPushButton("Test")
-        ffmpeg_find = QPushButton("Find PATH")
+        ffmpeg_browse = _compact_path_button("Browse", "Browse for ffmpeg executable")
+        ffmpeg_clear = _compact_path_button("Clear", "Clear override")
+        ffmpeg_test = _compact_path_button("Test", "Validate ffmpeg executable")
+        ffmpeg_find = _compact_path_button("Find", "Find from system PATH")
         ffmpeg_row = QHBoxLayout()
-        ffmpeg_row.addWidget(self.ffmpeg_path_input)
+        ffmpeg_row.setSpacing(4)
+        ffmpeg_row.addWidget(self.ffmpeg_path_input, 1)
         ffmpeg_row.addWidget(ffmpeg_browse)
         ffmpeg_row.addWidget(ffmpeg_clear)
         ffmpeg_row.addWidget(ffmpeg_test)
@@ -1708,7 +1750,7 @@ class WhisperGUI(QMainWindow):
         cli_layout.addRow("Extra CLI Args:", self.extra_cli_args)
         cli_hint = QLabel("Hint: run the Faster Whisper XXL executable with --help to see available flags.")
         cli_hint.setWordWrap(True)
-        cli_hint.setStyleSheet("color: #a0a0a0; font-size: 12px;")
+        cli_hint.setStyleSheet("color: #a0a0a0;")
         cli_layout.addRow(cli_hint)
 
         layout.addWidget(cli_group)
@@ -1764,6 +1806,20 @@ class WhisperGUI(QMainWindow):
         output_dir_layout.addWidget(self.output_dir)
         output_dir_layout.addWidget(self.browse_out_btn)
         layout.addRow(output_dir_label, output_dir_container)
+
+        self.output_dir_source_checkbox = QCheckBox("Use source folder")
+        self.output_dir_source_checkbox.setObjectName("output_dir_source_checkbox")
+        self.output_dir_source_checkbox.setToolTip("Save outputs next to each input file.")
+        layout.addRow("Output Location:", self.output_dir_source_checkbox)
+
+        self.output_name_match_checkbox = QCheckBox("Use input filename for outputs")
+        self.output_name_match_checkbox.setObjectName("output_name_match_checkbox")
+        self.output_name_match_checkbox.setToolTip(
+            "Prefer the original input name for outputs. A suffix may still be added to avoid conflicts."
+        )
+        self.output_name_match_checkbox.setChecked(True)
+        layout.addRow("Output Name:", self.output_name_match_checkbox)
+
         self.model_combo = QComboBox()
         self.model_combo.setToolTip(
             "Choose a model. Larger models are more accurate but use more resources. "
@@ -1974,25 +2030,38 @@ class WhisperGUI(QMainWindow):
         layout.addWidget(scroll)
 
     def setup_vad_tab(self, tab):
-        layout = QFormLayout(tab)
+        scroll = QScrollArea()
+        scroll_widget = QWidget()
+        layout = QVBoxLayout(scroll_widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(10)
+
+        vad_group = QGroupBox("Voice Activity Detection")
+        vad_layout = QFormLayout(vad_group)
+        vad_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        vad_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        vad_layout.setHorizontalSpacing(10)
+        vad_layout.setVerticalSpacing(4)
+        vad_layout.setContentsMargins(8, 8, 8, 8)
+
         self.vad_filter = QCheckBox("Enable VAD Filter")
         self.vad_filter.setObjectName("vad_filter_checkbox")
         self.vad_filter.setToolTip(
             "Enable voice activity detection to filter non-speech."
         )
-        layout.addRow(self.vad_filter)
+        vad_layout.addRow(self.vad_filter)
         vad_hint = QLabel("Hint: if quiet speech is missing, try disabling VAD or lowering the threshold.")
         vad_hint.setWordWrap(True)
-        vad_hint.setStyleSheet("color: #a0a0a0; font-size: 12px;")
-        layout.addRow(vad_hint)
+        vad_hint.setStyleSheet("color: #a0a0a0;")
+        vad_layout.addRow(vad_hint)
         self.vad_method = QComboBox()
         self.vad_method.addItems(['silero_v4_fw', 'silero_v5_fw', 'silero_v3', 'silero_v4', 'silero_v5', 'pyannote_v3', 'pyannote_onnx_v3', 'auditok', 'webrtc'])
         self.vad_method.setToolTip("Choose the VAD backend.")
-        layout.addRow("VAD Method:", self.vad_method)
+        vad_layout.addRow("VAD Method:", self.vad_method)
         self.vad_device = QComboBox()
         self.vad_device.addItems(["Auto", "CUDA", "CPU"])
         self.vad_device.setToolTip("Choose the VAD device for pyannote VAD. Auto follows recommendations.")
-        layout.addRow("VAD Device:", self.vad_device)
+        vad_layout.addRow("VAD Device:", self.vad_device)
         self.vad_threshold = QDoubleSpinBox()
         self.vad_threshold.setRange(0.0, 1.0)
         self.vad_threshold.setSingleStep(0.01)
@@ -2004,7 +2073,7 @@ class WhisperGUI(QMainWindow):
             "QDoubleSpinBox { padding-left: 0px; }"
             "QDoubleSpinBox QLineEdit { padding-left: 0px; margin-left: 0px; }"
         )
-        layout.addRow("VAD Threshold:", self.vad_threshold)
+        vad_layout.addRow("VAD Threshold:", self.vad_threshold)
         self.vad_min_speech = QSpinBox()
         self.vad_min_speech.setRange(0, 10000)
         self.vad_min_speech.setSuffix(" ms")
@@ -2015,7 +2084,101 @@ class WhisperGUI(QMainWindow):
             "QSpinBox { padding-left: 0px; }"
             "QSpinBox QLineEdit { padding-left: 0px; margin-left: 0px; }"
         )
-        layout.addRow("Min Speech Duration:", self.vad_min_speech)
+        vad_layout.addRow("Min Speech Duration:", self.vad_min_speech)
+
+        layout.addWidget(vad_group)
+
+        diarize_group = QGroupBox("Diarization")
+        diarize_layout = QVBoxLayout(diarize_group)
+        diarize_layout.setContentsMargins(8, 8, 8, 8)
+        diarize_layout.setSpacing(6)
+
+        self.diarize_enable = QCheckBox("Enable Diarization")
+        self.diarize_enable.setObjectName("diarize_enable_checkbox")
+        self.diarize_enable.setToolTip("Identify speaker turns and label segments.")
+        diarize_layout.addWidget(self.diarize_enable)
+
+        diarize_hint = QLabel("Hint: diarization can be memory intensive on GPU; try CPU if you see OOM errors.")
+        diarize_hint.setWordWrap(True)
+        diarize_hint.setStyleSheet("color: #a0a0a0;")
+        diarize_layout.addWidget(diarize_hint)
+
+        self.diarize_controls_container = QWidget()
+        diarize_controls_layout = QFormLayout(self.diarize_controls_container)
+        diarize_controls_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        diarize_controls_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        diarize_controls_layout.setHorizontalSpacing(10)
+        diarize_controls_layout.setVerticalSpacing(4)
+        diarize_controls_layout.setContentsMargins(0, 6, 0, 0)
+
+        self.diarize_backend = QComboBox()
+        self.diarize_backend.addItems(["pyannote_v3.1", "pyannote_v3.0", "reverb_v1", "reverb_v2"])
+        self.diarize_backend.setToolTip("Choose the diarization backend.")
+        diarize_controls_layout.addRow("Backend:", self.diarize_backend)
+
+        self.diarize_device = QComboBox()
+        self.diarize_device.addItems(["Auto", "CUDA", "CPU"])
+        self.diarize_device.setToolTip("Choose the diarization device. Auto follows backend defaults.")
+        diarize_controls_layout.addRow("Device:", self.diarize_device)
+
+        self.diarize_num_speakers = QSpinBox()
+        self.diarize_num_speakers.setRange(0, 30)
+        self.diarize_num_speakers.setToolTip("Fixed number of speakers. Set 0 to disable.")
+        diarize_controls_layout.addRow("Fixed Speakers:", self.diarize_num_speakers)
+
+        self.diarize_min_speakers = QSpinBox()
+        self.diarize_min_speakers.setRange(0, 30)
+        self.diarize_min_speakers.setToolTip("Minimum speakers. Set 0 to disable.")
+        diarize_controls_layout.addRow("Min Speakers:", self.diarize_min_speakers)
+
+        self.diarize_max_speakers = QSpinBox()
+        self.diarize_max_speakers.setRange(0, 30)
+        self.diarize_max_speakers.setToolTip("Maximum speakers. Set 0 to disable.")
+        diarize_controls_layout.addRow("Max Speakers:", self.diarize_max_speakers)
+
+        self.diarize_only_checkbox = QCheckBox("Diarize only (skip transcription)")
+        self.diarize_only_checkbox.setObjectName("diarize_only_checkbox")
+        self.diarize_only_checkbox.setToolTip(
+            "Run diarization without transcription output."
+        )
+        diarize_controls_layout.addRow(self.diarize_only_checkbox)
+
+        self.diarize_return_embeddings_checkbox = QCheckBox("Return embeddings")
+        self.diarize_return_embeddings_checkbox.setObjectName("diarize_return_embeddings_checkbox")
+        self.diarize_return_embeddings_checkbox.setToolTip(
+            "Include speaker embedding vectors in diarization output (advanced)."
+        )
+        diarize_controls_layout.addRow(self.diarize_return_embeddings_checkbox)
+
+        diarize_layout.addWidget(self.diarize_controls_container)
+
+        self.diarize_review_prompt_checkbox = QCheckBox("Prompt to review after diarization")
+        self.diarize_review_prompt_checkbox.setObjectName("diarize_review_prompt_checkbox")
+        self.diarize_review_prompt_checkbox.setToolTip(
+            "Show a prompt to review and rename speakers when diarization finishes."
+        )
+        self.diarize_review_prompt_checkbox.setChecked(True)
+        diarize_layout.addWidget(self.diarize_review_prompt_checkbox)
+
+        self.diarize_review_button = QPushButton("Review Diarization Output")
+        self.diarize_review_button.setToolTip("Review segments and rename speakers.")
+        self.diarize_review_button.setVisible(False)
+        self.diarize_review_button.clicked.connect(self.show_diarization_review_dialog)
+        diarize_layout.addWidget(self.diarize_review_button)
+
+        layout.addWidget(diarize_group)
+        layout.addStretch()
+
+        scroll.setWidget(scroll_widget)
+        scroll.setWidgetResizable(True)
+        tab_layout = QVBoxLayout(tab)
+        tab_layout.addWidget(scroll)
+
+        self.diarize_enable.toggled.connect(self.update_diarization_controls)
+        self.diarize_num_speakers.valueChanged.connect(self.update_diarization_controls)
+        self.diarize_min_speakers.valueChanged.connect(self.update_diarization_controls)
+        self.diarize_max_speakers.valueChanged.connect(self.update_diarization_controls)
+        self.update_diarization_controls(self.diarize_enable.isChecked())
 
     def setup_audio_tab(self, tab):
         scroll = QScrollArea()
@@ -2550,6 +2713,8 @@ class WhisperGUI(QMainWindow):
             self.setStyleSheet("") 
             if qss_path: 
                 logging.warning(f"Theme file not found: {qss_path}")
+
+        self._apply_menu_bar_font_scaling()
         
         # Save theme change immediately
         self.save_settings_to_file()
@@ -2573,6 +2738,80 @@ class WhisperGUI(QMainWindow):
         self.audio_true_peak_label.setVisible(active and self.audio_true_peak_enable.isChecked())
         self.audio_lra.setVisible(active)
         self.audio_lra_label.setVisible(active)
+
+    def update_output_dir_mode(self, checked=None, save_text=True):
+        if not getattr(self, "output_dir_source_checkbox", None):
+            return
+        if checked is None:
+            checked = self.output_dir_source_checkbox.isChecked()
+        if checked:
+            if not hasattr(self, "_output_dir_manual_value"):
+                self._output_dir_manual_value = self.output_dir.text().strip()
+            if not save_text:
+                self.output_dir.blockSignals(True)
+            self.output_dir.setText("source")
+            if not save_text:
+                self.output_dir.blockSignals(False)
+            self.output_dir.setEnabled(False)
+            if getattr(self, "browse_out_btn", None):
+                self.browse_out_btn.setEnabled(False)
+        else:
+            self.output_dir.setEnabled(True)
+            if getattr(self, "browse_out_btn", None):
+                self.browse_out_btn.setEnabled(True)
+            if self.output_dir.text().strip().lower() == "source":
+                restore = getattr(self, "_output_dir_manual_value", "")
+                if not save_text:
+                    self.output_dir.blockSignals(True)
+                self.output_dir.setText(restore)
+                if not save_text:
+                    self.output_dir.blockSignals(False)
+
+    def update_diarization_controls(self, enabled=None):
+        if enabled is None:
+            enabled = bool(getattr(self, "diarize_enable", None) and self.diarize_enable.isChecked())
+        if getattr(self, "diarize_controls_container", None):
+            self.diarize_controls_container.setVisible(bool(enabled))
+        self._update_diarize_review_link()
+        if not enabled:
+            return
+        if not getattr(self, "diarize_num_speakers", None):
+            return
+        fixed = self.diarize_num_speakers.value()
+        min_speakers = self.diarize_min_speakers.value()
+        max_speakers = self.diarize_max_speakers.value()
+        if min_speakers > 0 and max_speakers > 0 and max_speakers < min_speakers:
+            self.diarize_max_speakers.blockSignals(True)
+            self.diarize_max_speakers.setValue(min_speakers)
+            self.diarize_max_speakers.blockSignals(False)
+            max_speakers = min_speakers
+        if fixed > 0:
+            self.diarize_num_speakers.setEnabled(True)
+            self.diarize_min_speakers.setEnabled(False)
+            self.diarize_max_speakers.setEnabled(False)
+        elif min_speakers > 0 or max_speakers > 0:
+            self.diarize_num_speakers.setEnabled(False)
+            self.diarize_min_speakers.setEnabled(True)
+            self.diarize_max_speakers.setEnabled(True)
+        else:
+            self.diarize_num_speakers.setEnabled(True)
+            self.diarize_min_speakers.setEnabled(True)
+            self.diarize_max_speakers.setEnabled(True)
+
+    def _update_diarize_review_link(self):
+        review_widget = None
+        if getattr(self, "diarize_review_button", None):
+            review_widget = self.diarize_review_button
+        elif getattr(self, "diarize_review_link", None):
+            review_widget = self.diarize_review_link
+        if review_widget is None:
+            return
+        diarize_active = bool(getattr(self, "diarize_enable", None) and self.diarize_enable.isChecked())
+        if not diarize_active and self._extra_args_has_flag("--diarize"):
+            diarize_active = True
+        review_widget.setVisible(bool(self._review_link_ready and diarize_active))
+        if getattr(self, "diarize_review_prompt_checkbox", None):
+            self.diarize_review_prompt_checkbox.setVisible(bool(diarize_active))
 
     def toggle_quiet_speech_preset(self, enabled):
         if enabled:
@@ -2731,7 +2970,7 @@ class WhisperGUI(QMainWindow):
                 filters.append(f"loudnorm=I={lufs}:LRA={lra}")
         if not filters:
             return input_file
-        output_dir = self.get_output_dir()
+        output_dir = self.get_output_dir(input_file)
         if not output_dir:
             return None
         base_name = os.path.splitext(os.path.basename(input_file))[0]
@@ -2793,10 +3032,16 @@ class WhisperGUI(QMainWindow):
         self._current_processed_audio = None
 
     def rename_outputs_for_current_run(self):
-        output_dir = self.get_output_dir()
+        original = (
+            getattr(self, "_current_original_audio", None)
+            or getattr(self, "current_input_file", None)
+            or ""
+        )
+        if not original:
+            return
+        output_dir = self.get_output_dir(original)
         if not output_dir:
             return
-        original = getattr(self, "_current_original_audio", None) or ""
         original_base = os.path.splitext(os.path.basename(original))[0]
         target_base = self._current_output_basename or original_base
         if self._current_processed_audio:
@@ -3463,31 +3708,90 @@ class WhisperGUI(QMainWindow):
         """ Create menu bar with hardware optimization option """
         try:
             menubar = self.menuBar()
-            hardware_menu = menubar.addMenu('Hardware Settings')
-            optimize_action = hardware_menu.addAction('Optimize Hardware Settings')
+            menubar.clear()
+            menubar.setVisible(False)
+
+            if getattr(self, "top_menu_toolbar", None):
+                self.removeToolBar(self.top_menu_toolbar)
+
+            toolbar = QToolBar("Top Menus", self)
+            toolbar.setObjectName("top_menu_toolbar")
+            toolbar.setMovable(False)
+            toolbar.setFloatable(False)
+            toolbar.setContextMenuPolicy(Qt.ContextMenuPolicy.PreventContextMenu)
+            self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar)
+            self.top_menu_toolbar = toolbar
+
+            hardware_menu = QMenu(toolbar)
+            optimize_action = hardware_menu.addAction("Optimize Hardware Settings")
             optimize_action.triggered.connect(self.force_hardware_optimization)
-            view_hw_action = hardware_menu.addAction('View Hardware Info')
+            view_hw_action = hardware_menu.addAction("View Hardware Info")
             view_hw_action.triggered.connect(self.show_hardware_info)
             hardware_menu.addSeparator()
-            diagnose_action = hardware_menu.addAction('Diagnose GPU Detection')
+            diagnose_action = hardware_menu.addAction("Diagnose GPU Detection")
             diagnose_action.triggered.connect(self.diagnose_gpu_detection)
 
-            software_menu = menubar.addMenu('Software Information')
-            view_software_action = software_menu.addAction('View Software Information')
+            software_menu = QMenu(toolbar)
+            view_software_action = software_menu.addAction("View Software Information")
             view_software_action.triggered.connect(self.show_software_information)
 
-            help_menu = menubar.addMenu('Help')
-            wiki_action = help_menu.addAction('Wiki')
+            help_menu = QMenu(toolbar)
+            wiki_action = help_menu.addAction("Wiki")
             wiki_action.triggered.connect(self.open_wiki_page)
             help_menu.addSeparator()
-            debug_logs_action = help_menu.addAction('Debug Settings')
+            debug_logs_action = help_menu.addAction("Debug Settings")
             debug_logs_action.triggered.connect(self.show_debug_log_dialog)
             help_menu.addSeparator()
-            check_updates_action = help_menu.addAction('Check for Updates')
+            check_updates_action = help_menu.addAction("Check for Updates")
             check_updates_action.triggered.connect(self.check_app_update)
+
+            self._top_menu_buttons = []
+            for title, menu in (
+                ("Hardware Settings", hardware_menu),
+                ("Software Information", software_menu),
+                ("Help", help_menu),
+            ):
+                button = QToolButton(toolbar)
+                button.setText(title)
+                button.setMenu(menu)
+                button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+                button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+                toolbar.addWidget(button)
+                self._top_menu_buttons.append(button)
+
+            self._top_menus = (hardware_menu, software_menu, help_menu)
+            self._apply_menu_bar_font_scaling()
 
         except Exception as e:
             logging.error(f"Error creating menu bar: {e}")
+
+    def _apply_menu_bar_font_scaling(self):
+        # Match top-menu text to app font scaling across 100%/125%/150% text sizes.
+        menu_font = QFont(QApplication.font())
+        size_rule = "10pt"
+        if menu_font.pointSizeF() > 0:
+            if menu_font.pointSizeF() < 10.0:
+                menu_font.setPointSizeF(menu_font.pointSizeF() + 0.5)
+            size_rule = f"{menu_font.pointSizeF():.1f}pt"
+        elif menu_font.pixelSize() > 0:
+            if menu_font.pixelSize() < 14:
+                menu_font.setPixelSize(menu_font.pixelSize() + 1)
+            size_rule = f"{menu_font.pixelSize()}px"
+
+        toolbar = getattr(self, "top_menu_toolbar", None)
+        if toolbar:
+            toolbar.setStyleSheet(
+                f"QToolBar#top_menu_toolbar {{ border: 0px; spacing: 8px; padding: 4px 8px; }}"
+                f" QToolButton {{ font-size: {size_rule}; font-weight: 400; padding: 4px 8px; border: none; }}"
+                " QToolButton::menu-indicator { image: none; width: 0px; }"
+            )
+            for button in getattr(self, "_top_menu_buttons", []):
+                button.setFont(menu_font)
+
+        for menu in getattr(self, "_top_menus", ()):
+            menu.setFont(menu_font)
+            for action in menu.actions():
+                action.setFont(menu_font)
 
     def _log_debug_parameters(self, context):
         if not self.settings.get("debug_model_download_logging", False):
@@ -3512,6 +3816,46 @@ class WhisperGUI(QMainWindow):
             "vad_device": self.vad_device.currentText() if self.vad_filter.isChecked() else None,
             "vad_threshold": self.vad_threshold.value() if self.vad_filter.isChecked() else None,
             "vad_min_speech": self.vad_min_speech.value() if self.vad_filter.isChecked() else None,
+            "diarize_enabled": (
+                self.diarize_enable.isChecked()
+                if getattr(self, "diarize_enable", None)
+                else False
+            ),
+            "diarize_backend": (
+                self.diarize_backend.currentText()
+                if getattr(self, "diarize_enable", None) and self.diarize_enable.isChecked()
+                else None
+            ),
+            "diarize_device": (
+                self.diarize_device.currentText()
+                if getattr(self, "diarize_enable", None) and self.diarize_enable.isChecked()
+                else None
+            ),
+            "diarize_num_speakers": (
+                self.diarize_num_speakers.value()
+                if getattr(self, "diarize_enable", None) and self.diarize_enable.isChecked()
+                else None
+            ),
+            "diarize_min_speakers": (
+                self.diarize_min_speakers.value()
+                if getattr(self, "diarize_enable", None) and self.diarize_enable.isChecked()
+                else None
+            ),
+            "diarize_max_speakers": (
+                self.diarize_max_speakers.value()
+                if getattr(self, "diarize_enable", None) and self.diarize_enable.isChecked()
+                else None
+            ),
+            "diarize_only": (
+                self.diarize_only_checkbox.isChecked()
+                if getattr(self, "diarize_only_checkbox", None)
+                else False
+            ),
+            "diarize_return_embeddings": (
+                self.diarize_return_embeddings_checkbox.isChecked()
+                if getattr(self, "diarize_return_embeddings_checkbox", None)
+                else False
+            ),
             "word_timestamps": (
                 self.word_timestamps_checkbox.isChecked()
                 if getattr(self, "word_timestamps_checkbox", None)
@@ -4077,13 +4421,20 @@ class WhisperGUI(QMainWindow):
         self.device_combo.currentTextChanged.connect(self.save_combo_setting)
         self.vad_method.currentTextChanged.connect(self.save_combo_setting)
         self.vad_device.currentTextChanged.connect(self.save_combo_setting)
+        self.diarize_backend.currentTextChanged.connect(self.save_combo_setting)
+        self.diarize_device.currentTextChanged.connect(self.save_combo_setting)
         self.temperature.valueChanged.connect(self.save_spinbox_setting)
         self.beam_size.valueChanged.connect(self.save_spinbox_setting)
         self.best_of.valueChanged.connect(self.save_spinbox_setting)
         self.patience.valueChanged.connect(self.save_spinbox_setting)
         self.vad_threshold.valueChanged.connect(self.save_spinbox_setting)
         self.vad_min_speech.valueChanged.connect(self.save_spinbox_setting)
+        self.diarize_num_speakers.valueChanged.connect(self.save_spinbox_setting)
+        self.diarize_min_speakers.valueChanged.connect(self.save_spinbox_setting)
+        self.diarize_max_speakers.valueChanged.connect(self.save_spinbox_setting)
         self.output_dir.textChanged.connect(self.save_text_setting)
+        if getattr(self, "output_dir_source_checkbox", None):
+            self.output_dir_source_checkbox.toggled.connect(self.update_output_dir_mode)
         self.initial_prompt.textChanged.connect(self.save_text_setting)
         self.tooltips_checkbox.toggled.connect(self.apply_tooltip_visibility)
         
@@ -4105,6 +4456,8 @@ class WhisperGUI(QMainWindow):
         self.settings["device"] = self.device_combo.currentText()
         self.settings["vad_method"] = self.vad_method.currentText()
         self.settings["vad_device"] = self.vad_device.currentText()
+        self.settings["diarize_backend"] = self.diarize_backend.currentText()
+        self.settings["diarize_device"] = self.diarize_device.currentText()
         self.save_settings_to_file()
 
     def save_spinbox_setting(self):
@@ -4115,6 +4468,9 @@ class WhisperGUI(QMainWindow):
         self.settings["patience"] = self.patience.value()
         self.settings["vad_threshold"] = self.vad_threshold.value()
         self.settings["vad_min_speech"] = self.vad_min_speech.value()
+        self.settings["diarize_num_speakers"] = self.diarize_num_speakers.value()
+        self.settings["diarize_min_speakers"] = self.diarize_min_speakers.value()
+        self.settings["diarize_max_speakers"] = self.diarize_max_speakers.value()
         self.save_settings_to_file()
 
     def save_text_setting(self):
@@ -4629,10 +4985,19 @@ class WhisperGUI(QMainWindow):
         if dir_path:
             self.output_dir.setText(dir_path)
 
-    def get_output_dir(self):
-        dir_path = self.output_dir.text()
+    def get_output_dir(self, input_file=None):
+        dir_path = self.output_dir.text().strip()
         if not dir_path:
             dir_path = os.path.join(get_app_directory(), "output")
+        else:
+            if dir_path.lower() == "source":
+                candidate = input_file or getattr(self, "current_input_file", None)
+                if candidate:
+                    dir_path = os.path.dirname(candidate)
+                else:
+                    dir_path = os.path.join(get_app_directory(), "output")
+            elif dir_path == ".":
+                dir_path = os.getcwd()
         try:
             os.makedirs(dir_path, exist_ok=True)
             return dir_path
@@ -4979,15 +5344,22 @@ class WhisperGUI(QMainWindow):
         if not input_file or not os.path.exists(input_file):
             QMessageBox.warning(self, "Warning", f"Input file not found: {input_file}")
             return None
-        output_dir = self.get_output_dir()
+        output_dir = self.get_output_dir(input_file)
         if not output_dir:
             return None
+
+        self._temp_srt_for_json = False
+        self._temp_txt_for_json = False
 
         cmd = [self.executable_path, input_file]
         model_dir_cli, _, _ = self._get_model_root_dirs()
         vad_device = self._resolve_vad_device()
         compute_type = self._get_effective_compute_type()
         device_type = self.device_combo.currentText()
+        diarize_enabled = bool(getattr(self, "diarize_enable", None) and self.diarize_enable.isChecked())
+        extra_args_text = self.extra_cli_args.toPlainText().strip()
+        if not diarize_enabled and self._extra_args_has_flag("--diarize", extra_args_text):
+            diarize_enabled = True
         if device_type == "cpu" and compute_type in ("float16", "int8_float16", "int8_bfloat16", "bfloat16"):
             compute_type = "float32"
             if not self._cpu_compute_override_applied:
@@ -5011,6 +5383,24 @@ class WhisperGUI(QMainWindow):
             "--vad_threshold": str(self.vad_threshold.value()) if self.vad_filter.isChecked() else None,
             "--vad_min_speech_duration_ms": str(self.vad_min_speech.value()) if self.vad_filter.isChecked() else None,
         }
+        if diarize_enabled:
+            diarize_backend = self.diarize_backend.currentText()
+            diarize_device = (self.diarize_device.currentText() or "").strip().lower()
+            if diarize_device == "auto":
+                diarize_device = None
+            fixed_speakers = int(self.diarize_num_speakers.value())
+            min_speakers = int(self.diarize_min_speakers.value())
+            max_speakers = int(self.diarize_max_speakers.value())
+            options["--diarize"] = diarize_backend
+            if diarize_device:
+                options["--diarize_device"] = diarize_device
+            if fixed_speakers > 0:
+                options["--num_speakers"] = str(fixed_speakers)
+            else:
+                if min_speakers > 0:
+                    options["--min_speakers"] = str(min_speakers)
+                if max_speakers > 0:
+                    options["--max_speakers"] = str(max_speakers)
         for option, value in options.items():
             if value is not None:
                 cmd.extend([option, value])
@@ -5021,6 +5411,10 @@ class WhisperGUI(QMainWindow):
         for option, checkbox in checkboxes.items():
             if checkbox.isChecked():
                 cmd.append(option)
+        if diarize_enabled and getattr(self, "diarize_only_checkbox", None) and self.diarize_only_checkbox.isChecked():
+            cmd.append("--diarize_only")
+        if diarize_enabled and getattr(self, "diarize_return_embeddings_checkbox", None) and self.diarize_return_embeddings_checkbox.isChecked():
+            cmd.append("--return_embeddings")
 
         selected_formats = []
         display_formats = []
@@ -5048,6 +5442,13 @@ class WhisperGUI(QMainWindow):
         elif self.output_format_checkboxes['all'].isChecked():
             selected_formats = ['all']
             display_formats = ['all']
+
+        if diarize_enabled and "all" not in selected_formats:
+            wants_json = "json" in selected_formats
+            has_speaker_source = bool(set(selected_formats) & {"srt", "txt"})
+            if wants_json and not has_speaker_source:
+                selected_formats.append("srt")
+                self._temp_srt_for_json = True
 
         if (
             getattr(self, "word_timestamps_checkbox", None)
@@ -5107,10 +5508,9 @@ class WhisperGUI(QMainWindow):
             cmd.extend(["--word_timestamps", "True"])
         if getattr(self, "highlight_words_checkbox", None) and self.highlight_words_checkbox.isChecked():
             cmd.extend(["--highlight_words", "True"])
-        extra_args = self.extra_cli_args.toPlainText().strip()
-        if extra_args:
+        if extra_args_text:
             try:
-                extra_tokens = shlex.split(extra_args, posix=os.name != "nt")
+                extra_tokens = shlex.split(extra_args_text, posix=os.name != "nt")
             except ValueError as exc:
                 QMessageBox.warning(
                     self,
@@ -5126,6 +5526,8 @@ class WhisperGUI(QMainWindow):
         self.output_buffer = ""
         self.last_line_was_overwrite = False
         self.transcription_completed_successfully = False
+        self._review_link_ready = False
+        self._update_diarize_review_link()
         self._last_run_cuda_oom = False
         self._last_cuda_oom_snippet = None
         self._last_run_cuda_kernel_incompatible = False
@@ -5192,14 +5594,17 @@ class WhisperGUI(QMainWindow):
 
         self.cleanup_processed_audio()
         filters = self.get_preprocess_filters()
-        self._force_output_suffix = bool(filters)
-        output_dir = self.get_output_dir()
+        force_suffix = bool(filters)
+        if getattr(self, "output_name_match_checkbox", None) and self.output_name_match_checkbox.isChecked():
+            force_suffix = False
+        self._force_output_suffix = force_suffix
+        output_dir = self.get_output_dir(input_file)
         if not output_dir:
             return False
         self._current_output_basename = self._compute_output_basename(
             input_file,
             output_dir,
-            force_suffix=bool(filters)
+            force_suffix=force_suffix
         )
         self._register_output_basename(input_file, output_dir)
         self._record_output_basename(input_file, output_dir, self._current_output_basename)
@@ -5301,6 +5706,13 @@ class WhisperGUI(QMainWindow):
         logging.info(f"Starting QProcess with command: {command}")
         if self.full_console_checkbox.isChecked():
             self._append_text_to_console(f"Running command:\n{display_command}\n" + "="*50 + "\n")
+        else:
+            status_bits = ["Status: Running"]
+            if getattr(self, "current_input_file", None):
+                status_bits.append(self._basename_only(self.current_input_file))
+            if self._extra_args_has_flag("--diarize") or (getattr(self, "diarize_enable", None) and self.diarize_enable.isChecked()):
+                status_bits.append("diarization on")
+            self._append_text_to_console("\n" + " • ".join(status_bits) + "\n")
 
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -5457,15 +5869,65 @@ class WhisperGUI(QMainWindow):
                 self._append_text_to_console(f"\nWarning: Timestamped txt file is empty\n")
                 return False
             
-            pattern = r'\[[\d:.\->\s]+\]\s*(.*)'
-            matches = re.findall(pattern, content)
-            
-            if not matches:
+            pattern = re.compile(r'^\[[\d:.\->\s]+\]\s*(.*)$')
+            speaker_pattern = re.compile(r'^\[(SPEAKER_?\d+)\]:\s*(.*)$')
+            records = []
+            saw_speaker = False
+
+            for raw_line in content.splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                match = pattern.match(line)
+                if not match:
+                    continue
+                text = match.group(1).strip()
+                if not text:
+                    continue
+                speaker_match = speaker_pattern.match(text)
+                if speaker_match:
+                    speaker = speaker_match.group(1)
+                    remainder = speaker_match.group(2).strip()
+                    saw_speaker = True
+                    records.append((speaker, remainder))
+                else:
+                    records.append((None, text))
+
+            if not records:
                 self._append_text_to_console(f"\nWarning: No timestamped content found in txt file\n")
                 return False
-            
-            sentences_text = ' '.join(match.strip() for match in matches if match.strip())
-            
+
+            if saw_speaker:
+                lines = []
+                current_speaker = None
+                current_parts = []
+                for speaker, text in records:
+                    if speaker:
+                        if current_speaker and speaker != current_speaker:
+                            prefix = f"[{current_speaker}]:"
+                            if current_parts:
+                                lines.append(prefix + " " + " ".join(current_parts))
+                            else:
+                                lines.append(prefix)
+                            current_parts = []
+                        current_speaker = speaker
+                        if text:
+                            current_parts.append(text)
+                    else:
+                        if current_speaker:
+                            current_parts.append(text)
+                        else:
+                            lines.append(text)
+                if current_speaker:
+                    prefix = f"[{current_speaker}]:"
+                    if current_parts:
+                        lines.append(prefix + " " + " ".join(current_parts))
+                    else:
+                        lines.append(prefix)
+                sentences_text = "\n".join(line for line in lines if line.strip())
+            else:
+                sentences_text = ' '.join(text for _, text in records if text)
+
             if not sentences_text:
                 self._append_text_to_console(f"\nWarning: No valid sentences extracted from txt file\n")
                 return False
@@ -5478,6 +5940,534 @@ class WhisperGUI(QMainWindow):
         except Exception as e:
             self._append_text_to_console(f"Error creating sentences-only txt file: {str(e)}\n")
             return False
+
+    def _parse_txt_timestamp(self, value):
+        value = (value or "").strip()
+        if not value:
+            return None
+        parts = value.split(":")
+        try:
+            if len(parts) == 2:
+                minutes = int(parts[0])
+                seconds = float(parts[1])
+                return minutes * 60 + seconds
+            if len(parts) == 3:
+                hours = int(parts[0])
+                minutes = int(parts[1])
+                seconds = float(parts[2])
+                return hours * 3600 + minutes * 60 + seconds
+        except ValueError:
+            return None
+        return None
+
+    def _parse_srt_timestamp(self, value):
+        value = (value or "").strip()
+        if not value:
+            return None
+        match = re.match(r"^(?P<hh>\d{2}):(?P<mm>\d{2}):(?P<ss>\d{2}),(?P<ms>\d{3})$", value)
+        if not match:
+            return None
+        hours = int(match.group("hh"))
+        minutes = int(match.group("mm"))
+        seconds = int(match.group("ss"))
+        millis = int(match.group("ms"))
+        return hours * 3600 + minutes * 60 + seconds + (millis / 1000.0)
+
+    def _read_speaker_segments_from_srt(self, srt_path):
+        if not srt_path or not os.path.exists(srt_path):
+            return []
+        speaker_pattern = re.compile(r'^\s*\[(SPEAKER_?\d+)\]:\s*(.*)$')
+        time_pattern = re.compile(r"(?P<start>\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(?P<end>\d{2}:\d{2}:\d{2},\d{3})")
+        segments = []
+        try:
+            with open(srt_path, "r", encoding="utf-8") as handle:
+                lines = [line.rstrip("\n") for line in handle]
+            idx = 0
+            while idx < len(lines):
+                line = lines[idx].strip()
+                if not line:
+                    idx += 1
+                    continue
+                # Skip cue number if present
+                if line.isdigit():
+                    idx += 1
+                    if idx >= len(lines):
+                        break
+                    line = lines[idx].strip()
+                time_match = time_pattern.match(line)
+                if not time_match:
+                    idx += 1
+                    continue
+                start = self._parse_srt_timestamp(time_match.group("start"))
+                end = self._parse_srt_timestamp(time_match.group("end"))
+                idx += 1
+                text_lines = []
+                while idx < len(lines) and lines[idx].strip():
+                    text_lines.append(lines[idx].strip())
+                    idx += 1
+                text = " ".join(text_lines).strip()
+                speaker_match = speaker_pattern.match(text)
+                if speaker_match and start is not None and end is not None:
+                    speaker = speaker_match.group(1)
+                    segments.append({"start": start, "end": end, "speaker": speaker})
+                idx += 1
+        except Exception:
+            return []
+        return segments
+
+    def _read_speaker_segments_from_txt(self, txt_path):
+        if not txt_path or not os.path.exists(txt_path):
+            return []
+        line_pattern = re.compile(
+            r'^\[(?P<start>[\d:.]+)\s*-->\s*(?P<end>[\d:.]+)\]\s*(?P<text>.*)$'
+        )
+        speaker_pattern = re.compile(r'^\s*\[(SPEAKER_?\d+)\]:\s*(.*)$')
+        segments = []
+        try:
+            with open(txt_path, "r", encoding="utf-8") as handle:
+                for raw_line in handle:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    match = line_pattern.match(line)
+                    if not match:
+                        continue
+                    start = self._parse_txt_timestamp(match.group("start"))
+                    end = self._parse_txt_timestamp(match.group("end"))
+                    text = match.group("text").strip()
+                    speaker_match = speaker_pattern.match(text)
+                    if speaker_match and start is not None and end is not None:
+                        speaker = speaker_match.group(1)
+                        segments.append({"start": start, "end": end, "speaker": speaker})
+        except Exception:
+            return []
+        return segments
+
+    def _match_speaker_for_segment(self, start, end, speaker_segments):
+        if start is None or end is None or not speaker_segments:
+            return None
+        best_speaker = None
+        best_overlap = 0.0
+        for segment in speaker_segments:
+            overlap = min(end, segment["end"]) - max(start, segment["start"])
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_speaker = segment["speaker"]
+        if best_overlap > 0:
+            return best_speaker
+        mid = (start + end) / 2.0
+        tolerance = 0.5
+        for segment in speaker_segments:
+            if (segment["start"] - tolerance) <= mid <= (segment["end"] + tolerance):
+                return segment["speaker"]
+        nearest = None
+        nearest_delta = None
+        for segment in speaker_segments:
+            seg_mid = (segment["start"] + segment["end"]) / 2.0
+            delta = abs(mid - seg_mid)
+            if nearest_delta is None or delta < nearest_delta:
+                nearest_delta = delta
+                nearest = segment["speaker"]
+        return nearest
+
+    def _extra_args_has_flag(self, flag, text=None):
+        if text is None:
+            text = self.extra_cli_args.toPlainText().strip()
+        if not text:
+            return False
+        pattern = re.compile(rf"(^|\s){re.escape(flag)}(=|\s|$)")
+        return bool(pattern.search(text))
+
+    def _get_last_review_json_path(self):
+        output_dir = self._last_review_output_dir or self.get_output_dir()
+        base = self._last_review_output_base
+        if output_dir and base:
+            candidate = os.path.join(output_dir, f"{base}.json")
+            if os.path.exists(candidate):
+                return candidate
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select JSON Output",
+            output_dir or "",
+            "JSON Files (*.json);;All Files (*.*)"
+        )
+        return path or None
+
+    def _replace_speaker_labels_in_text(self, path, mapping):
+        if not path or not os.path.exists(path):
+            return False
+        pattern = re.compile(r"\[(SPEAKER_?\d+)\]:")
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                content = handle.read()
+            def repl(match):
+                speaker_id = match.group(1)
+                name = mapping.get(speaker_id)
+                if name:
+                    return f"[{name}]:"
+                return match.group(0)
+            updated = pattern.sub(repl, content)
+            if updated == content:
+                return False
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(updated)
+            return True
+        except Exception:
+            return False
+
+    def _apply_speaker_names_to_json(self, json_path, mapping):
+        if not json_path or not os.path.exists(json_path):
+            return False
+        try:
+            with open(json_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, dict):
+                segments = data.get("segments") or []
+            elif isinstance(data, list):
+                segments = data
+            else:
+                return False
+            updated = False
+            for segment in segments:
+                if not isinstance(segment, dict):
+                    continue
+                speaker_id = segment.get("speaker")
+                if not speaker_id:
+                    continue
+                name = mapping.get(speaker_id)
+                if name:
+                    segment["speaker_name"] = name
+                    updated = True
+            if not updated:
+                return False
+            with open(json_path, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=4, ensure_ascii=False)
+            return True
+        except Exception:
+            return False
+
+    def _inject_speakers_into_json_path(self, json_path):
+        if not json_path or not os.path.exists(json_path):
+            return False
+        base = os.path.splitext(json_path)[0]
+        srt_path = base + ".srt"
+        txt_path = base + ".txt"
+        speaker_segments = self._read_speaker_segments_from_srt(srt_path)
+        if not speaker_segments:
+            speaker_segments = self._read_speaker_segments_from_txt(txt_path)
+        if not speaker_segments:
+            return False
+        try:
+            with open(json_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, dict):
+                segments = data.get("segments") or []
+            elif isinstance(data, list):
+                segments = data
+            else:
+                return False
+            updated = False
+            for segment in segments:
+                if not isinstance(segment, dict):
+                    continue
+                if segment.get("speaker"):
+                    continue
+                start = segment.get("start")
+                end = segment.get("end")
+                speaker = self._match_speaker_for_segment(start, end, speaker_segments)
+                if speaker:
+                    segment["speaker"] = speaker
+                    updated = True
+            if not updated:
+                return False
+            with open(json_path, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=4, ensure_ascii=False)
+            return True
+        except Exception:
+            return False
+
+    def _show_diarization_prompt(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Diarization Complete")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(460)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(12)
+
+        message_row = QHBoxLayout()
+        icon_label = QLabel()
+        icon = self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation)
+        icon_label.setPixmap(icon.pixmap(32, 32))
+        icon_label.setAlignment(Qt.AlignmentFlag.AlignTop)
+        message_row.addWidget(icon_label)
+
+        message_label = QLabel("Diarization finished. Review and rename speakers now?")
+        message_label.setWordWrap(True)
+        message_row.addWidget(message_label, 1)
+        layout.addLayout(message_row)
+
+        button_box = QDialogButtonBox()
+        review_button = button_box.addButton("Review Now", QDialogButtonBox.ButtonRole.AcceptRole)
+        button_box.addButton("Later", QDialogButtonBox.ButtonRole.RejectRole)
+        layout.addWidget(button_box)
+
+        def on_review():
+            dialog.accept()
+            self.show_diarization_review_dialog()
+
+        review_button.clicked.connect(on_review)
+        button_box.rejected.connect(dialog.reject)
+
+        dialog.exec()
+
+    def show_diarization_review_dialog(self):
+        json_path = self._get_last_review_json_path()
+        if not json_path:
+            return
+        try:
+            with open(json_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except Exception as exc:
+            QMessageBox.warning(self, "Review Output", f"Failed to read JSON:\n{exc}")
+            return
+        if isinstance(data, dict):
+            segments = data.get("segments") or []
+        elif isinstance(data, list):
+            segments = data
+        else:
+            segments = []
+        if not segments:
+            QMessageBox.information(self, "Review Output", "No segments found in JSON output.")
+            return
+
+        if not any(isinstance(segment, dict) and segment.get("speaker") for segment in segments):
+            if self._inject_speakers_into_json_path(json_path):
+                try:
+                    with open(json_path, "r", encoding="utf-8") as handle:
+                        data = json.load(handle)
+                    if isinstance(data, dict):
+                        segments = data.get("segments") or []
+                    elif isinstance(data, list):
+                        segments = data
+                except Exception:
+                    pass
+
+        speakers = []
+        speaker_names = {}
+        for segment in segments:
+            if not isinstance(segment, dict):
+                continue
+            speaker_id = segment.get("speaker")
+            if not speaker_id:
+                continue
+            if speaker_id not in speaker_names:
+                speaker_names[speaker_id] = segment.get("speaker_name") or ""
+            if speaker_id not in speakers:
+                speakers.append(speaker_id)
+        speakers.sort()
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Review Diarization Output")
+        dialog.setModal(True)
+        dialog.setMinimumSize(960, 640)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 10, 12, 12)
+        layout.setSpacing(10)
+
+        title = QLabel(f"Output: {os.path.basename(json_path)}")
+        title.setStyleSheet("font-size: 14px; font-weight: bold;")
+        layout.addWidget(title)
+
+        speaker_group = QGroupBox("Speaker Names")
+        speaker_layout = QFormLayout(speaker_group)
+        speaker_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        speaker_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        speaker_layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
+        speaker_layout.setFormAlignment(Qt.AlignmentFlag.AlignTop)
+        speaker_layout.setHorizontalSpacing(10)
+        speaker_layout.setVerticalSpacing(4)
+        speaker_layout.setContentsMargins(8, 8, 8, 8)
+
+        mapping_inputs = {}
+        if speakers:
+            for speaker_id in speakers:
+                line_edit = QLineEdit()
+                line_edit.setPlaceholderText("Optional name")
+                line_edit.setText(speaker_names.get(speaker_id, ""))
+                speaker_layout.addRow(f"{speaker_id}:", line_edit)
+                mapping_inputs[speaker_id] = line_edit
+        else:
+            empty_label = QLabel("No speaker labels found in this JSON. Run diarization or select an output with speaker tags.")
+            empty_label.setWordWrap(True)
+            empty_label.setStyleSheet("color: #a0a0a0;")
+            speaker_layout.addRow(empty_label)
+
+        layout.addWidget(speaker_group)
+
+        table = QTableWidget(dialog)
+        table.setColumnCount(4)
+        table.setHorizontalHeaderLabels(["Start (s)", "End (s)", "Speaker", "Text"])
+        table.setRowCount(len(segments))
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+
+        speaker_rows = {sp: [] for sp in speakers}
+        for row, segment in enumerate(segments):
+            if not isinstance(segment, dict):
+                continue
+            start = segment.get("start")
+            end = segment.get("end")
+            speaker_id = segment.get("speaker") or ""
+            speaker_name = segment.get("speaker_name") or ""
+            speaker_label = speaker_name or speaker_id
+            text = (segment.get("text") or "").strip()
+            start_item = QTableWidgetItem(f"{float(start):.2f}" if isinstance(start, (int, float)) else "")
+            end_item = QTableWidgetItem(f"{float(end):.2f}" if isinstance(end, (int, float)) else "")
+            speaker_item = QTableWidgetItem(speaker_label)
+            text_item = QTableWidgetItem(text)
+            table.setItem(row, 0, start_item)
+            table.setItem(row, 1, end_item)
+            table.setItem(row, 2, speaker_item)
+            table.setItem(row, 3, text_item)
+            if speaker_id in speaker_rows:
+                speaker_rows[speaker_id].append(row)
+
+        layout.addWidget(table)
+
+        update_text_outputs_checkbox = QCheckBox("Update speaker labels in SRT/TXT/LRC/VTT outputs")
+        update_text_outputs_checkbox.setChecked(True)
+        layout.addWidget(update_text_outputs_checkbox)
+
+        button_row = QHBoxLayout()
+        save_button = QPushButton("Apply Names")
+        close_button = QPushButton("Close")
+        save_button.setMinimumWidth(130)
+        close_button.setMinimumWidth(110)
+        button_row.addWidget(save_button)
+        button_row.addStretch()
+        button_row.addWidget(close_button)
+        layout.addLayout(button_row)
+
+        if not speakers:
+            save_button.setEnabled(False)
+            update_text_outputs_checkbox.setEnabled(False)
+
+        def refresh_table_for_speaker(speaker_id, name):
+            rows = speaker_rows.get(speaker_id) or []
+            label = name.strip() or speaker_id
+            for row in rows:
+                item = table.item(row, 2)
+                if item:
+                    item.setText(label)
+
+        for speaker_id, line_edit in mapping_inputs.items():
+            line_edit.textChanged.connect(lambda text, sid=speaker_id: refresh_table_for_speaker(sid, text))
+
+        def on_apply():
+            mapping = {
+                speaker_id: line_edit.text().strip()
+                for speaker_id, line_edit in mapping_inputs.items()
+                if line_edit.text().strip()
+            }
+            if not mapping:
+                QMessageBox.information(dialog, "Review Output", "No speaker names were entered.")
+                return
+            json_updated = self._apply_speaker_names_to_json(json_path, mapping)
+            text_updated = False
+            if update_text_outputs_checkbox.isChecked():
+                base = os.path.splitext(json_path)[0]
+                for ext in ("srt", "txt", "lrc", "vtt"):
+                    text_updated = self._replace_speaker_labels_in_text(f"{base}.{ext}", mapping) or text_updated
+            if json_updated or text_updated:
+                QMessageBox.information(dialog, "Review Output", "Speaker names applied.")
+            else:
+                QMessageBox.information(dialog, "Review Output", "No changes were made.")
+
+        save_button.clicked.connect(on_apply)
+        close_button.clicked.connect(dialog.accept)
+
+        dialog.exec()
+
+    def _maybe_inject_speakers_into_json(self, input_file_path):
+        if not input_file_path:
+            return False
+        diarize_enabled = bool(getattr(self, "diarize_enable", None) and self.diarize_enable.isChecked())
+        if not diarize_enabled and not self._extra_args_has_flag("--diarize"):
+            return False
+        formats = getattr(self, "last_output_formats", [])
+        if "json" not in formats and "all" not in formats:
+            return False
+        output_dir = self.get_output_dir()
+        if not output_dir:
+            return False
+        filename_only = self._current_output_basename or os.path.splitext(os.path.basename(input_file_path))[0]
+        json_path = os.path.join(output_dir, filename_only + ".json")
+
+        srt_path = os.path.join(output_dir, filename_only + ".srt")
+        txt_path = os.path.join(output_dir, filename_only + ".txt")
+        temp_srt = bool(getattr(self, "_temp_srt_for_json", False))
+        temp_txt = bool(getattr(self, "_temp_txt_for_json", False))
+        updated = False
+
+        try:
+            if not os.path.exists(json_path):
+                return False
+            speaker_segments = self._read_speaker_segments_from_srt(srt_path)
+            if not speaker_segments:
+                speaker_segments = self._read_speaker_segments_from_txt(txt_path)
+            if not speaker_segments:
+                return False
+
+            with open(json_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, dict):
+                segments = data.get("segments") or []
+            elif isinstance(data, list):
+                segments = data
+            else:
+                return False
+            for segment in segments:
+                if not isinstance(segment, dict):
+                    continue
+                if segment.get("speaker"):
+                    continue
+                start = segment.get("start")
+                end = segment.get("end")
+                speaker = self._match_speaker_for_segment(start, end, speaker_segments)
+                if speaker:
+                    segment["speaker"] = speaker
+                    updated = True
+            if not updated:
+                return False
+            with open(json_path, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, indent=4, ensure_ascii=False)
+            if self.full_console_checkbox.isChecked():
+                self._append_text_to_console("\nAdded speaker labels to JSON output.\n")
+        except Exception as exc:
+            if self.full_console_checkbox.isChecked():
+                self._append_text_to_console(f"\nFailed to add speaker labels to JSON: {exc}\n")
+            return False
+        finally:
+            if temp_srt and os.path.exists(srt_path):
+                try:
+                    os.remove(srt_path)
+                except Exception:
+                    pass
+            if temp_txt and os.path.exists(txt_path):
+                try:
+                    os.remove(txt_path)
+                except Exception:
+                    pass
+        return updated
 
     def _format_lrc_timestamp(self, seconds):
         try:
@@ -5609,11 +6599,34 @@ class WhisperGUI(QMainWindow):
         if self.stop_requested:
             if self.full_console_checkbox.isChecked():
                 self._append_text_to_console("Process stopped by user.\n")
+            else:
+                self._append_text_to_console("\nStatus: Stopped\n")
         elif exit_code == 0 or self.transcription_completed_successfully:
             if self.full_console_checkbox.isChecked():
                 self._append_text_to_console("Process completed successfully.\n")
+            else:
+                self._append_text_to_console("\nStatus: Completed\n")
 
             self.rename_outputs_for_current_run()
+            self._last_review_output_dir = self.get_output_dir()
+            if self._current_output_basename:
+                self._last_review_output_base = self._current_output_basename
+            elif getattr(self, "current_input_file", None):
+                self._last_review_output_base = os.path.splitext(os.path.basename(self.current_input_file))[0]
+            self._review_link_ready = True
+            self._update_diarize_review_link()
+            if not self.full_console_checkbox.isChecked():
+                if self._extra_args_has_flag("--diarize") or (getattr(self, "diarize_enable", None) and self.diarize_enable.isChecked()):
+                    self._append_text_to_console(
+                        "Review Output: VAD tab → Diarization → Review Diarization Output\n"
+                    )
+            if (
+                (self._extra_args_has_flag("--diarize") or (getattr(self, "diarize_enable", None) and self.diarize_enable.isChecked()))
+                and not self.pending_files
+                and not (self.downloader and self.downloader.isRunning())
+            ):
+                if not getattr(self, "diarize_review_prompt_checkbox", None) or self.diarize_review_prompt_checkbox.isChecked():
+                    self._show_diarization_prompt()
 
             if ((hasattr(self, 'sentences_only_requested') and self.sentences_only_requested) or
                 (hasattr(self, 'txt_with_timestamps_requested') and self.txt_with_timestamps_requested)) and \
@@ -5632,6 +6645,10 @@ class WhisperGUI(QMainWindow):
                         self._append_text_to_console(
                             f"\nWord timestamps LRC saved to: {self.get_output_dir()}\n"
                         )
+            if hasattr(self, 'current_input_file') and self.current_input_file:
+                injected = self._maybe_inject_speakers_into_json(self.current_input_file)
+                if injected and not self.full_console_checkbox.isChecked():
+                    self._append_text_to_console("\nSpeaker labels added to JSON.\n")
             if not self.full_console_checkbox.isChecked():
                 output_dir = self.get_output_dir()
                 formats = getattr(self, "last_output_formats", [])
@@ -5858,6 +6875,29 @@ class WhisperGUI(QMainWindow):
             return
 
         self._append_text_to_console(f"YouTube Download Error:\n{error_message}\n")
+        error_lower = (error_message or "").lower()
+        if (
+            "http error 403" in error_lower
+            or "403: forbidden" in error_lower
+            or "403 forbidden" in error_lower
+        ):
+            self._append_text_to_console(
+                "\nTip: This usually means yt-dlp is outdated or YouTube changed access rules.\n"
+                "Try Settings -> yt-dlp and switch Source to EXE, then use the latest yt-dlp.exe.\n"
+                "If you use Python module mode, restart the app and accept the yt-dlp update prompt.\n"
+            )
+            if not self._shown_ytdlp_403_hint:
+                self._shown_ytdlp_403_hint = True
+                QMessageBox.information(
+                    self,
+                    "yt-dlp 403 Forbidden",
+                    (
+                        "YouTube returned HTTP 403 (Forbidden).\n\n"
+                        "Most common fix: use the latest yt-dlp.exe.\n"
+                        "Go to Settings -> yt-dlp, set Source to EXE, and point it to a new yt-dlp.exe.\n\n"
+                        "If you prefer Python module mode, restart and accept the yt-dlp update prompt."
+                    ),
+                )
         self.downloads_completed = True
         if not self.process and not self.pending_files:
             self.run_btn.setEnabled(True)
@@ -5930,6 +6970,11 @@ class WhisperGUI(QMainWindow):
         self.settings["vad_device"] = self.vad_device.currentText()
         self.settings["vad_threshold"] = self.vad_threshold.value()
         self.settings["vad_min_speech"] = self.vad_min_speech.value()
+        self.settings["diarize_backend"] = self.diarize_backend.currentText()
+        self.settings["diarize_device"] = self.diarize_device.currentText()
+        self.settings["diarize_num_speakers"] = self.diarize_num_speakers.value()
+        self.settings["diarize_min_speakers"] = self.diarize_min_speakers.value()
+        self.settings["diarize_max_speakers"] = self.diarize_max_speakers.value()
         
         checkbox_settings = dict(self.settings.get("checkboxes", {}))
         checkbox_settings.update(
@@ -5997,6 +7042,12 @@ class WhisperGUI(QMainWindow):
                 self._enforce_splitter_sizes_for_frozen()
 
         self.output_dir.setText(self.settings.get("output_dir", ""))
+        source_mode = self.settings.get("checkboxes", {}).get("output_dir_source_checkbox", False)
+        if self.output_dir.text().strip().lower() == "source":
+            source_mode = True
+        if getattr(self, "output_dir_source_checkbox", None):
+            self.output_dir_source_checkbox.setChecked(source_mode)
+            self.update_output_dir_mode(source_mode, save_text=False)
         self._ensure_models_registry()
         self._sync_models_from_disk()
         self._refresh_model_combo(preferred_name=self.settings.get("model", "large-v3"))
@@ -6037,6 +7088,11 @@ class WhisperGUI(QMainWindow):
         self.vad_device.setCurrentText(self.settings.get("vad_device", "Auto"))
         self.vad_threshold.setValue(self.settings.get("vad_threshold", 0.5))
         self.vad_min_speech.setValue(self.settings.get("vad_min_speech", 250))
+        self.diarize_backend.setCurrentText(self.settings.get("diarize_backend", "pyannote_v3.1"))
+        self.diarize_device.setCurrentText(self.settings.get("diarize_device", "Auto"))
+        self.diarize_num_speakers.setValue(self.settings.get("diarize_num_speakers", 0))
+        self.diarize_min_speakers.setValue(self.settings.get("diarize_min_speakers", 0))
+        self.diarize_max_speakers.setValue(self.settings.get("diarize_max_speakers", 0))
 
         all_checkboxes = {cb.objectName(): cb for cb in self.findChildren(QCheckBox) if cb.objectName()}
         checkbox_settings = self.settings.get("checkboxes", {})
@@ -6044,6 +7100,7 @@ class WhisperGUI(QMainWindow):
             if name in all_checkboxes:
                 all_checkboxes[name].setChecked(checked)
         self.apply_tooltip_visibility(self.tooltips_checkbox.isChecked())
+        self.update_diarization_controls(self.diarize_enable.isChecked())
         
         output_formats = self.settings.get("output_formats", ["srt"])
         for fmt, cb in self.output_format_checkboxes.items():

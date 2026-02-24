@@ -10,6 +10,9 @@ This document provides an in-depth explanation of all the settings and options a
     *   [File Tab](#file-tab)
     *   [yt-dlp Tab](#yt-dlp-tab)
 4.  [Global Settings](#4-global-settings)
+    *   [Output Dir](#output-dir)
+    *   [Output Location](#output-location)
+    *   [Output Name](#output-name)
     *   [Model](#model)
     *   [Model Manager (Custom Models)](#model-manager-custom-models)
     *   [Transformers -> CTranslate2 Conversion](#transformers---ctranslate2-conversion)
@@ -61,22 +64,23 @@ The application is divided into several tabs, each grouping related settings. Th
 
 ### File Tab
 
-*   **Input File:**
-    *   **Description:** Specifies the path to your local audio or video file that you wish to transcribe.
-    *   **Usage:** Click "Browse" to open a file dialog, or drag and drop a file directly onto the input field.
+*   **Input List:**
+    *   **Description:** Queue local audio/video files for transcription.
+    *   **Usage:** Use **Add Files**, **Add Folder**, **Remove Selected**, and **Clear All**. You can also drag and drop files/folders into the input area.
     *   **Supported Formats:** Common audio (MP3, WAV, M4A) and video (MP4, AVI, MOV, MKV) formats are supported.
-*   **Output Directory:**
-    *   **Description:** Defines where the generated transcription files (e.g., SRT, TXT) will be saved.
-    *   **Usage:** Click "Browse" to select a folder. If left empty, files will be saved in an `output` folder within the application's directory.
+*   **Note:** Output destination and output naming options are configured in **Global Settings**.
 
 ### yt-dlp Tab
 
-*   **YouTube URL:**
-    *   **Description:** Enter the URL of a YouTube video you want to download and transcribe. The application uses `yt-dlp` to fetch the content.
-    *   **Usage:** Paste the full YouTube video URL (e.g., `https://www.youtube.com/watch?v=dQw4w9WgXcQ`).
+*   **Links List:**
+    *   **Description:** Queue one or more URLs for download/transcription using `yt-dlp`.
+    *   **Usage:** Use **Add Links**, **Paste Links**, **Remove Selected**, and **Clear All**. You can also drop URLs into the list.
 *   **Audio-only:**
     *   **Description:** If checked, only the audio track of the YouTube video will be downloaded and processed. If unchecked, the full video will be downloaded.
     *   **Recommendation:** For transcription purposes, downloading audio-only is usually sufficient and significantly faster, saving bandwidth and storage. Only uncheck if you specifically need the video file.
+*   **Download all before transcribing:**
+    *   **Description:** If enabled, the app downloads all queued links first, then starts transcription.
+    *   **Recommendation:** Keep disabled for faster first-result time; enable when you want a full download pass before any transcription starts.
 *   **Manual yt-dlp updates (no Python):**
     *   **Description:** Download the latest `yt-dlp.exe` and set Source to `EXE (custom or PATH)` in Settings.
     *   **Usage:** Replace the exe when a new release is available; the app will use that file for downloads.
@@ -85,16 +89,34 @@ The application is divided into several tabs, each grouping related settings. Th
 
 These settings apply broadly to the transcription process and are crucial for performance and accuracy.
 
+### Output Dir
+
+*   **Description:** Sets the base directory where generated transcript files are written.
+*   **Usage:** Click **Browse** to choose a folder, or leave empty to use the app's default `output` folder.
+
+### Output Location
+
+*   **Description:** Controls whether outputs are written to the source media file's folder.
+*   **Option:** `Use source folder`
+*   **Behavior:** When checked, outputs go next to each input file (or downloaded media item) instead of the configured Output Dir.
+
+### Output Name
+
+*   **Description:** Controls output filename base behavior.
+*   **Option:** `Use input filename for outputs`
+*   **Behavior:** When checked, output files use the original media filename with transcription format extensions (`.srt`, `.txt`, etc.). When unchecked, default naming behavior is used.
+
 ### Model
 
 *   **Description:** Selects the Whisper model size to use for transcription. Larger models generally offer higher accuracy but require more computational resources (CPU/GPU and RAM/VRAM).
 *   **Options:** `tiny`, `base`, `small`, `medium`, `large`, `large-v2`, `large-v3`, `large-v3-turbo`.
-*   **Note:** `large-v3-turbo` uses a [community CTranslate2 conversion](https://huggingface.co/dropbox-dash/faster-whisper-large-v3-turbo). The official OpenAI repo is Transformers format and is not directly supported by the downloader.
+*   **Note:** Built-in `large-v3-turbo` uses a [community CTranslate2 conversion](https://huggingface.co/dropbox-dash/faster-whisper-large-v3-turbo).
+*   **Note:** The official OpenAI repo is Transformers format. You can still use it via **Manage Models** by downloading the repo and converting it to CTranslate2 (`model.bin`).
 *   **Note:** The app recognizes CTranslate2 model folders (look for a `model.bin` file). You can set the Model Directory to either the parent `_models` folder or a specific model folder.
 *   **Recommendation:**
     *   **`tiny`, `base`:** Good for quick transcriptions or systems with limited resources (e.g., older CPUs, integrated graphics). Accuracy might be lower.
     *   **`small`, `medium`:** A good balance between speed and accuracy for most modern systems.
-    *   **`large`, `large-v2`, `large-v3`:** Highest accuracy, but demand significant resources. Recommended for systems with dedicated GPUs (especially NVIDIA with CUDA) and ample VRAM (8GB+). `large-v3` is the latest and most accurate.
+    *   **`large`, `large-v2`, `large-v3`:** Highest accuracy, but demand significant resources. Recommended for systems with dedicated GPUs (especially NVIDIA with CUDA) and ample VRAM (8GB+). `large-v3` is the newest flagship and often the most accurate, but `large-v2` may be more stable on some content; if you see hallucinations, try `large-v2`.
 
 ### Model Manager (Custom Models)
 
