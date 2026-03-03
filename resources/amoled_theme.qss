@@ -104,6 +104,35 @@ QScrollBar::handle:vertical {
 QScrollBar::handle:vertical:hover {
     background-color: #333333;
 }
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+    background-color: #000000;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+    background: transparent;
+    border: none;
+    height: 0px;
+}
+QScrollBar:horizontal {
+    background-color: #000000;
+    height: 12px;
+    border-radius: 6px;
+}
+QScrollBar::handle:horizontal {
+    background-color: #222222;
+    border-radius: 6px;
+    min-width: 20px;
+}
+QScrollBar::handle:horizontal:hover {
+    background-color: #333333;
+}
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {
+    background-color: #000000;
+}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    background: transparent;
+    border: none;
+    width: 0px;
+}
 
 QComboBox QAbstractItemView {
     background-color: #000000;

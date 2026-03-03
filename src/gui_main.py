@@ -5712,7 +5712,7 @@ class WhisperGUI(QMainWindow):
                 status_bits.append(self._basename_only(self.current_input_file))
             if self._extra_args_has_flag("--diarize") or (getattr(self, "diarize_enable", None) and self.diarize_enable.isChecked()):
                 status_bits.append("diarization on")
-            self._append_text_to_console("\n" + " • ".join(status_bits) + "\n")
+            self._append_text_to_console("\n" + " • ".join(status_bits) + "\n\n\n")
 
         self.run_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -5760,9 +5760,14 @@ class WhisperGUI(QMainWindow):
         filtered_lines = []
 
         for line in lines:
-            if re.match(r'^\[\d+:\d+\.\d+ --> \d+:\d+\.\d+\]', line):
+            if re.match(
+                r'^\[(?:\d+:\d+\.\d+|\d+:\d+:\d+\.\d+)\s*-->\s*(?:\d+:\d+\.\d+|\d+:\d+:\d+\.\d+)\]',
+                line,
+            ):
                 filtered_lines.append(line)
-            elif 'Subtitles are written to' in line and self.full_console_checkbox.isChecked():
+            elif 'Subtitles are written to' in line:
+                if not filtered_lines or filtered_lines[-1] != "":
+                    filtered_lines.append("")
                 filtered_lines.append(line)
 
         return '\n'.join(filtered_lines) if filtered_lines else ''
@@ -5813,13 +5818,23 @@ class WhisperGUI(QMainWindow):
                 self._append_text_to_console(filtered + "\n")
 
     def _append_text_to_console(self, text_chunk, is_html=False):
+        vbar = self.output_text.verticalScrollBar()
+        was_at_bottom = True
+        if vbar is not None:
+            # Only auto-follow new output when the user is already at the bottom.
+            was_at_bottom = vbar.value() >= (vbar.maximum() - 2)
+
         cursor = self.output_text.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
 
         if is_html:
             cursor.insertHtml(text_chunk)
             self.last_line_was_overwrite = False 
-            self.output_text.ensureCursorVisible()
+            if was_at_bottom:
+                self.output_text.setTextCursor(cursor)
+                self.output_text.ensureCursorVisible()
+                if vbar is not None:
+                    vbar.setValue(vbar.maximum())
             return
 
         self.output_buffer += text_chunk.replace('\r\n', '\n')
@@ -5851,8 +5866,12 @@ class WhisperGUI(QMainWindow):
                 self.last_line_was_overwrite = False
             else:
                 self.last_line_was_overwrite = True
-        
-        self.output_text.ensureCursorVisible()
+
+        if was_at_bottom:
+            self.output_text.setTextCursor(cursor)
+            self.output_text.ensureCursorVisible()
+            if vbar is not None:
+                vbar.setValue(vbar.maximum())
 
 
     def create_sentences_only_file(self, txt_with_timestamps, sentences_only_path):
