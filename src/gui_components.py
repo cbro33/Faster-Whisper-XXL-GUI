@@ -1560,3 +1560,71 @@ class FileDropWidget(QWidget):
         if os.path.isdir(path):
             return True
         return path.lower().endswith(SUPPORTED_EXTENSIONS)
+
+
+class LoudnessProgressDialog(QDialog):
+    def __init__(self, total, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Analyze Loudness")
+        self.setModal(True)
+        self.setMinimumSize(420, 150)
+        self._total = total
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 12, 16, 14)
+        layout.setSpacing(10)
+
+        self.status_label = QLabel("Preparing analysis…", self)
+        layout.addWidget(self.status_label)
+
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setRange(0, self._total)
+        self.progress_bar.setValue(0)
+        layout.addWidget(self.progress_bar)
+
+        self.cancel_button = QPushButton("Cancel", self)
+        self.cancel_button.clicked.connect(self.reject)
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        button_layout.addWidget(self.cancel_button)
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
+
+    def update_progress(self, current, total, filename):
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(min(current, total))
+        if current >= total:
+            self.status_label.setText("Finalizing…")
+        else:
+            self.status_label.setText(f"Analyzing {current}/{total}: {filename}")
+
+
+class AudioPreprocessDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Preparing Audio")
+        self.setModal(True)
+        self.setMinimumSize(420, 150)
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 12, 16, 14)
+        layout.setSpacing(10)
+
+        self.status_label = QLabel("Preparing audio…", self)
+        layout.addWidget(self.status_label)
+
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setRange(0, 0)
+        layout.addWidget(self.progress_bar)
+
+        self.cancel_button = QPushButton("Cancel", self)
+        self.cancel_button.clicked.connect(self.reject)
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+        button_layout.addWidget(self.cancel_button)
+        button_layout.addStretch()
+        layout.addLayout(button_layout)

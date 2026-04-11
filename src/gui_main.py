@@ -4,7 +4,6 @@ import json
 import logging
 import time
 import shutil
-import tempfile
 import threading
 import requests
 import webbrowser
@@ -29,7 +28,12 @@ from config import APP_VERSION, SUPPORTED_EXTENSIONS
 from utils import (
     get_app_directory, get_settings_directory, get_portable_settings_directory,
     resource_path, format_path_for_display, detect_faster_whisper_binary_version,
-    run_hidden_subprocess, resolve_ffmpeg_location
+    run_hidden_subprocess, resolve_ffmpeg_location,
+    redact_path_text, looks_like_path_token, sanitize_command_display,
+    is_windows_path, windows_to_posix_path, sanitize_model_name,
+    parse_hf_repo_id, detect_model_arch_from_dir,
+    filter_verbose_output, extract_links_from_text,
+    normalize_version, version_tuple, text_indicates_transcription_success,
 )
 from python_utils import (
     enumerate_python_runtimes, get_execution_environment, get_executable_fallback_path,
@@ -42,21 +46,46 @@ from ytdlp_utils import (
     get_ytdlp_installation_info, refresh_yt_dlp_module_after_update, remove_external_yt_dlp,
     select_yt_dlp_source, set_ytdlp_debug_logging_enabled
 )
-from workers import YouTubeDownloader, YtDlpUpdateWorker
+from workers import (
+    YouTubeDownloader, YtDlpUpdateWorker, YtDlpVersionCheckWorker,
+    ConverterBundleRepairWorker, ConverterBundleVerifyWorker,
+    LoudnessAnalysisWorker, AudioPreprocessWorker, VerifyModelsWorker,
+)
 from gui_components import (
     DownloadManager, HardwareOptimizationDialog, FileDropGroupBox, FileDropListWidget,
     FileDropWidget, LinkDropGroupBox, LinkDropListWidget, UpdateProgressDialog, show_setup_critical,
     show_setup_question, show_setup_warning, show_setup_information,
     show_yt_dlp_unavailable, ModelDownloadDialog, set_model_download_logging_enabled,
     get_model_download_log_path, get_model_download_logger,
-    confirm_transformers_conversion, run_transformers_conversion_dialog, ConverterProgressDialog
+    confirm_transformers_conversion, run_transformers_conversion_dialog, ConverterProgressDialog,
+    LoudnessProgressDialog, AudioPreprocessDialog,
 )
 from gpu_utils import detect_hardware_capabilities
 from converter_utils import (
-    ensure_converter_bundle,
     scan_transformers_weights,
     get_converter_bundle_dir,
     get_converter_python_path,
+)
+from cuda_errors import (
+    detect_cuda_oom,
+    detect_cuda_kernel_incompatible,
+    detect_cublas_not_supported,
+    get_compute_fallback,
+    COMPUTE_FALLBACK_ORDER,
+)
+from output_formats import (
+    parse_txt_timestamp,
+    parse_srt_timestamp,
+    format_lrc_timestamp,
+    read_speaker_segments_from_srt,
+    read_speaker_segments_from_txt,
+    match_speaker_for_segment,
+    replace_speaker_labels_in_text,
+    apply_speaker_names_to_json,
+    inject_speakers_into_json,
+    create_sentences_only,
+    build_lrc_lines,
+    extra_args_has_flag,
 )
 
 MODEL_DIR_PREFIX = "faster-whisper-"
@@ -67,1131 +96,12 @@ BUILTIN_MODELS = [
 ]
 GITHUB_HEADERS = {"User-Agent": f"Faster-Whisper-XXL-GUI/{APP_VERSION}"}
 
-class YtDlpVersionCheckWorker(QThread):
-    finished = pyqtSignal(dict)
+from model_manager import ModelManagerDialog  # noqa: E402 — after MODULE_DIR_PREFIX is defined
+from gui_tabs import TabSetupMixin
+from gui_info_dialogs import InfoDialogsMixin  # noqa: E402
 
-    def __init__(self, url, timeout=5, parent=None):
-        super().__init__(parent)
-        self.url = url
-        self.timeout = timeout
 
-    def run(self):
-        result = {"ok": False, "status_code": None, "latest_version": None, "error": None}
-        try:
-            response = requests.get(self.url, timeout=self.timeout, headers=GITHUB_HEADERS)
-            result["status_code"] = response.status_code
-            if response.status_code == 200:
-                data = response.json()
-                result["latest_version"] = data.get("tag_name")
-            result["ok"] = True
-        except Exception as exc:
-            result["error"] = str(exc)
-        self.finished.emit(result)
-
-class ConverterBundleRepairWorker(QThread):
-    progress = pyqtSignal(str, int)
-    finished = pyqtSignal(bool, str)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.stop_requested = False
-
-    def stop(self):
-        self.stop_requested = True
-
-    def run(self):
-        try:
-            self.progress.emit("Clearing converter bundle cache...", -1)
-            bundle_dir = get_converter_bundle_dir()
-            if bundle_dir and os.path.isdir(bundle_dir):
-                shutil.rmtree(bundle_dir, ignore_errors=True)
-            if self.stop_requested:
-                self.finished.emit(False, "Repair cancelled.")
-                return
-
-            def progress_cb(message, downloaded, total):
-                if self.stop_requested:
-                    return
-                percent = -1
-                if total:
-                    try:
-                        percent = int((downloaded / total) * 100)
-                    except Exception:
-                        percent = -1
-                self.progress.emit(message, percent)
-
-            ensure_converter_bundle(progress_cb=progress_cb, cancel_cb=lambda: self.stop_requested)
-            if self.stop_requested:
-                self.finished.emit(False, "Repair cancelled.")
-            else:
-                self.finished.emit(True, "Converter bundle repaired.")
-        except Exception as exc:
-            if self.stop_requested:
-                self.finished.emit(False, "Repair cancelled.")
-            else:
-                self.finished.emit(False, str(exc))
-
-class ConverterBundleVerifyWorker(QThread):
-    progress = pyqtSignal(str)
-    finished = pyqtSignal(bool, str)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.stop_requested = False
-
-    def stop(self):
-        self.stop_requested = True
-
-    def _build_env(self):
-        env = os.environ.copy()
-        for key in ("PYTHONHOME", "PYTHONPATH"):
-            env.pop(key, None)
-        return env
-
-    def run(self):
-        try:
-            bundle_dir = get_converter_bundle_dir()
-            python_path = get_converter_python_path(bundle_dir)
-            if not python_path or not os.path.isfile(python_path):
-                self.finished.emit(False, "Converter bundle not installed.")
-                return
-            self.progress.emit("Verifying converter bundle...")
-            result = run_hidden_subprocess(
-                [
-                    python_path,
-                    "-c",
-                    (
-                        "import ctranslate2, transformers, torch, safetensors;"
-                        "import ctranslate2.converters.transformers;"
-                        "print('ctranslate2', ctranslate2.__version__);"
-                        "print('transformers', transformers.__version__);"
-                        "print('torch', torch.__version__);"
-                        "print('safetensors', safetensors.__version__)"
-                    )
-                ],
-                capture_output=True,
-                text=True,
-                timeout=20,
-                env=self._build_env(),
-            )
-            if result.returncode == 0:
-                self.finished.emit(True, "Converter bundle is ready.")
-            else:
-                detail = (result.stderr or result.stdout or "").strip()
-                if not detail:
-                    detail = "Missing required packages."
-                self.finished.emit(False, detail)
-        except Exception as exc:
-            if self.stop_requested:
-                self.finished.emit(False, "Verification cancelled.")
-            else:
-                self.finished.emit(False, str(exc))
-class LoudnessAnalysisWorker(QThread):
-    progress = pyqtSignal(int, int, str)
-    finished = pyqtSignal(object, object, bool)
-
-    def __init__(self, ffmpeg_path, file_paths, parent=None):
-        super().__init__(parent)
-        self.ffmpeg_path = ffmpeg_path
-        self.file_paths = list(file_paths)
-        self.stop_requested = False
-
-    def stop(self):
-        self.stop_requested = True
-
-    def run(self):
-        results = []
-        failed = []
-        total = len(self.file_paths)
-        for index, path in enumerate(self.file_paths, start=1):
-            if self.stop_requested:
-                break
-            self.progress.emit(index, total, os.path.basename(path))
-            data, error = self._analyze_loudness_file(path)
-            if data is None:
-                failed.append((path, error))
-            else:
-                results.append((path, data))
-        canceled = self.stop_requested
-        self.progress.emit(total, total, "Done")
-        self.finished.emit(results, failed, canceled)
-
-    def _analyze_loudness_file(self, input_file):
-        command = [
-            self.ffmpeg_path,
-            "-hide_banner",
-            "-i",
-            input_file,
-            "-filter_complex",
-            "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
-            "-f",
-            "null",
-            "-",
-        ]
-        result = run_hidden_subprocess(command, capture_output=True, text=True)
-        output = (result.stderr or "") + (result.stdout or "")
-        match = re.findall(r"\{.*?\}", output, flags=re.DOTALL)
-        if not match:
-            return None, "parse_failed"
-        try:
-            return json.loads(match[-1]), None
-        except json.JSONDecodeError:
-            return None, "decode_failed"
-
-class LoudnessProgressDialog(QDialog):
-    def __init__(self, total, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Analyze Loudness")
-        self.setModal(True)
-        self.setMinimumSize(420, 150)
-        self._total = total
-        self._setup_ui()
-
-    def _setup_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 12, 16, 14)
-        layout.setSpacing(10)
-
-        self.status_label = QLabel("Preparing analysis…", self)
-        layout.addWidget(self.status_label)
-
-        self.progress_bar = QProgressBar(self)
-        self.progress_bar.setRange(0, self._total)
-        self.progress_bar.setValue(0)
-        layout.addWidget(self.progress_bar)
-
-        self.cancel_button = QPushButton("Cancel", self)
-        self.cancel_button.clicked.connect(self.reject)
-        button_layout = QHBoxLayout()
-        button_layout.addStretch()
-        button_layout.addWidget(self.cancel_button)
-        button_layout.addStretch()
-        layout.addLayout(button_layout)
-
-    def update_progress(self, current, total, filename):
-        self.progress_bar.setRange(0, total)
-        self.progress_bar.setValue(min(current, total))
-        if current >= total:
-            self.status_label.setText("Finalizing…")
-        else:
-            self.status_label.setText(f"Analyzing {current}/{total}: {filename}")
-
-class AudioPreprocessWorker(QThread):
-    finished = pyqtSignal(object)
-
-    def __init__(self, ffmpeg_path, input_file, output_dir, filters, parent=None):
-        super().__init__(parent)
-        self.ffmpeg_path = ffmpeg_path
-        self.input_file = input_file
-        self.output_dir = output_dir
-        self.filters = list(filters or [])
-        self.stop_requested = False
-
-    def stop(self):
-        self.stop_requested = True
-
-    def run(self):
-        if not self.filters:
-            self.finished.emit({"ok": True, "path": self.input_file})
-            return
-        base_name = os.path.splitext(os.path.basename(self.input_file))[0]
-        stamp = int(time.time() * 1000)
-        output_path = os.path.join(self.output_dir, f"{base_name}_preprocessed_{stamp}.wav")
-        command = [
-            self.ffmpeg_path,
-            "-y",
-            "-i",
-            self.input_file,
-            "-filter_complex",
-            ",".join(self.filters),
-            "-c:a",
-            "pcm_s16le",
-            output_path,
-        ]
-        result = run_hidden_subprocess(command, capture_output=True, text=True)
-        if self.stop_requested:
-            if os.path.exists(output_path):
-                try:
-                    os.remove(output_path)
-                except Exception:
-                    pass
-            self.finished.emit({"ok": False, "error": "canceled"})
-            return
-        if result.returncode != 0:
-            snippet = (result.stderr or result.stdout or "").strip()
-            if snippet:
-                snippet = snippet.splitlines()[-1]
-            self.finished.emit({"ok": False, "error": snippet or "ffmpeg failed"})
-            return
-        self.finished.emit({"ok": True, "path": output_path})
-
-class AudioPreprocessDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Preparing Audio")
-        self.setModal(True)
-        self.setMinimumSize(420, 150)
-        self._setup_ui()
-
-    def _setup_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 12, 16, 14)
-        layout.setSpacing(10)
-
-        self.status_label = QLabel("Preparing audio…", self)
-        layout.addWidget(self.status_label)
-
-        self.progress_bar = QProgressBar(self)
-        self.progress_bar.setRange(0, 0)
-        layout.addWidget(self.progress_bar)
-
-        self.cancel_button = QPushButton("Cancel", self)
-        self.cancel_button.clicked.connect(self.reject)
-        button_layout = QHBoxLayout()
-        button_layout.addStretch()
-        button_layout.addWidget(self.cancel_button)
-        button_layout.addStretch()
-        layout.addLayout(button_layout)
-
-class VerifyModelsWorker(QThread):
-    progress = pyqtSignal(int, int, str)
-    finished = pyqtSignal(list)
-
-    def __init__(self, executable_path, checks, audio_path, device_type, compute_type, parent=None):
-        super().__init__(parent)
-        self.executable_path = executable_path
-        self.checks = list(checks)
-        self.audio_path = audio_path
-        self.device_type = device_type
-        self.compute_type = compute_type
-        self._cancel_event = threading.Event()
-
-    def cancel(self):
-        self._cancel_event.set()
-
-    def run(self):
-        results = []
-        total = len(self.checks)
-        for index, item in enumerate(self.checks, start=1):
-            if self._cancel_event.is_set():
-                results.append((item["name"], "Cancelled", "Verification cancelled by user."))
-                break
-            self.progress.emit(index, total, item["name"])
-            temp_dir = tempfile.mkdtemp(prefix="fw-verify-")
-            cmd = [
-                self.executable_path,
-                "--check_files",
-                "-m",
-                item["name"],
-                "--model_dir",
-                item["model_dir_cli"],
-                "--device",
-                self.device_type,
-                "--compute_type",
-                self.compute_type,
-                "--output_dir",
-                temp_dir,
-                self.audio_path,
-            ]
-            try:
-                result = run_hidden_subprocess(cmd, capture_output=True, text=True, timeout=45)
-            except Exception as exc:
-                results.append((item["name"], "Failed", f"Failed to run check: {exc}"))
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                continue
-            output = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
-            output = output.strip()
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            if result.returncode == 0:
-                results.append((item["name"], "OK", output or "Model check passed."))
-            else:
-                message = output or "Model check failed."
-                if result.returncode == -1073741819:
-                    message += (
-                        "\nThe backend crashed while loading the model. This usually means the model "
-                        "conversion is incompatible with the bundled faster-whisper-xxl binary."
-                    )
-                results.append((item["name"], "Failed", message))
-        self.finished.emit(results)
-
-class ModelManagerDialog(QDialog):
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.parent = parent
-        self._loading_table = False
-        self.setWindowTitle("Manage Models")
-        self.setModal(True)
-        self.setMinimumSize(720, 720)
-
-        layout = QVBoxLayout(self)
-        info_label = QLabel(
-            "Enable models to show them in the dropdown. Built-in models can be disabled too.\n"
-            "Custom models are stored in the _models/custom folder."
-        )
-        info_label.setWordWrap(True)
-        layout.addWidget(info_label)
-
-        conversion_group = QGroupBox("Conversion Settings")
-        conversion_layout = QFormLayout(conversion_group)
-        self.auto_convert_checkbox = QCheckBox("Auto-convert Transformers models")
-        self.auto_convert_checkbox.setToolTip(
-            "When a model repo only has Transformers weights (model.safetensors / pytorch_model.bin), "
-            "automatically convert it to CTranslate2 (model.bin)."
-        )
-        conversion_layout.addRow(self.auto_convert_checkbox)
-
-        self.converter_python_path_input = QLineEdit()
-        self.converter_python_path_input.setPlaceholderText("Optional: override converter Python")
-        self.converter_python_path_input.setToolTip(
-            "Use a specific Python for model conversion (e.g., your conda env python.exe). "
-            "Leave empty to use the current Python."
-        )
-        self.converter_pick_button = QToolButton()
-        self.converter_pick_button.setText("Detect ▾")
-        self.converter_pick_button.setToolTip("Select from detected Python installations.")
-        self.converter_pick_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        self.converter_pick_menu = QMenu(self.converter_pick_button)
-        self.converter_pick_button.setMenu(self.converter_pick_menu)
-        self.converter_pick_button.setStyleSheet(
-            "QToolButton { padding-right: 6px; }"
-            "QToolButton::menu-indicator { image: none; width: 0px; }"
-        )
-        converter_browse = QPushButton("Browse")
-        converter_browse.setToolTip("Select a Python executable for conversion.")
-        self.converter_python_row_widget = QWidget()
-        converter_row = QHBoxLayout(self.converter_python_row_widget)
-        converter_row.setContentsMargins(0, 0, 0, 0)
-        converter_row.addWidget(self.converter_python_path_input)
-        converter_row.addWidget(self.converter_pick_button)
-        converter_row.addWidget(converter_browse)
-        self.converter_python_label = QLabel("Converter Python:")
-        conversion_layout.addRow(self.converter_python_label, self.converter_python_row_widget)
-
-        self.verify_bundle_button = QPushButton("Verify Bundle")
-        self.verify_bundle_button.setToolTip("Check if the converter bundle is healthy.")
-        self.repair_bundle_button = QPushButton("Repair Bundle")
-        self.repair_bundle_button.setToolTip("Delete and re-download the converter bundle.")
-        bundle_row = QHBoxLayout()
-        bundle_row.addWidget(self.verify_bundle_button)
-        bundle_row.addWidget(self.repair_bundle_button)
-        bundle_row.addStretch()
-        conversion_layout.addRow("Converter Bundle:", bundle_row)
-        layout.addWidget(conversion_group)
-
-        self.table = QTableWidget(self)
-        self.table.setColumnCount(5)
-        self.table.setHorizontalHeaderLabels(["Enabled", "Model", "Status", "Source", "Location"])
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.table.verticalHeader().setVisible(False)
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.itemChanged.connect(self._handle_item_changed)
-        layout.addWidget(self.table)
-
-        button_row = QHBoxLayout()
-        self.add_hf_button = QPushButton("Add from HF...")
-        self.import_button = QPushButton("Import Local...")
-        self.refresh_button = QPushButton("Rescan")
-        self.verify_button = QPushButton("Verify Enabled")
-        self.more_button = QToolButton()
-        self.more_button.setText("More ▾")
-        self.more_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        more_menu = QMenu(self.more_button)
-        self.enable_all_action = more_menu.addAction("Enable All")
-        self.disable_all_action = more_menu.addAction("Disable All")
-        more_menu.addSeparator()
-        self.delete_selected_action = more_menu.addAction("Delete Selected...")
-        self.more_button.setMenu(more_menu)
-        self.more_button.setStyleSheet(
-            "QToolButton { padding-right: 6px; }"
-            "QToolButton::menu-indicator { image: none; width: 0px; }"
-        )
-        self.close_button = QPushButton("Close")
-        button_row.addWidget(self.add_hf_button)
-        button_row.addWidget(self.import_button)
-        button_row.addWidget(self.refresh_button)
-        button_row.addWidget(self.verify_button)
-        button_row.addWidget(self.more_button)
-        button_row.addStretch()
-        button_row.addWidget(self.close_button)
-        layout.addLayout(button_row)
-
-        self.add_hf_button.clicked.connect(self._add_from_hf)
-        self.import_button.clicked.connect(self._import_local_model)
-        self.refresh_button.clicked.connect(self._rescan_models)
-        self.enable_all_action.triggered.connect(self._enable_all_models)
-        self.disable_all_action.triggered.connect(self._disable_all_models)
-        self.delete_selected_action.triggered.connect(self._delete_selected_models)
-        self.verify_button.clicked.connect(self._verify_selected_model)
-        self.close_button.clicked.connect(self.accept)
-        self.auto_convert_checkbox.toggled.connect(self._save_auto_convert_setting)
-        self.converter_python_path_input.textChanged.connect(self._save_converter_python_path)
-        self.converter_pick_menu.aboutToShow.connect(self._populate_converter_python_menu)
-        self.converter_pick_menu.triggered.connect(self._select_converter_python_action)
-        converter_browse.clicked.connect(self._browse_converter_python)
-        if getattr(sys, "frozen", False):
-            self.converter_python_row_widget.setVisible(False)
-            self.converter_python_label.setVisible(False)
-            self.converter_python_hint = QLabel(
-                "EXE builds use the converter bundle by default."
-            )
-            self.converter_python_hint.setWordWrap(True)
-            self.converter_python_hint.setStyleSheet("color: #a0a0a0;")
-            self.converter_python_link = QPushButton("Use custom Python anyway...")
-            self.converter_python_link.setFlat(True)
-            self.converter_python_link.setStyleSheet(
-                "QPushButton { color: #4da3ff; text-decoration: underline; border: none; padding: 0; }"
-            )
-            conversion_layout.addRow(self.converter_python_hint)
-            conversion_layout.addRow(self.converter_python_link)
-            self.converter_python_link.clicked.connect(self._show_converter_python_row)
-        self.verify_bundle_button.clicked.connect(self.parent.verify_converter_bundle)
-        self.repair_bundle_button.clicked.connect(self.parent.repair_converter_bundle)
-
-        self._load_table()
-        self._load_conversion_settings()
-        QTimer.singleShot(0, self._clear_table_focus)
-
-    def _clear_table_focus(self):
-        self.table.setCurrentIndex(QModelIndex())
-        self.table.clearSelection()
-        if self.close_button:
-            self.close_button.setFocus()
-
-    def _load_conversion_settings(self):
-        checkbox_settings = self.parent.settings.get("checkboxes", {})
-        auto_convert = bool(checkbox_settings.get("auto_convert_transformers_checkbox", False))
-        self.auto_convert_checkbox.blockSignals(True)
-        self.auto_convert_checkbox.setChecked(auto_convert)
-        self.auto_convert_checkbox.blockSignals(False)
-
-        converter_path = self.parent.settings.get("converter_python_path", "")
-        self.converter_python_path_input.blockSignals(True)
-        self.converter_python_path_input.setText(converter_path)
-        self.converter_python_path_input.blockSignals(False)
-
-    def _save_auto_convert_setting(self, checked):
-        checkbox_settings = dict(self.parent.settings.get("checkboxes", {}))
-        checkbox_settings["auto_convert_transformers_checkbox"] = bool(checked)
-        self.parent.settings["checkboxes"] = checkbox_settings
-        self.parent.save_settings_to_file()
-
-    def _save_converter_python_path(self):
-        converter_path = self.converter_python_path_input.text().strip()
-        self.parent.settings["converter_python_path"] = converter_path
-        if converter_path:
-            os.environ["FWHISPER_CONVERTER_PYTHON"] = converter_path
-        else:
-            os.environ.pop("FWHISPER_CONVERTER_PYTHON", None)
-        self.parent.save_settings_to_file()
-
-    def _browse_converter_python(self):
-        start_dir = ""
-        current = self.converter_python_path_input.text().strip()
-        if current and os.path.isdir(current):
-            start_dir = current
-        elif current and os.path.isfile(current):
-            start_dir = os.path.dirname(current)
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select Python Executable",
-            start_dir,
-            "Python Executable (python.exe);;All Files (*.*)"
-        )
-        if not path:
-            return
-        self.converter_python_path_input.setText(path)
-        self._save_converter_python_path()
-
-    def _show_converter_python_row(self):
-        if getattr(self, "converter_python_row_widget", None):
-            self.converter_python_row_widget.setVisible(True)
-        if getattr(self, "converter_python_label", None):
-            self.converter_python_label.setVisible(True)
-        if getattr(self, "converter_python_hint", None):
-            self.converter_python_hint.setVisible(False)
-        if getattr(self, "converter_python_link", None):
-            self.converter_python_link.setVisible(False)
-
-    def _populate_converter_python_menu(self):
-        self.converter_pick_menu.clear()
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            runtimes = enumerate_python_runtimes()
-        finally:
-            QApplication.restoreOverrideCursor()
-        items = []
-        for runtime in runtimes:
-            exe = runtime.get("executable")
-            version = runtime.get("version") or "unknown"
-            if not exe:
-                continue
-            label = f"Python {version} - {exe}"
-            if getattr(sys, "frozen", False):
-                try:
-                    if os.path.abspath(exe) == os.path.abspath(sys.executable):
-                        label = f"Bundled (EXE) - Python {version} - {exe}"
-                except Exception:
-                    pass
-            items.append((label, exe))
-        if not items:
-            action = self.converter_pick_menu.addAction("No Python installations found")
-            action.setEnabled(False)
-            return
-        for label, exe in items:
-            action = self.converter_pick_menu.addAction(label)
-            action.setData(exe)
-
-    def _select_converter_python_action(self, action):
-        path = action.data()
-        if not path:
-            return
-        self.converter_python_path_input.setText(str(path))
-        self._save_converter_python_path()
-
-    def _sorted_entries(self):
-        priority = {
-            "builtin": 0,
-            "hf": 1,
-            "local": 2,
-        }
-        entries = list(self.parent._get_models_registry())
-        return sorted(
-            entries,
-            key=lambda entry: (
-                priority.get(entry.get("source", "unknown"), 99),
-                (entry.get("display_name") or entry.get("name") or "").lower(),
-            ),
-        )
-
-    def _load_table(self):
-        entries = self._sorted_entries()
-        self._loading_table = True
-        self.table.setRowCount(len(entries))
-        for row, entry in enumerate(entries):
-            enabled_item = QTableWidgetItem()
-            enabled_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
-            enabled_item.setCheckState(Qt.CheckState.Checked if entry.get("enabled") else Qt.CheckState.Unchecked)
-            enabled_item.setData(Qt.ItemDataRole.UserRole, entry.get("name"))
-            self.table.setItem(row, 0, enabled_item)
-
-            display_name = entry.get("display_name") or entry.get("name") or ""
-            name_item = QTableWidgetItem(display_name)
-            name_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-            tooltip_parts = [f"Internal name: {entry.get('name', '')}"]
-            if entry.get("repo_id"):
-                tooltip_parts.append(f"Repo: {entry.get('repo_id')}")
-            name_item.setToolTip("\n".join(part for part in tooltip_parts if part))
-            self.table.setItem(row, 1, name_item)
-
-            status_value = entry.get("verify_status")
-            status_label = "Unknown"
-            if status_value == "ok":
-                status_label = "OK"
-            elif status_value == "failed":
-                status_label = "Failed"
-            elif status_value == "missing":
-                status_label = "Not Downloaded"
-            elif status_value == "skipped":
-                status_label = "Skipped"
-            status_item = QTableWidgetItem(status_label)
-            status_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-            if entry.get("verify_message"):
-                status_item.setToolTip(entry.get("verify_message"))
-            self.table.setItem(row, 2, status_item)
-
-            source_value = entry.get("source", "unknown")
-            source_label = {
-                "builtin": "Built-in",
-                "hf": "HF",
-                "local": "Local",
-            }.get(source_value, "Unknown")
-            source_item = QTableWidgetItem(source_label)
-            source_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-            self.table.setItem(row, 3, source_item)
-
-            location_label = "Custom" if entry.get("root") == "custom" else "Default"
-            location_item = QTableWidgetItem(location_label)
-            location_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
-            self.table.setItem(row, 4, location_item)
-        self._loading_table = False
-
-    def _handle_item_changed(self, item):
-        if self._loading_table or item.column() != 0:
-            return
-        model_name = item.data(Qt.ItemDataRole.UserRole)
-        entry = self.parent._find_model_entry(model_name)
-        if not entry:
-            return
-        new_enabled = item.checkState() == Qt.CheckState.Checked
-        if not new_enabled:
-            enabled_count = sum(1 for e in self.parent._get_models_registry() if e.get("enabled"))
-            if enabled_count <= 1:
-                QMessageBox.information(
-                    self,
-                    "Model Required",
-                    "At least one model must remain enabled.",
-                )
-                self._loading_table = True
-                item.setCheckState(Qt.CheckState.Checked)
-                self._loading_table = False
-                return
-        entry["enabled"] = new_enabled
-        self.parent._models_registry_dirty = True
-
-    def _add_from_hf(self):
-        repo_text, ok = QInputDialog.getText(
-            self,
-            "Add Model from Hugging Face",
-            "Enter Hugging Face repo ID or URL:",
-        )
-        if not ok or not repo_text.strip():
-            return
-        repo_id = self.parent._parse_hf_repo_id(repo_text)
-        if not repo_id:
-            QMessageBox.warning(self, "Invalid Repo", "Please enter a valid Hugging Face repo ID or URL.")
-            return
-        default_name = repo_id.split("/", 1)[-1]
-        display_name, ok = QInputDialog.getText(
-            self,
-            "Model Name",
-            "Display name (used for folder and dropdown):",
-            text=default_name,
-        )
-        if not ok:
-            return
-        display_name = (display_name or "").strip() or default_name
-        model_name = self.parent._sanitize_model_name(display_name)
-        if not model_name:
-            QMessageBox.warning(self, "Invalid Name", "Please provide a valid model name.")
-            return
-        _, base_local = self.parent.get_model_dirs()
-        if not base_local:
-            QMessageBox.warning(self, "Model Directory", "Model directory is not available yet.")
-            return
-        custom_root = os.path.join(base_local, "custom")
-        target_dir = os.path.join(custom_root, self.parent._get_model_folder_name(model_name))
-        existing_entry = self.parent._find_model_entry(model_name)
-        if existing_entry:
-            folder_exists = os.path.isdir(target_dir)
-            has_model_bin = folder_exists and os.path.isfile(os.path.join(target_dir, "model.bin"))
-            has_weights = folder_exists and bool(scan_transformers_weights(target_dir))
-            dialog = QMessageBox(self)
-            dialog.setWindowTitle("Model Already Exists")
-            dialog.setIcon(QMessageBox.Icon.Warning)
-            if has_model_bin:
-                dialog.setText(
-                    "A model with this name already exists and contains model.bin:\n"
-                    f"{target_dir}"
-                )
-                dialog.setInformativeText(
-                    "Replace the folder to re-download a clean copy."
-                )
-            elif has_weights:
-                dialog.setText(
-                    "A model with this name already exists, but it still needs conversion:\n"
-                    f"{target_dir}"
-                )
-                dialog.setInformativeText(
-                    "Convert the existing files now, or replace the folder to re-download."
-                )
-            else:
-                dialog.setText(
-                    "A model with this name already exists, but the folder looks incomplete:\n"
-                    f"{target_dir}"
-                )
-                dialog.setInformativeText(
-                    "Replace the folder to download a clean copy."
-                )
-            convert_button = None
-            if has_weights and not has_model_bin:
-                convert_button = dialog.addButton("Convert existing files", QMessageBox.ButtonRole.ActionRole)
-            replace_button = dialog.addButton("Replace folder", QMessageBox.ButtonRole.DestructiveRole)
-            dialog.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-            dialog.setDefaultButton(replace_button)
-            dialog.exec()
-            clicked = dialog.clickedButton()
-            if convert_button and clicked is convert_button:
-                self.parent._maybe_convert_transformers_model(target_dir, parent=self)
-                return
-            if clicked is replace_button:
-                registry = self.parent._get_models_registry()
-                registry[:] = [entry for entry in registry if entry.get("name") != model_name]
-                self.parent._models_registry_dirty = True
-                self.parent.save_settings_to_file()
-                if folder_exists:
-                    try:
-                        shutil.rmtree(target_dir)
-                    except Exception as exc:
-                        QMessageBox.warning(
-                            self,
-                            "Delete Failed",
-                            f"Could not delete existing folder:\n{exc}",
-                        )
-                        return
-            else:
-                return
-        if os.path.exists(target_dir):
-            has_model_bin = os.path.isfile(os.path.join(target_dir, "model.bin"))
-            has_weights = bool(scan_transformers_weights(target_dir))
-            dialog = QMessageBox(self)
-            dialog.setWindowTitle("Folder Exists")
-            dialog.setIcon(QMessageBox.Icon.Warning)
-            if has_model_bin or has_weights:
-                dialog.setText(
-                    "A model folder already exists for this name:\n"
-                    f"{target_dir}"
-                )
-                dialog.setInformativeText(
-                    "Replace it to re-download a clean copy (recommended). "
-                    "Use existing only if you trust the current files."
-                )
-            else:
-                dialog.setText(
-                    "A model folder already exists, but it looks incomplete:\n"
-                    f"{target_dir}"
-                )
-                dialog.setInformativeText(
-                    "Replace it to download a clean copy."
-                )
-            use_button = None
-            if has_model_bin or has_weights:
-                use_button = dialog.addButton("Use existing files", QMessageBox.ButtonRole.ActionRole)
-            delete_button = dialog.addButton("Replace folder", QMessageBox.ButtonRole.DestructiveRole)
-            dialog.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-            dialog.setDefaultButton(delete_button)
-            dialog.exec()
-            clicked = dialog.clickedButton()
-            if clicked is delete_button:
-                try:
-                    shutil.rmtree(target_dir)
-                except Exception as exc:
-                    QMessageBox.warning(
-                        self,
-                        "Delete Failed",
-                        f"Could not delete existing folder:\n{exc}",
-                    )
-                    return
-            elif use_button and clicked is use_button:
-                model_bin = os.path.join(target_dir, "model.bin")
-                if not os.path.isfile(model_bin) and not scan_transformers_weights(target_dir):
-                    QMessageBox.warning(
-                        self,
-                        "Invalid Model Folder",
-                        "No model.bin or Transformers weights were found in that folder.\n"
-                        "Please delete it and re-download.",
-                    )
-                    return
-                self.parent._get_models_registry().append({
-                    "name": model_name,
-                    "display_name": display_name,
-                    "source": "hf",
-                    "enabled": True,
-                    "root": "custom",
-                    "repo_id": repo_id,
-                })
-                self.parent._models_registry_dirty = True
-                self._load_table()
-                if not os.path.isfile(model_bin):
-                    self.parent._maybe_convert_transformers_model(target_dir, parent=self)
-                return
-            else:
-                return
-        confirm = QMessageBox.question(
-            self,
-            "Download Model",
-            f"Download '{display_name}' from {repo_id} to:\n{target_dir}\n\nContinue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if confirm != QMessageBox.StandardButton.Yes:
-            return
-        dialog = ModelDownloadDialog(
-            model_name,
-            target_dir,
-            parent=self,
-            repo_id=repo_id,
-            display_name=display_name,
-            download_all_files=True,
-            auto_convert_transformers=self.parent._should_auto_convert_transformers(),
-        )
-        result = dialog.exec()
-        if result != QDialog.DialogCode.Accepted:
-            return
-        self.parent._get_models_registry().append({
-            "name": model_name,
-            "display_name": display_name,
-            "source": "hf",
-            "enabled": True,
-            "root": "custom",
-            "repo_id": repo_id,
-        })
-        self.parent._models_registry_dirty = True
-        self._load_table()
-
-    def _import_local_model(self):
-        source_dir = QFileDialog.getExistingDirectory(self, "Select a CTranslate2 Model Folder")
-        if not source_dir:
-            return
-        model_bin = os.path.join(source_dir, "model.bin")
-        if not os.path.isfile(model_bin):
-            if not self.parent._maybe_convert_transformers_model(source_dir, parent=self):
-                QMessageBox.warning(self, "Invalid Model", "model.bin was not found in that folder.")
-                return
-        default_name = os.path.basename(source_dir)
-        if default_name.startswith(MODEL_DIR_PREFIX):
-            default_name = default_name[len(MODEL_DIR_PREFIX):]
-        display_name, ok = QInputDialog.getText(
-            self,
-            "Model Name",
-            "Display name (used for folder and dropdown):",
-            text=default_name,
-        )
-        if not ok:
-            return
-        display_name = (display_name or "").strip() or default_name
-        model_name = self.parent._sanitize_model_name(display_name)
-        if not model_name:
-            QMessageBox.warning(self, "Invalid Name", "Please provide a valid model name.")
-            return
-        _, base_local = self.parent.get_model_dirs()
-        if not base_local:
-            QMessageBox.warning(self, "Model Directory", "Model directory is not available yet.")
-            return
-        custom_root = os.path.join(base_local, "custom")
-        target_dir = os.path.join(custom_root, self.parent._get_model_folder_name(model_name))
-        existing_entry = self.parent._find_model_entry(model_name)
-        if existing_entry:
-            folder_exists = os.path.isdir(target_dir)
-            has_model_bin = folder_exists and os.path.isfile(os.path.join(target_dir, "model.bin"))
-            has_weights = folder_exists and bool(scan_transformers_weights(target_dir))
-            dialog = QMessageBox(self)
-            dialog.setWindowTitle("Model Already Exists")
-            dialog.setIcon(QMessageBox.Icon.Warning)
-            if has_model_bin:
-                dialog.setText(
-                    "A model with this name already exists and contains model.bin:\n"
-                    f"{target_dir}"
-                )
-                dialog.setInformativeText(
-                    "Replace the folder to re-import a clean copy."
-                )
-            elif has_weights:
-                dialog.setText(
-                    "A model with this name already exists, but it still needs conversion:\n"
-                    f"{target_dir}"
-                )
-                dialog.setInformativeText(
-                    "Convert the existing files now, or replace the folder to re-import."
-                )
-            else:
-                dialog.setText(
-                    "A model with this name already exists, but the folder looks incomplete:\n"
-                    f"{target_dir}"
-                )
-                dialog.setInformativeText(
-                    "Replace the folder to import a clean copy."
-                )
-            convert_button = None
-            if has_weights and not has_model_bin:
-                convert_button = dialog.addButton("Convert existing files", QMessageBox.ButtonRole.ActionRole)
-            replace_button = dialog.addButton("Replace folder", QMessageBox.ButtonRole.DestructiveRole)
-            dialog.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-            dialog.setDefaultButton(replace_button)
-            dialog.exec()
-            clicked = dialog.clickedButton()
-            if convert_button and clicked is convert_button:
-                self.parent._maybe_convert_transformers_model(target_dir, parent=self)
-                return
-            if clicked is replace_button:
-                registry = self.parent._get_models_registry()
-                registry[:] = [entry for entry in registry if entry.get("name") != model_name]
-                self.parent._models_registry_dirty = True
-                self.parent.save_settings_to_file()
-                if folder_exists:
-                    try:
-                        shutil.rmtree(target_dir)
-                    except Exception as exc:
-                        QMessageBox.warning(
-                            self,
-                            "Delete Failed",
-                            f"Could not delete existing folder:\n{exc}",
-                        )
-                        return
-            else:
-                return
-        if os.path.exists(target_dir):
-            QMessageBox.warning(
-                self,
-                "Folder Exists",
-                f"The folder already exists:\n{target_dir}",
-            )
-            return
-        confirm = QMessageBox.question(
-            self,
-            "Import Model",
-            "This will copy the selected model folder into:\n"
-            f"{target_dir}\n\nContinue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if confirm != QMessageBox.StandardButton.Yes:
-            return
-        try:
-            shutil.copytree(source_dir, target_dir)
-        except Exception as exc:
-            QMessageBox.warning(self, "Import Failed", f"Failed to copy model:\n{exc}")
-            return
-        self.parent._get_models_registry().append({
-            "name": model_name,
-            "display_name": display_name,
-            "source": "local",
-            "enabled": True,
-            "root": "custom",
-        })
-        self.parent._models_registry_dirty = True
-        self._load_table()
-
-    def _rescan_models(self):
-        self.parent._sync_models_from_disk()
-        self._load_table()
-
-    def _enable_all_models(self):
-        entries = self.parent._get_models_registry()
-        for entry in entries:
-            entry["enabled"] = True
-        self.parent._models_registry_dirty = True
-        self._load_table()
-
-    def _disable_all_models(self):
-        entries = self.parent._get_models_registry()
-        if not entries:
-            return
-        keep_name = self.parent._get_selected_model_name()
-        keep_entry = self.parent._find_model_entry(keep_name)
-        if not keep_entry and entries:
-            keep_entry = entries[0]
-        for entry in entries:
-            entry["enabled"] = False
-        if keep_entry:
-            keep_entry["enabled"] = True
-        self.parent._models_registry_dirty = True
-        self._load_table()
-
-    def _get_selected_table_models(self):
-        selected_rows = set()
-        for item in self.table.selectedItems():
-            selected_rows.add(item.row())
-        models = []
-        for row in sorted(selected_rows):
-            name_item = self.table.item(row, 0)
-            if name_item:
-                model_name = name_item.data(Qt.ItemDataRole.UserRole)
-                if model_name:
-                    models.append(model_name)
-        return models
-
-    def _verify_selected_model(self):
-        model_names = [entry.get("name") for entry in self.parent._get_enabled_model_entries()]
-        model_names = [name for name in model_names if name]
-        if not model_names:
-            QMessageBox.warning(self, "Verify Model", "No model selected.")
-            return
-        self.parent.verify_model_files(model_names, parent=self)
-        self._load_table()
-
-    def _delete_selected_models(self):
-        model_names = self._get_selected_table_models()
-        if not model_names:
-            QMessageBox.warning(self, "Delete Models", "No models selected.")
-            return
-
-        custom_names = []
-        blocked_names = []
-        for name in model_names:
-            entry = self.parent._find_model_entry(name)
-            if not entry:
-                continue
-            if entry.get("root") != "custom":
-                blocked_names.append(name)
-                continue
-            custom_names.append(name)
-
-        if blocked_names and not custom_names:
-            QMessageBox.information(
-                self,
-                "Delete Models",
-                "Only custom models can be deleted from disk.",
-            )
-            return
-
-        if not custom_names:
-            QMessageBox.warning(self, "Delete Models", "No custom models selected.")
-            return
-
-        message = (
-            "Delete selected custom models?\n\n"
-            "• Delete Files: removes model folders from disk (recommended to free space)\n"
-            "• Remove Only: removes from the list but keeps files on disk (may reappear after Rescan)\n"
-        )
-        dialog = QMessageBox(self)
-        dialog.setWindowTitle("Delete Models")
-        dialog.setIcon(QMessageBox.Icon.Warning)
-        dialog.setText(message)
-        delete_button = dialog.addButton("Delete Files", QMessageBox.ButtonRole.DestructiveRole)
-        remove_button = dialog.addButton("Remove Only", QMessageBox.ButtonRole.ActionRole)
-        dialog.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-        dialog.exec()
-        clicked = dialog.clickedButton()
-
-        if clicked not in (delete_button, remove_button):
-            return
-
-        delete_files = clicked is delete_button
-        errors = []
-        removed = 0
-
-        registry = self.parent._get_models_registry()
-        remaining = []
-        _, base_local = self.parent.get_model_dirs()
-        custom_root = os.path.join(base_local, "custom") if base_local else None
-
-        for entry in registry:
-            entry_name = entry.get("name")
-            entry_root = entry.get("root")
-            if entry_name in custom_names and entry_root == "custom":
-                removed += 1
-                if delete_files and custom_root:
-                    folder = self.parent._get_model_folder_name(entry_name)
-                    target_dir = os.path.join(custom_root, folder)
-                    if os.path.isdir(target_dir):
-                        try:
-                            shutil.rmtree(target_dir)
-                        except Exception as exc:
-                            errors.append(f"{entry_name}: {exc}")
-                continue
-            remaining.append(entry)
-
-        if removed:
-            self.parent.settings["models_registry"] = remaining
-            self.parent._models_registry_dirty = True
-            self.parent.save_settings_to_file()
-            self.parent._models_registry_dirty = False
-            self._load_table()
-            self.parent._refresh_model_combo(preferred_name=None)
-
-        if errors:
-            QMessageBox.warning(
-                self,
-                "Delete Models",
-                "Some models could not be deleted:\n" + "\n".join(errors),
-            )
-
-class WhisperGUI(QMainWindow):
+class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
     def __init__(self):
         super().__init__()
         self.process = None
@@ -1248,6 +158,9 @@ class WhisperGUI(QMainWindow):
         self._last_cuda_oom_snippet = None
         self._last_run_cuda_kernel_incompatible = False
         self._last_cuda_kernel_snippet = None
+        self._last_run_cublas_not_supported = False
+        self._last_cublas_not_supported_snippet = None
+        self._cublas_compute_retry_attempted = False
         self._vad_cpu_fallback_active = False
         self._vad_oom_retry_files = set()
         self._last_command = None
@@ -1498,807 +411,6 @@ class WhisperGUI(QMainWindow):
         if getattr(sys, "frozen", False):
             QTimer.singleShot(0, self._apply_tab_minimums)
 
-    def setup_file_tab(self, tab):
-        layout = QFormLayout(tab)
-        input_group = FileDropGroupBox("Input", add_files_callback=self.add_input_files)
-        input_layout = QVBoxLayout(input_group)
-        input_layout.setContentsMargins(8, 6, 8, 6)
-        input_layout.setSpacing(4)
-
-        hint_row = QHBoxLayout()
-        hint_row.setContentsMargins(0, 0, 0, 0)
-        hint_label = QLabel("Drag & drop files or folders here.")
-        hint_label.setStyleSheet("color: #a0a0a0;")
-        self.file_count_label = QLabel("0 files")
-        self.file_count_label.setStyleSheet("color: #a0a0a0; font-weight: bold;")
-        hint_row.addWidget(hint_label)
-        hint_row.addStretch()
-        hint_row.addWidget(self.file_count_label)
-        input_layout.addLayout(hint_row)
-
-        self.file_list = FileDropListWidget(add_files_callback=self.add_input_files)
-        self.file_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.file_list.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
-        self.file_list.setDefaultDropAction(Qt.DropAction.CopyAction)
-        self.file_list.setAcceptDrops(True)
-        self.file_list.viewport().setAcceptDrops(True)
-        self.file_list.setMinimumHeight(92)
-        self.file_list.setMaximumHeight(104)
-        self.file_list.setFrameShape(QListWidget.Shape.NoFrame)
-        input_layout.addWidget(self.file_list)
-
-        file_button_layout = QHBoxLayout()
-        self.add_files_btn = QPushButton("Add Files")
-        self.add_files_btn.clicked.connect(self.browse_files)
-        self.add_folder_btn = QPushButton("Add Folder")
-        self.add_folder_btn.clicked.connect(self.browse_folder)
-        self.remove_btn = QPushButton("Remove Selected")
-        self.remove_btn.clicked.connect(self.remove_selected_files)
-        self.clear_btn = QPushButton("Clear All")
-        self.clear_btn.clicked.connect(self.clear_files)
-        file_button_layout.addWidget(self.add_files_btn)
-        file_button_layout.addWidget(self.add_folder_btn)
-        file_button_layout.addWidget(self.remove_btn)
-        file_button_layout.addWidget(self.clear_btn)
-        input_layout.addLayout(file_button_layout)
-        input_group.setMaximumHeight(190)
-
-        layout.addRow(input_group)
-
-    def setup_youtube_tab(self, tab):
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-        link_group = LinkDropGroupBox("Links", add_links_callback=self.add_input_links)
-        link_layout = QVBoxLayout(link_group)
-        link_layout.setContentsMargins(8, 6, 8, 4)
-        link_layout.setSpacing(2)
-        hint_row = QHBoxLayout()
-        hint_row.setContentsMargins(0, 0, 0, 0)
-        hint_label = QLabel("Paste one link per line or drop URLs.")
-        hint_label.setStyleSheet("color: gray;")
-        self.link_count_label = QLabel("0 links")
-        hint_row.addWidget(hint_label)
-        hint_row.addStretch()
-        hint_row.addWidget(self.link_count_label)
-        link_layout.addLayout(hint_row)
-
-        self.link_list = LinkDropListWidget(add_links_callback=self.add_input_links)
-        self.link_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.link_list.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
-        self.link_list.setDefaultDropAction(Qt.DropAction.CopyAction)
-        self.link_list.setAcceptDrops(True)
-        self.link_list.viewport().setAcceptDrops(True)
-        self.link_list.setMinimumHeight(92)
-        self.link_list.setMaximumHeight(104)
-        self.link_list.setFrameShape(QListWidget.Shape.NoFrame)
-        link_layout.addWidget(self.link_list)
-
-        link_button_layout = QHBoxLayout()
-        self.add_link_btn = QPushButton("Add Links")
-        self.add_link_btn.clicked.connect(self.prompt_add_links)
-        self.paste_links_btn = QPushButton("Paste Links")
-        self.paste_links_btn.clicked.connect(self.paste_links)
-        self.remove_link_btn = QPushButton("Remove Selected")
-        self.remove_link_btn.clicked.connect(self.remove_selected_links)
-        self.clear_links_btn = QPushButton("Clear All")
-        self.clear_links_btn.clicked.connect(self.clear_links)
-        link_button_layout.addWidget(self.add_link_btn)
-        link_button_layout.addWidget(self.paste_links_btn)
-        link_button_layout.addWidget(self.remove_link_btn)
-        link_button_layout.addWidget(self.clear_links_btn)
-        link_layout.addLayout(link_button_layout)
-        link_group.setFixedHeight(190)
-        layout.addWidget(link_group)
-
-        options_widget = QWidget()
-        options_layout = QVBoxLayout(options_widget)
-        options_layout.setContentsMargins(0, 6, 0, 0)
-        options_layout.setSpacing(2)
-
-        self.audio_only_checkbox = QCheckBox("Audio Only (Download faster)")
-        self.audio_only_checkbox.setChecked(True)
-        self.audio_only_checkbox.setObjectName("audio_only_checkbox")
-        self.audio_only_checkbox.setToolTip("Downloads audio only for faster processing.")
-        options_layout.addWidget(self.audio_only_checkbox)
-        self.download_all_checkbox = QCheckBox("Download all before transcribing")
-        self.download_all_checkbox.setChecked(False)
-        self.download_all_checkbox.setToolTip(
-            "When enabled, downloads all items first, then transcribes. "
-            "When disabled, items are transcribed as soon as they finish downloading."
-        )
-        options_layout.addWidget(self.download_all_checkbox)
-        options_widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        layout.addWidget(options_widget)
-
-    def setup_overrides_tab(self, tab):
-        scroll = QScrollArea()
-        scroll_widget = QWidget()
-        layout = QVBoxLayout(scroll_widget)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(10)
-
-        def _compact_path_button(text, tooltip=""):
-            button = QPushButton(text)
-            if tooltip:
-                button.setToolTip(tooltip)
-            button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-            button.setMinimumHeight(28)
-            button.setMaximumHeight(32)
-            metrics = QFontMetrics(button.font())
-            width = metrics.horizontalAdvance(text) + 22
-            width = max(56, min(width, 100))
-            button.setMinimumWidth(width)
-            button.setMaximumWidth(width)
-            button.setStyleSheet("QPushButton { padding: 4px 8px; }")
-            return button
-
-        core_group = QGroupBox("Core Paths")
-        core_layout = QFormLayout(core_group)
-        core_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        core_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
-
-        self.fw_exe_path = QLineEdit()
-        self.fw_exe_path.setPlaceholderText("Optional override for faster-whisper-xxl executable")
-        fw_browse = _compact_path_button("Browse", "Browse for executable")
-        fw_clear = _compact_path_button("Clear", "Clear override")
-        fw_test = _compact_path_button("Test", "Validate executable")
-        fw_find = _compact_path_button("Find", "Find from system PATH")
-        fw_row = QHBoxLayout()
-        fw_row.setSpacing(4)
-        fw_row.addWidget(self.fw_exe_path, 1)
-        fw_row.addWidget(fw_browse)
-        fw_row.addWidget(fw_clear)
-        fw_row.addWidget(fw_test)
-        fw_row.addWidget(fw_find)
-        core_layout.addRow("Whisper XXL EXE:", fw_row)
-
-        self.model_dir_path = QLineEdit()
-        self.model_dir_path.setPlaceholderText("Optional override for model directory")
-        self.model_dir_path.setToolTip(
-            "CT2 models are supported (requires model.bin). The test view can also flag "
-            "Transformers models for troubleshooting."
-        )
-        model_browse = _compact_path_button("Browse", "Browse for model directory")
-        model_clear = _compact_path_button("Clear", "Clear override")
-        model_test = _compact_path_button("Test", "Validate model directory")
-        model_row = QHBoxLayout()
-        model_row.setSpacing(4)
-        model_row.addWidget(self.model_dir_path, 1)
-        model_row.addWidget(model_browse)
-        model_row.addWidget(model_clear)
-        model_row.addWidget(model_test)
-        model_dir_label = QLabel("Model Directory:")
-        model_dir_label.setToolTip(
-            "CT2 models are supported (requires model.bin). The test view can also flag "
-            "Transformers models for troubleshooting."
-        )
-        core_layout.addRow(model_dir_label, model_row)
-
-        layout.addWidget(core_group)
-
-        ytdlp_group = QGroupBox("yt-dlp")
-        ytdlp_layout = QFormLayout(ytdlp_group)
-        ytdlp_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        ytdlp_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
-
-        bundled_label = (
-            "Uses Python module (current env)."
-            if not getattr(sys, "frozen", False)
-            else "Uses bundled Python module."
-        )
-        ytdlp_hint = QLabel(bundled_label)
-        ytdlp_hint.setStyleSheet("color: #a0a0a0;")
-        ytdlp_hint.setWordWrap(True)
-        ytdlp_layout.addRow(ytdlp_hint)
-        self.ytdlp_source_combo = QComboBox()
-        self.ytdlp_source_combo.addItem("Python module (current env/bundled)", "bundled")
-        self.ytdlp_source_combo.addItem("EXE (custom or PATH)", "path")
-        self.ytdlp_source_combo.setToolTip("Choose whether downloads use the Python module or yt-dlp EXE.")
-        ytdlp_layout.addRow("Source:", self.ytdlp_source_combo)
-
-        self.ytdlp_exe_path = QLineEdit()
-        self.ytdlp_exe_path.setPlaceholderText("Optional override for yt-dlp.exe (manual use)")
-        ytdlp_browse = _compact_path_button("Browse", "Browse for yt-dlp executable")
-        ytdlp_clear = _compact_path_button("Clear", "Clear override")
-        ytdlp_test = _compact_path_button("Test", "Validate yt-dlp executable")
-        ytdlp_find = _compact_path_button("Find", "Find from system PATH")
-        ytdlp_row = QHBoxLayout()
-        ytdlp_row.setSpacing(4)
-        ytdlp_row.addWidget(self.ytdlp_exe_path, 1)
-        ytdlp_row.addWidget(ytdlp_browse)
-        ytdlp_row.addWidget(ytdlp_clear)
-        ytdlp_row.addWidget(ytdlp_test)
-        ytdlp_row.addWidget(ytdlp_find)
-        ytdlp_layout.addRow("yt-dlp EXE:", ytdlp_row)
-
-        layout.addWidget(ytdlp_group)
-
-        ffmpeg_group = QGroupBox("ffmpeg")
-        ffmpeg_layout = QFormLayout(ffmpeg_group)
-        ffmpeg_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        ffmpeg_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
-
-        self.ffmpeg_path_input = QLineEdit()
-        self.ffmpeg_path_input.setPlaceholderText("Optional override for ffmpeg executable")
-        ffmpeg_browse = _compact_path_button("Browse", "Browse for ffmpeg executable")
-        ffmpeg_clear = _compact_path_button("Clear", "Clear override")
-        ffmpeg_test = _compact_path_button("Test", "Validate ffmpeg executable")
-        ffmpeg_find = _compact_path_button("Find", "Find from system PATH")
-        ffmpeg_row = QHBoxLayout()
-        ffmpeg_row.setSpacing(4)
-        ffmpeg_row.addWidget(self.ffmpeg_path_input, 1)
-        ffmpeg_row.addWidget(ffmpeg_browse)
-        ffmpeg_row.addWidget(ffmpeg_clear)
-        ffmpeg_row.addWidget(ffmpeg_test)
-        ffmpeg_row.addWidget(ffmpeg_find)
-        ffmpeg_layout.addRow("FFMPEG EXE:", ffmpeg_row)
-
-        layout.addWidget(ffmpeg_group)
-
-        cli_group = QGroupBox("CLI Overrides")
-        cli_layout = QFormLayout(cli_group)
-        cli_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        cli_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
-
-        self.extra_cli_args = QTextEdit()
-        self.extra_cli_args.setMaximumHeight(100)
-        self.extra_cli_args.setToolTip(
-            "Extra Faster Whisper XXL CLI arguments. These are appended to the command as-is. "
-            "Use --help with the executable to see available flags."
-        )
-        cli_layout.addRow("Extra CLI Args:", self.extra_cli_args)
-        cli_hint = QLabel("Hint: run the Faster Whisper XXL executable with --help to see available flags.")
-        cli_hint.setWordWrap(True)
-        cli_hint.setStyleSheet("color: #a0a0a0;")
-        cli_layout.addRow(cli_hint)
-
-        layout.addWidget(cli_group)
-        layout.addStretch()
-
-        scroll.setWidget(scroll_widget)
-        scroll.setWidgetResizable(True)
-        tab_layout = QVBoxLayout(tab)
-        tab_layout.addWidget(scroll)
-
-        fw_browse.clicked.connect(lambda: self.browse_executable_path(self.fw_exe_path))
-        fw_clear.clicked.connect(lambda: self.clear_config_path(self.fw_exe_path))
-        fw_test.clicked.connect(self.test_faster_whisper_path)
-        fw_find.clicked.connect(self.show_faster_whisper_path_picker)
-        model_browse.clicked.connect(lambda: self.browse_directory_path(self.model_dir_path))
-        model_clear.clicked.connect(lambda: self.clear_config_path(self.model_dir_path))
-        model_test.clicked.connect(self.test_model_dir_path)
-        ytdlp_browse.clicked.connect(lambda: self.browse_executable_path(self.ytdlp_exe_path))
-        ytdlp_clear.clicked.connect(lambda: self.clear_config_path(self.ytdlp_exe_path))
-        ytdlp_test.clicked.connect(self.test_ytdlp_path)
-        ytdlp_find.clicked.connect(self.show_ytdlp_path_picker)
-        ffmpeg_browse.clicked.connect(lambda: self.browse_executable_path(self.ffmpeg_path_input))
-        ffmpeg_clear.clicked.connect(lambda: self.clear_config_path(self.ffmpeg_path_input))
-        ffmpeg_test.clicked.connect(self.test_ffmpeg_path)
-        ffmpeg_find.clicked.connect(self.show_ffmpeg_path_picker)
-
-        self.fw_exe_path.editingFinished.connect(self.save_config_settings)
-        self.model_dir_path.editingFinished.connect(self.save_config_settings)
-        self.ytdlp_exe_path.editingFinished.connect(self.save_config_settings)
-        self.ffmpeg_path_input.editingFinished.connect(self.save_config_settings)
-        self.ytdlp_source_combo.currentIndexChanged.connect(self.save_config_settings)
-
-    def setup_global_settings(self, layout):
-        layout.setVerticalSpacing(4)
-        layout.setContentsMargins(8, 4, 8, 4)
-        output_dir_container = QWidget()
-        output_dir_layout = QHBoxLayout(output_dir_container)
-        output_dir_layout.setContentsMargins(0, 0, 0, 0)
-        self.output_dir = QLineEdit()
-        self.output_dir.setPlaceholderText("Leave empty for default 'output' folder")
-        self.output_dir.setToolTip(
-            "Where to save output files. Default is the app folder, or the media folder when using recursive batch. "
-            "Use '.' for the current folder or 'source' for the media folder."
-        )
-        output_dir_label = QLabel("Output Dir:")
-        output_dir_label.setToolTip(
-            "Where to save output files. Default is the app folder, or the media folder when using recursive batch. "
-            "Use '.' for the current folder or 'source' for the media folder."
-        )
-        self.browse_out_btn = QPushButton("Browse")
-        self.browse_out_btn.setToolTip("Choose an output folder.")
-        self.browse_out_btn.clicked.connect(self.browse_output_dir)
-        output_dir_layout.addWidget(self.output_dir)
-        output_dir_layout.addWidget(self.browse_out_btn)
-        layout.addRow(output_dir_label, output_dir_container)
-
-        self.output_dir_source_checkbox = QCheckBox("Use source folder")
-        self.output_dir_source_checkbox.setObjectName("output_dir_source_checkbox")
-        self.output_dir_source_checkbox.setToolTip("Save outputs next to each input file.")
-        layout.addRow("Output Location:", self.output_dir_source_checkbox)
-
-        self.output_name_match_checkbox = QCheckBox("Use input filename for outputs")
-        self.output_name_match_checkbox.setObjectName("output_name_match_checkbox")
-        self.output_name_match_checkbox.setToolTip(
-            "Prefer the original input name for outputs. A suffix may still be added to avoid conflicts."
-        )
-        self.output_name_match_checkbox.setChecked(True)
-        layout.addRow("Output Name:", self.output_name_match_checkbox)
-
-        self.model_combo = QComboBox()
-        self.model_combo.setToolTip(
-            "Choose a model. Larger models are more accurate but use more resources. "
-            "large-v3-turbo downloads a community CTranslate2 conversion (dropbox-dash)."
-        )
-        model_label = QLabel("Model:")
-        model_label.setToolTip(
-            "Choose a model. Larger models are more accurate but use more resources. "
-            "large-v3-turbo downloads a community CTranslate2 conversion (dropbox-dash)."
-        )
-        self.model_manage_button = QPushButton("Manage")
-        self.model_manage_button.setToolTip("Download, import, and enable models.")
-        self.model_manage_button.setObjectName("manage_model_button")
-        self.model_manage_button.setFixedWidth(90)
-        model_row = QHBoxLayout()
-        model_row.setContentsMargins(0, 0, 0, 0)
-        model_row.setSpacing(6)
-        model_row.addWidget(self.model_combo)
-        model_row.addWidget(self.model_manage_button)
-        layout.addRow(model_label, model_row)
-        self.model_manage_button.clicked.connect(self.show_model_manager)
-        self.task_combo = QComboBox()
-        self.task_combo.addItems(['transcribe', 'translate'])
-        self.task_combo.setToolTip("Transcribe keeps the original language; translate outputs English.")
-        task_label = QLabel("Task:")
-        task_label.setToolTip("Transcribe keeps the original language; translate outputs English.")
-        layout.addRow(task_label, self.task_combo)
-        self.language_combo = QComboBox()
-        languages = [
-            ("auto", "Auto"),
-            ("af", "Afrikaans"), ("am", "Amharic"), ("ar", "Arabic"), ("as", "Assamese"),
-            ("az", "Azerbaijani"), ("ba", "Bashkir"), ("be", "Belarusian"), ("bg", "Bulgarian"),
-            ("bn", "Bengali"), ("bo", "Tibetan"), ("br", "Breton"), ("bs", "Bosnian"),
-            ("ca", "Catalan"), ("cs", "Czech"), ("cy", "Welsh"), ("da", "Danish"),
-            ("de", "German"), ("el", "Greek"), ("en", "English"), ("es", "Spanish"),
-            ("et", "Estonian"), ("eu", "Basque"), ("fa", "Persian"), ("fi", "Finnish"),
-            ("fo", "Faroese"), ("fr", "French"), ("gl", "Galician"), ("gu", "Gujarati"),
-            ("ha", "Hausa"), ("haw", "Hawaiian"), ("he", "Hebrew"), ("hi", "Hindi"),
-            ("hr", "Croatian"), ("ht", "Haitian Creole"), ("hu", "Hungarian"), ("hy", "Armenian"),
-            ("id", "Indonesian"), ("is", "Icelandic"), ("it", "Italian"), ("ja", "Japanese"),
-            ("jw", "Javanese"), ("ka", "Georgian"), ("kk", "Kazakh"), ("km", "Khmer"),
-            ("kn", "Kannada"), ("ko", "Korean"), ("la", "Latin"), ("lb", "Luxembourgish"),
-            ("ln", "Lingala"), ("lo", "Lao"), ("lt", "Lithuanian"), ("lv", "Latvian"),
-            ("mg", "Malagasy"), ("mi", "Maori"), ("mk", "Macedonian"), ("ml", "Malayalam"),
-            ("mn", "Mongolian"), ("mr", "Marathi"), ("ms", "Malay"), ("mt", "Maltese"),
-            ("my", "Burmese"), ("ne", "Nepali"), ("nl", "Dutch"), ("nn", "Nynorsk"),
-            ("no", "Norwegian"), ("oc", "Occitan"), ("pa", "Punjabi"), ("pl", "Polish"),
-            ("ps", "Pashto"), ("pt", "Portuguese"), ("ro", "Romanian"), ("ru", "Russian"),
-            ("sa", "Sanskrit"), ("sd", "Sindhi"), ("si", "Sinhala"), ("sk", "Slovak"),
-            ("sl", "Slovenian"), ("sn", "Shona"), ("so", "Somali"), ("sq", "Albanian"),
-            ("sr", "Serbian"), ("su", "Sundanese"), ("sv", "Swedish"), ("sw", "Swahili"),
-            ("ta", "Tamil"), ("te", "Telugu"), ("tg", "Tajik"), ("th", "Thai"),
-            ("tk", "Turkmen"), ("tl", "Tagalog"), ("tr", "Turkish"), ("tt", "Tatar"),
-            ("uk", "Ukrainian"), ("ur", "Urdu"), ("uz", "Uzbek"), ("vi", "Vietnamese"),
-            ("yi", "Yiddish"), ("yo", "Yoruba"), ("yue", "Cantonese"), ("zh", "Chinese"),
-        ]
-        for code, name in languages:
-            display = f"{name} ({code})"
-            self.language_combo.addItem(display, code)
-        self.language_combo.setEditable(True)
-        self.language_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.language_combo.setToolTip("Auto-detect or pick a language code.")
-        if line_edit := self.language_combo.lineEdit():
-            line_edit.setTextMargins(0, 0, 0, 0)
-            line_edit.setContentsMargins(0, 0, 0, 0)
-        self.language_combo.setStyleSheet(
-            "QComboBox { padding-left: 0px; }"
-            "QComboBox QLineEdit { padding-left: 0px; margin-left: 0px; }"
-        )
-        if completer := self.language_combo.completer():
-            completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
-        language_label = QLabel("Language:")
-        language_label.setToolTip("Auto-detect or pick a language code.")
-        layout.addRow(language_label, self.language_combo)
-        self.compute_combo = QComboBox()
-        self.compute_combo.addItems(['default', 'auto', 'int8', 'int8_float16', 'int8_float32', 'int8_bfloat16', 'int16', 'float16', 'float32', 'bfloat16'])
-        self.compute_combo.setToolTip(
-            "Speed vs quality setting. Lower precision is faster and uses less GPU memory."
-        )
-        compute_label = QLabel("Compute Type:")
-        compute_label.setToolTip(
-            "Speed vs quality setting. Lower precision is faster and uses less GPU memory."
-        )
-        layout.addRow(compute_label, self.compute_combo)
-        self.device_combo = QComboBox()
-        self.device_combo.addItems(['cuda', 'cpu'])
-        self.device_combo.setToolTip(
-            "Use GPU (cuda) if available, otherwise CPU."
-        )
-        device_label = QLabel("Device:")
-        device_label.setToolTip(
-            "Use GPU (cuda) if available, otherwise CPU."
-        )
-        layout.addRow(device_label, self.device_combo)
-        self.full_console_checkbox = QCheckBox("Show extra console details")
-        self.full_console_checkbox.setObjectName("full_console_checkbox")
-        self.full_console_checkbox.setToolTip("Show extra status lines (verbose).")
-        self.full_console_checkbox.setChecked(False)
-        console_label = QLabel("Console Output:")
-        console_label.setToolTip("Show extra status lines (verbose).")
-        layout.addRow(console_label, self.full_console_checkbox)
-        output_format_group = QWidget()
-        container_layout = QHBoxLayout(output_format_group)
-        container_layout.setContentsMargins(0, 4, 0, 0)
-        grid_layout = QGridLayout()
-        grid_layout.setHorizontalSpacing(40)
-        grid_layout.setVerticalSpacing(2)
-        formats = ['json', 'vtt', 'srt', 'lrc', 'txt (with timestamps)', 'txt (sentences only)', 'tsv', 'all']
-        num_rows = 4
-        for i, fmt in enumerate(formats):
-            checkbox = QCheckBox(fmt)
-            checkbox.setObjectName(f"format_checkbox_{fmt}")
-            checkbox.setToolTip("Select one or more output formats.")
-            checkbox.setStyleSheet("QCheckBox::indicator { width: 16px; height: 16px; }")
-            checkbox.setMinimumHeight(20)
-            self.output_format_checkboxes[fmt] = checkbox
-            row = i % num_rows
-            col = i // num_rows
-            grid_layout.addWidget(checkbox, row, col, Qt.AlignmentFlag.AlignLeft)
-        container_layout.addLayout(grid_layout)
-        container_layout.addStretch()
-        self.output_format_checkboxes['all'].toggled.connect(self.handle_all_formats_toggle)
-        layout.addRow("Output Format:", output_format_group)
-
-    def create_output_console(self):
-        output_group = QGroupBox("Console Output")
-        layout = QVBoxLayout(output_group)
-        self.output_text = QTextEdit()
-        self.output_text.setReadOnly(True)
-        font = QFont("Courier New" if sys.platform == "win32" else "Monospace")
-        font.setPointSize(10)
-        self.output_text.setFont(font)
-        layout.addWidget(self.output_text)
-        return output_group
-
-    def create_button_layout(self):
-        button_layout = QHBoxLayout()
-        self.run_btn = QPushButton("Run")
-        self.run_btn.setToolTip("Run the process based on the active tab (File or yt-dlp).")
-        self.run_btn.clicked.connect(self.start_processing)
-        self.run_btn.setMinimumHeight(40)
-        self.stop_btn = QPushButton("Stop")
-        self.stop_btn.clicked.connect(self.stop_processing)
-        self.stop_btn.setEnabled(False)
-        self.stop_btn.setMinimumHeight(40)
-        button_layout.addWidget(self.run_btn)
-        button_layout.addWidget(self.stop_btn)
-        return button_layout
-
-    def handle_all_formats_toggle(self, checked):
-        all_checkbox = self.output_format_checkboxes['all']
-        all_checkbox.blockSignals(True)
-        for fmt, checkbox in self.output_format_checkboxes.items():
-            if fmt != 'all':
-                checkbox.setChecked(checked)
-        all_checkbox.blockSignals(False)
-
-    def setup_advanced_tab(self, tab):
-        scroll = QScrollArea()
-        scroll_widget = QWidget()
-        scroll_layout = QFormLayout(scroll_widget)
-        self.tooltips_checkbox = QCheckBox("Show tooltips")
-        self.tooltips_checkbox.setObjectName("show_tooltips_checkbox")
-        self.tooltips_checkbox.setToolTip("Toggle help tooltips throughout the app.")
-        self.tooltips_checkbox.setChecked(True)
-        scroll_layout.addRow(self.tooltips_checkbox)
-        self.word_timestamps_checkbox = QCheckBox("Word timestamps")
-        self.word_timestamps_checkbox.setObjectName("word_timestamps_checkbox")
-        self.word_timestamps_checkbox.setToolTip(
-            "Include word-level timestamps when supported by the output format. "
-            "For SRT/VTT, Highlight words will be enabled automatically."
-        )
-        scroll_layout.addRow(self.word_timestamps_checkbox)
-        self.highlight_words_checkbox = QCheckBox("Highlight words")
-        self.highlight_words_checkbox.setObjectName("highlight_words_checkbox")
-        self.highlight_words_checkbox.setToolTip(
-            "Highlight words as they are spoken (SRT/VTT only). "
-            "Required to render word-level timestamps in SRT/VTT."
-        )
-        scroll_layout.addRow(self.highlight_words_checkbox)
-        self.temperature = QDoubleSpinBox()
-        self.temperature.setRange(0.0, 1.0)
-        self.temperature.setSingleStep(0.1)
-        self.temperature.setDecimals(1)
-        self.temperature.setToolTip("Higher values increase randomness; lower values are more consistent.")
-        scroll_layout.addRow("Temperature:", self.temperature)
-        self.beam_size = QSpinBox()
-        self.beam_size.setRange(1, 100)
-        self.beam_size.setToolTip("Number of beams used in decoding (temperature 0).")
-        scroll_layout.addRow("Beam Size:", self.beam_size)
-        self.best_of = QSpinBox()
-        self.best_of.setRange(1, 100)
-        self.best_of.setToolTip("Number of candidates to consider when temperature > 0.")
-        scroll_layout.addRow("Best Of:", self.best_of)
-        self.patience = QDoubleSpinBox()
-        self.patience.setRange(0.0, 10.0)
-        self.patience.setSingleStep(0.1)
-        self.patience.setDecimals(1)
-        self.patience.setToolTip("Beam search patience; higher may improve accuracy.")
-        scroll_layout.addRow("Patience:", self.patience)
-        self.initial_prompt = QTextEdit()
-        self.initial_prompt.setMaximumHeight(80)
-        self.initial_prompt.setToolTip("Optional text to prime the transcription.")
-        scroll_layout.addRow("Initial Prompt:", self.initial_prompt)
-        scroll.setWidget(scroll_widget)
-        scroll.setWidgetResizable(True)
-        layout = QVBoxLayout(tab)
-        layout.addWidget(scroll)
-
-    def setup_vad_tab(self, tab):
-        scroll = QScrollArea()
-        scroll_widget = QWidget()
-        layout = QVBoxLayout(scroll_widget)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(10)
-
-        vad_group = QGroupBox("Voice Activity Detection")
-        vad_layout = QFormLayout(vad_group)
-        vad_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        vad_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
-        vad_layout.setHorizontalSpacing(10)
-        vad_layout.setVerticalSpacing(4)
-        vad_layout.setContentsMargins(8, 8, 8, 8)
-
-        self.vad_filter = QCheckBox("Enable VAD Filter")
-        self.vad_filter.setObjectName("vad_filter_checkbox")
-        self.vad_filter.setToolTip(
-            "Enable voice activity detection to filter non-speech."
-        )
-        vad_layout.addRow(self.vad_filter)
-        vad_hint = QLabel("Hint: if quiet speech is missing, try disabling VAD or lowering the threshold.")
-        vad_hint.setWordWrap(True)
-        vad_hint.setStyleSheet("color: #a0a0a0;")
-        vad_layout.addRow(vad_hint)
-        self.vad_method = QComboBox()
-        self.vad_method.addItems(['silero_v4_fw', 'silero_v5_fw', 'silero_v3', 'silero_v4', 'silero_v5', 'pyannote_v3', 'pyannote_onnx_v3', 'auditok', 'webrtc'])
-        self.vad_method.setToolTip("Choose the VAD backend.")
-        vad_layout.addRow("VAD Method:", self.vad_method)
-        self.vad_device = QComboBox()
-        self.vad_device.addItems(["Auto", "CUDA", "CPU"])
-        self.vad_device.setToolTip("Choose the VAD device for pyannote VAD. Auto follows recommendations.")
-        vad_layout.addRow("VAD Device:", self.vad_device)
-        self.vad_threshold = QDoubleSpinBox()
-        self.vad_threshold.setRange(0.0, 1.0)
-        self.vad_threshold.setSingleStep(0.01)
-        self.vad_threshold.setDecimals(2)
-        self.vad_threshold.setToolTip(
-            "Higher values are stricter about what counts as speech."
-        )
-        self.vad_threshold.setStyleSheet(
-            "QDoubleSpinBox { padding-left: 0px; }"
-            "QDoubleSpinBox QLineEdit { padding-left: 0px; margin-left: 0px; }"
-        )
-        vad_layout.addRow("VAD Threshold:", self.vad_threshold)
-        self.vad_min_speech = QSpinBox()
-        self.vad_min_speech.setRange(0, 10000)
-        self.vad_min_speech.setSuffix(" ms")
-        self.vad_min_speech.setToolTip(
-            "Minimum duration to treat a segment as speech."
-        )
-        self.vad_min_speech.setStyleSheet(
-            "QSpinBox { padding-left: 0px; }"
-            "QSpinBox QLineEdit { padding-left: 0px; margin-left: 0px; }"
-        )
-        vad_layout.addRow("Min Speech Duration:", self.vad_min_speech)
-
-        layout.addWidget(vad_group)
-
-        diarize_group = QGroupBox("Diarization")
-        diarize_layout = QVBoxLayout(diarize_group)
-        diarize_layout.setContentsMargins(8, 8, 8, 8)
-        diarize_layout.setSpacing(6)
-
-        self.diarize_enable = QCheckBox("Enable Diarization")
-        self.diarize_enable.setObjectName("diarize_enable_checkbox")
-        self.diarize_enable.setToolTip("Identify speaker turns and label segments.")
-        diarize_layout.addWidget(self.diarize_enable)
-
-        diarize_hint = QLabel("Hint: diarization can be memory intensive on GPU; try CPU if you see OOM errors.")
-        diarize_hint.setWordWrap(True)
-        diarize_hint.setStyleSheet("color: #a0a0a0;")
-        diarize_layout.addWidget(diarize_hint)
-
-        self.diarize_controls_container = QWidget()
-        diarize_controls_layout = QFormLayout(self.diarize_controls_container)
-        diarize_controls_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        diarize_controls_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
-        diarize_controls_layout.setHorizontalSpacing(10)
-        diarize_controls_layout.setVerticalSpacing(4)
-        diarize_controls_layout.setContentsMargins(0, 6, 0, 0)
-
-        self.diarize_backend = QComboBox()
-        self.diarize_backend.addItems(["pyannote_v3.1", "pyannote_v3.0", "reverb_v1", "reverb_v2"])
-        self.diarize_backend.setToolTip("Choose the diarization backend.")
-        diarize_controls_layout.addRow("Backend:", self.diarize_backend)
-
-        self.diarize_device = QComboBox()
-        self.diarize_device.addItems(["Auto", "CUDA", "CPU"])
-        self.diarize_device.setToolTip("Choose the diarization device. Auto follows backend defaults.")
-        diarize_controls_layout.addRow("Device:", self.diarize_device)
-
-        self.diarize_num_speakers = QSpinBox()
-        self.diarize_num_speakers.setRange(0, 30)
-        self.diarize_num_speakers.setToolTip("Fixed number of speakers. Set 0 to disable.")
-        diarize_controls_layout.addRow("Fixed Speakers:", self.diarize_num_speakers)
-
-        self.diarize_min_speakers = QSpinBox()
-        self.diarize_min_speakers.setRange(0, 30)
-        self.diarize_min_speakers.setToolTip("Minimum speakers. Set 0 to disable.")
-        diarize_controls_layout.addRow("Min Speakers:", self.diarize_min_speakers)
-
-        self.diarize_max_speakers = QSpinBox()
-        self.diarize_max_speakers.setRange(0, 30)
-        self.diarize_max_speakers.setToolTip("Maximum speakers. Set 0 to disable.")
-        diarize_controls_layout.addRow("Max Speakers:", self.diarize_max_speakers)
-
-        self.diarize_only_checkbox = QCheckBox("Diarize only (skip transcription)")
-        self.diarize_only_checkbox.setObjectName("diarize_only_checkbox")
-        self.diarize_only_checkbox.setToolTip(
-            "Run diarization without transcription output."
-        )
-        diarize_controls_layout.addRow(self.diarize_only_checkbox)
-
-        self.diarize_return_embeddings_checkbox = QCheckBox("Return embeddings")
-        self.diarize_return_embeddings_checkbox.setObjectName("diarize_return_embeddings_checkbox")
-        self.diarize_return_embeddings_checkbox.setToolTip(
-            "Include speaker embedding vectors in diarization output (advanced)."
-        )
-        diarize_controls_layout.addRow(self.diarize_return_embeddings_checkbox)
-
-        diarize_layout.addWidget(self.diarize_controls_container)
-
-        self.diarize_review_prompt_checkbox = QCheckBox("Prompt to review after diarization")
-        self.diarize_review_prompt_checkbox.setObjectName("diarize_review_prompt_checkbox")
-        self.diarize_review_prompt_checkbox.setToolTip(
-            "Show a prompt to review and rename speakers when diarization finishes."
-        )
-        self.diarize_review_prompt_checkbox.setChecked(True)
-        diarize_layout.addWidget(self.diarize_review_prompt_checkbox)
-
-        self.diarize_review_button = QPushButton("Review Diarization Output")
-        self.diarize_review_button.setToolTip("Review segments and rename speakers.")
-        self.diarize_review_button.setVisible(False)
-        self.diarize_review_button.clicked.connect(self.show_diarization_review_dialog)
-        diarize_layout.addWidget(self.diarize_review_button)
-
-        layout.addWidget(diarize_group)
-        layout.addStretch()
-
-        scroll.setWidget(scroll_widget)
-        scroll.setWidgetResizable(True)
-        tab_layout = QVBoxLayout(tab)
-        tab_layout.addWidget(scroll)
-
-        self.diarize_enable.toggled.connect(self.update_diarization_controls)
-        self.diarize_num_speakers.valueChanged.connect(self.update_diarization_controls)
-        self.diarize_min_speakers.valueChanged.connect(self.update_diarization_controls)
-        self.diarize_max_speakers.valueChanged.connect(self.update_diarization_controls)
-        self.update_diarization_controls(self.diarize_enable.isChecked())
-
-    def setup_audio_tab(self, tab):
-        scroll = QScrollArea()
-        scroll_widget = QWidget()
-        layout = QVBoxLayout(scroll_widget)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(10)
-
-        pre_group = QGroupBox("Pre-Processing")
-        self.audio_pre_group = pre_group
-        pre_layout = QFormLayout(pre_group)
-        pre_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        pre_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
-        pre_layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-        pre_layout.setFormAlignment(Qt.AlignmentFlag.AlignTop)
-        pre_layout.setHorizontalSpacing(10)
-        pre_layout.setVerticalSpacing(4)
-        pre_layout.setContentsMargins(8, 8, 8, 8)
-
-        self.ff_mp3 = QCheckBox("Convert to MP3")
-        self.ff_mp3.setObjectName("ff_mp3_checkbox")
-        self.ff_mp3.setToolTip("Convert input audio to MP3 before processing.")
-        pre_layout.addRow(self.ff_mp3)
-
-        self.audio_preprocess_enable = QCheckBox("Enable Audio Pre-Processing")
-        self.audio_preprocess_enable.setObjectName("audio_preprocess_enable")
-        pre_layout.addRow(self.audio_preprocess_enable)
-
-        self.keep_preprocessed_audio = QCheckBox("Keep preprocessed audio files")
-        self.keep_preprocessed_audio.setObjectName("keep_preprocessed_audio_checkbox")
-        self.keep_preprocessed_audio.setToolTip("Leave the temporary WAV files in the output folder.")
-        pre_layout.addRow(self.keep_preprocessed_audio)
-
-        self.audio_gain_label = QLabel("Gain:")
-        self.audio_gain = QDoubleSpinBox()
-        self.audio_gain.setRange(-30.0, 30.0)
-        self.audio_gain.setSingleStep(0.5)
-        self.audio_gain.setDecimals(1)
-        self.audio_gain.setSuffix(" dB")
-        self.audio_gain.setToolTip("Boost or reduce input audio before transcription.")
-        self.audio_gain.setValue(0.0)
-        pre_layout.addRow(self.audio_gain_label, self.audio_gain)
-
-        layout.addWidget(pre_group)
-
-        norm_group = QGroupBox("Normalization")
-        self.audio_norm_group = norm_group
-        norm_layout = QFormLayout(norm_group)
-        norm_layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-        norm_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
-        norm_layout.setLabelAlignment(Qt.AlignmentFlag.AlignLeft)
-        norm_layout.setFormAlignment(Qt.AlignmentFlag.AlignTop)
-        norm_layout.setHorizontalSpacing(10)
-        norm_layout.setVerticalSpacing(4)
-        norm_layout.setContentsMargins(8, 8, 8, 8)
-
-        self.audio_normalize = QCheckBox("Normalize Loudness (LUFS)")
-        self.audio_normalize.setObjectName("audio_normalize_checkbox")
-        norm_layout.addRow(self.audio_normalize)
-
-        self.audio_lufs_target_label = QLabel("Target LUFS:")
-        self.audio_lufs_target = QDoubleSpinBox()
-        self.audio_lufs_target.setRange(-30.0, -10.0)
-        self.audio_lufs_target.setSingleStep(0.5)
-        self.audio_lufs_target.setDecimals(1)
-        self.audio_lufs_target.setSuffix(" LUFS")
-        self.audio_lufs_target.setToolTip("Target loudness for normalization.")
-        self.audio_lufs_target.setValue(-16.0)
-        norm_layout.addRow(self.audio_lufs_target_label, self.audio_lufs_target)
-
-        self.audio_true_peak_enable = QCheckBox("Limit True Peak")
-        self.audio_true_peak_enable.setObjectName("audio_true_peak_checkbox")
-        self.audio_true_peak_enable.setChecked(True)
-        norm_layout.addRow(self.audio_true_peak_enable)
-
-        self.audio_true_peak_label = QLabel("True Peak:")
-        self.audio_true_peak = QDoubleSpinBox()
-        self.audio_true_peak.setRange(-6.0, 0.0)
-        self.audio_true_peak.setSingleStep(0.1)
-        self.audio_true_peak.setDecimals(1)
-        self.audio_true_peak.setSuffix(" dBTP")
-        self.audio_true_peak.setToolTip("True peak ceiling when normalizing.")
-        self.audio_true_peak.setValue(-1.5)
-        norm_layout.addRow(self.audio_true_peak_label, self.audio_true_peak)
-
-        self.audio_lra_label = QLabel("Target LRA:")
-        self.audio_lra = QDoubleSpinBox()
-        self.audio_lra.setRange(1.0, 20.0)
-        self.audio_lra.setSingleStep(0.5)
-        self.audio_lra.setDecimals(1)
-        self.audio_lra.setSuffix(" LU")
-        self.audio_lra.setToolTip("Loudness range target for normalization.")
-        self.audio_lra.setValue(11.0)
-        norm_layout.addRow(self.audio_lra_label, self.audio_lra)
-
-        layout.addWidget(norm_group)
-
-        self.audio_analyze_button = QPushButton("Analyze Loudness")
-        self.audio_analyze_button.clicked.connect(self.analyze_loudness)
-        self.audio_analyze_button.setMinimumHeight(28)
-        self.audio_analyze_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        layout.addWidget(self.audio_analyze_button)
-        self.audio_quiet_preset_button = QPushButton("Quiet Speech Preset")
-        self.audio_quiet_preset_button.setCheckable(True)
-        self.audio_quiet_preset_button.toggled.connect(self.toggle_quiet_speech_preset)
-        self.audio_quiet_preset_button.setMinimumHeight(28)
-        self.audio_quiet_preset_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        layout.addWidget(self.audio_quiet_preset_button)
-        layout.addStretch()
-
-        scroll.setWidget(scroll_widget)
-        scroll.setWidgetResizable(True)
-        tab_layout = QVBoxLayout(tab)
-        tab_layout.addWidget(scroll)
-
-        self.audio_preprocess_enable.toggled.connect(self.update_audio_preprocess_controls)
-        self.audio_normalize.toggled.connect(self.update_audio_normalize_controls)
-        self.audio_true_peak_enable.toggled.connect(self.update_audio_normalize_controls)
-        self.update_audio_preprocess_controls(self.audio_preprocess_enable.isChecked())
-        self.update_audio_normalize_controls(self.audio_normalize.isChecked())
 
     def browse_executable_path(self, target_line_edit):
         path, _ = QFileDialog.getOpenFileName(self, "Select Executable")
@@ -2602,30 +714,6 @@ class WhisperGUI(QMainWindow):
         select_button.clicked.connect(apply_selection)
         close_button.clicked.connect(dialog.reject)
         table.itemDoubleClicked.connect(lambda _item: apply_selection())
-
-        dialog.exec()
-
-    def show_info_dialog(self, title, message, min_width=520, min_height=180):
-        dialog = QDialog(self)
-        dialog.setWindowTitle(title)
-        dialog.setModal(True)
-        dialog.setMinimumSize(min_width, min_height)
-
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(12, 10, 12, 12)
-        layout.setSpacing(10)
-
-        label = QLabel(message)
-        label.setWordWrap(True)
-        label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(label)
-
-        close_button = QPushButton("Close")
-        close_button.clicked.connect(dialog.accept)
-        button_row = QHBoxLayout()
-        button_row.addStretch()
-        button_row.addWidget(close_button)
-        layout.addLayout(button_row)
 
         dialog.exec()
 
@@ -3106,17 +1194,8 @@ class WhisperGUI(QMainWindow):
 
     def check_for_transcription_success(self, text):
         """Check if the output indicates successful transcription completion"""
-        success_indicators = [
-            "Operation finished in:",
-            "Subtitles are written to",
-            "Transcription speed:",
-            "audio seconds/s"
-        ]
-        
-        for indicator in success_indicators:
-            if indicator in text:
-                self.transcription_completed_successfully = True
-                break
+        if text_indicates_transcription_success(text):
+            self.transcription_completed_successfully = True
 
     def get_system_theme(self):
         """Detect system theme preference"""
@@ -3190,6 +1269,7 @@ class WhisperGUI(QMainWindow):
             self.yt_dlp_version_worker = YtDlpVersionCheckWorker(
                 "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest",
                 timeout=5,
+                headers=GITHUB_HEADERS,
                 parent=self,
             )
             self.yt_dlp_version_worker.finished.connect(self.on_yt_dlp_version_check_finished)
@@ -3439,15 +1519,10 @@ class WhisperGUI(QMainWindow):
             logging.error(f"Error in hardware optimization check: {e}")
 
     def _normalize_version(self, version_str):
-        if not version_str:
-            return ""
-        return version_str.strip().lstrip("vV")
+        return normalize_version(version_str)
 
     def _version_tuple(self, version_str):
-        try:
-            return tuple(int(p) for p in re.findall(r"\d+", version_str))
-        except Exception:
-            return ()
+        return version_tuple(version_str)
 
     def check_app_update(self):
         """Check GitHub releases for a newer GUI version and prompt once."""
@@ -3893,35 +1968,7 @@ class WhisperGUI(QMainWindow):
             logger.info("[event] %s", payload)
 
     def _detect_model_arch_from_dir(self, model_path):
-        if not model_path or not os.path.isdir(model_path):
-            return None
-        model_bin = os.path.join(model_path, "model.bin")
-        if os.path.isfile(model_bin):
-            return {
-                "arch": "CT2",
-                "path": model_bin,
-                "model_dir": model_path,
-            }
-        config_path = os.path.join(model_path, "config.json")
-        weight_files = []
-        try:
-            for filename in os.listdir(model_path):
-                lowered = filename.lower()
-                if lowered in ("model.safetensors", "pytorch_model.bin"):
-                    weight_files.append(os.path.join(model_path, filename))
-                elif lowered.startswith("model-") and lowered.endswith(".safetensors"):
-                    weight_files.append(os.path.join(model_path, filename))
-                elif lowered.startswith("pytorch_model-") and lowered.endswith(".bin"):
-                    weight_files.append(os.path.join(model_path, filename))
-        except Exception:
-            weight_files = []
-        if os.path.isfile(config_path) or weight_files:
-            return {
-                "arch": "Transformers",
-                "path": config_path if os.path.isfile(config_path) else (weight_files[0] if weight_files else model_path),
-                "model_dir": model_path,
-            }
-        return None
+        return detect_model_arch_from_dir(model_path)
 
     def _should_auto_convert_transformers(self):
         checkbox = getattr(self, "auto_convert_transformers_checkbox", None)
@@ -4021,51 +2068,13 @@ class WhisperGUI(QMainWindow):
         return os.path.join(log_dir, "last_error.txt")
 
     def _redact_path_text(self, text):
-        if not text:
-            return text
-        redacted = text
-        redacted = re.sub(r'(["\'])([A-Za-z]:[\\/].*?)(\\1)', r'"\<path\>"', redacted)
-        redacted = re.sub(r'(["\'])(\\\\.*?)(\\1)', r'"\<path\>"', redacted)
-        redacted = re.sub(r'(["\'])(//.*?)(\\1)', r'"\<path\>"', redacted)
-        redacted = re.sub(r'(["\'])(/.*?)(\\1)', r'"\<path\>"', redacted)
-        redacted = re.sub(r"[A-Za-z]:[\\/][^\\s]+", "<path>", redacted)
-        redacted = re.sub(r"\\\\[^\\s]+", "<path>", redacted)
-        redacted = re.sub(r"//[^\\s]+", "<path>", redacted)
-        redacted = re.sub(r"(?<![A-Za-z0-9])/(?:[^\\s]+)", "<path>", redacted)
-        redacted = re.sub(r"<path>[^\\s]*", "<path>", redacted)
-        return redacted
+        return redact_path_text(text)
 
     def _looks_like_path_token(self, token):
-        if not token:
-            return False
-        if re.match(r"^[A-Za-z]:[\\/]", token):
-            return True
-        if token.startswith("\\\\") or token.startswith("//"):
-            return True
-        if token.startswith("/"):
-            return True
-        return False
+        return looks_like_path_token(token)
 
     def _get_sanitized_command_display(self):
-        if not self._last_command:
-            return self._redact_path_text(self._last_display_command or "")
-        safe_tokens = []
-        for token in self._last_command:
-            if token.startswith("-"):
-                safe_tokens.append(token)
-                continue
-            if self._looks_like_path_token(token):
-                safe_tokens.append("<path>")
-            else:
-                safe_tokens.append(self._redact_path_text(token))
-        quoted_parts = []
-        for token in safe_tokens:
-            if " " in token or '"' in token or "'" in token:
-                processed = token.replace('"', '\\"')
-                quoted_parts.append(f'"{processed}"')
-            else:
-                quoted_parts.append(token)
-        return " ".join(quoted_parts)
+        return sanitize_command_display(self._last_command, self._last_display_command)
 
     def _basename_only(self, path):
         if not path:
@@ -4119,298 +2128,6 @@ class WhisperGUI(QMainWindow):
             self.show_hardware_optimization_dialog()
         except Exception as e:
             logging.error(f"Error in forced hardware optimization: {e}")
-
-    def open_wiki_page(self):
-        """Open the project wiki in the default browser."""
-        try:
-            import webbrowser
-            webbrowser.open("https://github.com/cbro33/Faster-Whisper-XXL-GUI/wiki")
-        except Exception as e:
-            logging.error(f"Error opening wiki page: {e}")
-
-    def show_debug_log_dialog(self):
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Debug Logs")
-        dialog.setModal(True)
-        dialog.setMinimumSize(560, 300)
-
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(22, 14, 22, 22)
-        layout.setSpacing(14)
-
-        title_label = QLabel("Debug Logging")
-        title_label.setStyleSheet("font-size: 18px; font-weight: bold;")
-        layout.addWidget(title_label)
-
-        info_label = QLabel(
-            "<div>Enable debugging and write to <b>debug_log.txt</b>.</div>"
-            "<div style='margin-top:10px;'>The log includes:</div>"
-            "<ul style='margin-top:8px; margin-bottom:0;'>"
-            "<li>Model download lifecycle (start, cancel, finish)</li>"
-            "<li>Model size detection source (HEAD/API/header)</li>"
-            "<li>Run parameters (model, task, device, compute type)</li>"
-            "<li>Output formats and advanced toggles (VAD, word timestamps, MP3)</li>"
-            "</ul>"
-        )
-        info_label.setWordWrap(True)
-        info_label.setTextFormat(Qt.TextFormat.RichText)
-        info_label.setStyleSheet("font-size: 14px; line-height: 1.25;")
-        layout.addWidget(info_label)
-        layout.addSpacing(10)
-
-        enabled_checkbox = QCheckBox("Enable debug logging")
-        enabled_checkbox.setChecked(self.settings.get("debug_model_download_logging", False))
-        enabled_checkbox.setStyleSheet("margin-top: 6px; margin-bottom: 8px; font-size: 14px;")
-        layout.addWidget(enabled_checkbox)
-
-        button_row = QHBoxLayout()
-        open_button = QPushButton("Open Log")
-        clear_button = QPushButton("Clear Log")
-        close_button = QPushButton("Close")
-        for button in (open_button, clear_button, close_button):
-            button.setMinimumWidth(110)
-            button.setMinimumHeight(34)
-        button_row.addWidget(open_button)
-        button_row.addWidget(clear_button)
-        button_row.addStretch()
-        button_row.addWidget(close_button)
-        layout.addLayout(button_row)
-
-        def on_toggle():
-            enabled = enabled_checkbox.isChecked()
-            self.settings["debug_model_download_logging"] = enabled
-            self.save_settings_to_file()
-            set_model_download_logging_enabled(enabled)
-            set_ytdlp_debug_logging_enabled(enabled)
-
-        enabled_checkbox.toggled.connect(on_toggle)
-
-        def on_open():
-            log_path = get_model_download_log_path()
-            if not os.path.exists(log_path) or os.path.getsize(log_path) == 0:
-                QMessageBox.information(self, "Debug Log", "No debug log found yet.")
-                return
-            QDesktopServices.openUrl(QUrl.fromLocalFile(log_path))
-
-        def on_clear():
-            log_path = get_model_download_log_path()
-            try:
-                if not os.path.exists(log_path) or os.path.getsize(log_path) == 0:
-                    QMessageBox.information(self, "Debug Log", "No debug log to clear.")
-                    return
-                with open(log_path, "w", encoding="utf-8"):
-                    pass
-                QMessageBox.information(self, "Debug Log", "Debug log cleared.")
-            except Exception as exc:
-                QMessageBox.warning(self, "Debug Log", f"Unable to clear log file:\n{exc}")
-
-        open_button.clicked.connect(on_open)
-        clear_button.clicked.connect(on_clear)
-        close_button.clicked.connect(dialog.accept)
-
-        dialog.exec()
-
-    def show_hardware_info(self):
-        """ Show current hardware information """
-        try:
-            hardware_info = detect_hardware_capabilities()
-            info_text = "Current Hardware Information:\n\n"
-            
-            if hardware_info["has_cuda"]:
-                info_text += f"GPU: {hardware_info['gpu_name']} ({hardware_info['gpu_memory_gb']:.1f}GB VRAM)\n"
-                info_text += f"CUDA Version: {hardware_info['cuda_version']}\n"
-            else:
-                info_text += "GPU: No CUDA-compatible GPU detected\n"
-            
-            info_text += f"System RAM: {hardware_info['ram_gb']:.1f}GB\n"
-            info_text += f"CPU Cores: {hardware_info['cpu_cores']}\n"
-            info_text += f"Platform: {hardware_info['os_platform']}\n\n"
-            
-            if self.settings.get("hardware_optimized", False):
-                info_text += "Hardware Optimization: Applied\n"
-                applied = self.settings.get("optimization_applied", {})
-                if applied:
-                    info_text += f"Current Settings:\n"
-                    info_text += f"• Device: {applied.get('device', 'N/A')}\n"
-                    info_text += f"• Model: {applied.get('model', 'N/A')}\n"
-                    info_text += f"• Compute Type: {applied.get('compute_type', 'N/A')}\n"
-            else:
-                info_text += "Hardware Optimization: Not applied\n"
-            
-            show_setup_information(self, "Hardware Information", info_text)
-            
-        except Exception as e:
-            logging.error(f"Error showing hardware info: {e}")
-            show_setup_critical(self, "Error", f"Could not retrieve hardware information: {e}")
-
-    def show_software_information(self):
-        """Display detected versions, interpreters, and module paths"""
-        try:
-            info_lines = []
-            execution_env = get_execution_environment()
-            mode = "Standalone Executable" if getattr(sys, 'frozen', False) else "Source (Python)"
-            info_lines.append(f"Application Mode: {mode}")
-            info_lines.append(f"Execution Environment: {execution_env}")
-            info_lines.append(f"App Version: {APP_VERSION}")
-            info_lines.append(f"App Directory: {format_path_for_display(get_app_directory())}")
-            info_lines.append("")
-
-            info_lines.append("Current Python Process:")
-            info_lines.append(f"• Version: {platform.python_version()} ({platform.python_implementation()})")
-            info_lines.append(f"• Executable: {format_path_for_display(get_executable_fallback_path())}")
-
-            runtimes = enumerate_python_runtimes()
-            info_lines.append("")
-            bundle_dir = get_converter_bundle_dir()
-            bundle_python = get_converter_python_path(bundle_dir)
-            info_lines.append("Converter Bundle:")
-            info_lines.append(f"• Bundle Directory: {format_path_for_display(bundle_dir)}")
-            if bundle_python:
-                info_lines.append(f"• Python: {format_path_for_display(bundle_python)}")
-            else:
-                info_lines.append("• Python: Not found (bundle not installed)")
-            info_lines.append("")
-            info_lines.append("Detected Python Interpreters:")
-            if runtimes:
-                for runtime in runtimes:
-                    pip_state = "pip available" if runtime.get("has_pip") else "pip missing"
-                    commands = runtime.get("commands") or []
-                    if commands:
-                        cmd_summary = ", ".join(commands[:2])
-                        if len(commands) > 2:
-                            cmd_summary += " …"
-                        cmd_summary = f" via {cmd_summary}"
-                    else:
-                        cmd_summary = ""
-                    info_lines.append(
-                        f"• Python {runtime.get('version', 'unknown')} ({pip_state}{cmd_summary})"
-                    )
-                    display_path = format_path_for_display(runtime.get("executable"))
-                    if display_path:
-                        info_lines.append(f"  Executable: {display_path}")
-            else:
-                info_lines.append("• None detected")
-
-            source = self.settings.get("yt_dlp_source", "bundled")
-            plan = get_python_update_plan()
-            info_lines.append("")
-            info_lines.append("yt-dlp Update Planner:")
-            if source == "path":
-                info_lines.append("• Source: EXE (custom or PATH)")
-                info_lines.append("• Update Method: Manual (download new yt-dlp.exe)")
-            else:
-                info_lines.append("• Source: Python module (bundled/current env)")
-                info_lines.append(f"• Status: {plan.get('status')}")
-                if plan.get("status_detail"):
-                    info_lines.append(f"• Detail: {plan['status_detail']}")
-                python_info = plan.get("python_info")
-                if python_info:
-                    info_lines.append(
-                        f"• Selected Interpreter: {python_info.get('display_name')} (Python {python_info.get('version')})"
-                    )
-                if plan.get("target_directory"):
-                    info_lines.append(f"• Target Directory: {format_path_for_display(plan['target_directory'])}")
-
-            probe_log = get_python_probe_log()
-            if plan.get("status") != "ready" and failures:
-                info_lines.append("")
-                info_lines.append("Python Probe Diagnostics (failed commands):")
-                for entry in failures[:5]:
-                    detail = entry.get("detail")
-                    if detail and len(detail) > 200:
-                        detail = detail[:200] + "…"
-                    cmd_label = " ".join(entry.get("command", [])) or "(unknown)"
-                    info_lines.append(
-                        f"• {cmd_label}: {entry.get('status')}" + (f" ({detail})" if detail else "")
-                    )
-
-            info_lines.append("")
-            if source == "path":
-                exe_version, exe_path, exe_error = self.get_ytdlp_exe_version()
-                info_lines.append("yt-dlp EXE:")
-                info_lines.append(f"• Version: {exe_version or 'Unknown'}")
-                info_lines.append(f"• Location: {format_path_for_display(exe_path) or 'Unknown'}")
-                if exe_error:
-                    info_lines.append(f"• Status: {exe_error}")
-                version_status = evaluate_yt_dlp_version_status(exe_version)
-            else:
-                ytdlp_info = get_ytdlp_installation_info()
-                info_lines.append("yt-dlp Module:")
-                info_lines.append(f"• Version: {ytdlp_info.get('version') or 'Not found'}")
-                info_lines.append(f"• Location: {format_path_for_display(ytdlp_info.get('path')) or 'Unknown'}")
-                info_lines.append(f"• Source: {ytdlp_info.get('installation_type')}")
-                version_status = evaluate_yt_dlp_version_status(ytdlp_info.get('version'))
-            latest = version_status.get("latest_version")
-            if latest:
-                info_lines.append(f"• Latest Release: {latest}")
-            status_label = version_status.get("status")
-            if status_label == "up_to_date":
-                info_lines.append("• Upstream Status: Up to date")
-            elif status_label == "behind" and version_status.get("releases_behind"):
-                releases_behind = version_status["releases_behind"]
-                plural = "s" if releases_behind != 1 else ""
-                info_lines.append(
-                    f"• Upstream Status: {releases_behind} release{plural} behind"
-                )
-            elif status_label == "unknown":
-                info_lines.append("• Upstream Status: Unable to determine (version not in release list)")
-
-            info_lines.append("")
-            info_lines.append("Faster Whisper XXL GUI:")
-            info_lines.append(f"• GUI Version: {APP_VERSION}")
-            if self.executable_path and os.path.exists(self.executable_path):
-                fw_version = detect_faster_whisper_binary_version(self.executable_path)
-                info_lines.append(f"• Backend Binary: {format_path_for_display(self.executable_path)}")
-                info_lines.append(f"• Backend Binary Version: {fw_version or 'Not reported'}")
-            else:
-                info_lines.append("• Backend Binary: Not initialized yet")
-
-            info_text = "\n".join(info_lines)
-            show_setup_information(self, "Software Information", info_text)
-        except Exception as e:
-            logging.error(f"Error showing software info: {e}")
-            show_setup_warning(self, "Software Information", f"Could not gather software info:\n{e}")
-
-    def diagnose_gpu_detection(self):
-        """ Run comprehensive GPU detection diagnostics """
-        try:
-            hardware_info = detect_hardware_capabilities()
-            diag_text = "GPU Detection Diagnostics\n\n"
-            
-            if hardware_info["has_cuda"]:
-                diag_text += f"✅ SUCCESS: GPU detected via {hardware_info.get('detection_method', 'unknown')}\n\n"
-                diag_text += f"GPU Name: {hardware_info['gpu_name']}\n"
-                diag_text += f"VRAM: {hardware_info['gpu_memory_gb']:.1f}GB\n"
-                diag_text += f"CUDA Version: {hardware_info['cuda_version']}\n\n"
-                diag_text += "Your GPU is properly detected and CUDA acceleration is available."
-            else:
-                diag_text += "❌ FAILED: No CUDA-compatible GPU detected\n\n"
-                if hardware_info.get("detection_details"):
-                    diag_text += "Detection attempts:\n"
-                    for detail in hardware_info["detection_details"]:
-                        diag_text += f"• {detail}\n"
-                    diag_text += "\n"
-                
-                diag_text += "Troubleshooting steps:\n"
-                diag_text += "1. Install PyTorch with CUDA support:\n"
-                diag_text += "   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121\n\n"
-                diag_text += "2. Update NVIDIA drivers from nvidia.com\n\n"
-                diag_text += "3. Verify NVIDIA GPU is detected by Windows:\n"
-                diag_text += "   - Open Device Manager\n"
-                diag_text += "   - Check 'Display adapters' section\n"
-                diag_text += "   - Look for NVIDIA GPU (no yellow warning icons)\n\n"
-                diag_text += "4. Test nvidia-smi command:\n"
-                diag_text += "   - Open Command Prompt\n"
-                diag_text += "   - Run: nvidia-smi\n"
-                diag_text += "   - Should show GPU information\n\n"
-                diag_text += "5. Restart computer after driver installation\n\n"
-                diag_text += "CPU mode will be used until GPU is properly detected."
-            
-            show_setup_information(self, "GPU Detection Diagnostics", diag_text)
-            
-        except Exception as e:
-            logging.error(f"Error in GPU diagnostics: {e}")
-            show_setup_critical(self, "Diagnostic Error", f"Could not run GPU diagnostics: {e}")
 
     def setup_realtime_saving(self):
         """Connect UI elements to save settings in real-time"""
@@ -4666,15 +2383,7 @@ class WhisperGUI(QMainWindow):
             worker.wait(2000)
 
     def _extract_links(self, text):
-        if not text:
-            return []
-        links = []
-        for line in text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            links.extend(token for token in re.split(r"\s+", line) if token)
-        return links
+        return extract_links_from_text(text)
 
     def add_input_links(self, links):
         if not links:
@@ -4809,25 +2518,17 @@ class WhisperGUI(QMainWindow):
         selection = (self.vad_device.currentText() or "").strip().lower()
         return selection in {"cpu", "cuda"}
 
-    def _detect_cuda_oom(self, text):
-        if not text:
-            return False
-        lowered = text.lower()
-        if "cuda out of memory" in lowered or "cuda error: out of memory" in lowered:
-            return True
-        if "cublas_status_alloc_failed" in lowered or ("cudnn" in lowered and "out of memory" in lowered):
-            return True
-        if "out of memory" in lowered and ("cuda" in lowered or "gpu" in lowered):
-            return True
-        if "out of memory" in lowered and "tried to allocate" in lowered:
-            return True
-        return False
+    @staticmethod
+    def _detect_cuda_oom(text):
+        return detect_cuda_oom(text)
 
-    def _detect_cuda_kernel_incompatible(self, text):
-        if not text:
-            return False
-        lowered = text.lower()
-        return "no kernel image is available for execution on the device" in lowered
+    @staticmethod
+    def _detect_cuda_kernel_incompatible(text):
+        return detect_cuda_kernel_incompatible(text)
+
+    @staticmethod
+    def _detect_cublas_not_supported(text):
+        return detect_cublas_not_supported(text)
 
     def _should_retry_with_vad_cpu(self):
         if not self._last_run_cuda_oom:
@@ -4905,6 +2606,53 @@ class WhisperGUI(QMainWindow):
             self._append_text_to_console("\nCUDA kernel incompatible. Retrying with VAD on CPU...\n")
         else:
             self._append_text_to_console("\nRetrying with VAD on CPU...\n")
+        return self.start_transcription_process(command, clear_output=False)
+
+    def _should_retry_cublas_compute(self):
+        if not self._last_run_cublas_not_supported:
+            return False
+        if self.stop_requested:
+            return False
+        if self._cublas_compute_retry_attempted:
+            return False
+        current = self._get_effective_compute_type()
+        return get_compute_fallback(current) is not None
+
+    def _start_cublas_compute_retry(self):
+        current = self._get_effective_compute_type()
+        fallback = get_compute_fallback(current)
+        if not fallback:
+            return False
+        self._cublas_compute_retry_attempted = True
+        self._last_run_cublas_not_supported = False
+        self._compute_type_override = fallback
+        logging.info(
+            "cuBLAS not-supported detected: retrying with compute_type=%s (was %s)",
+            fallback, current,
+        )
+        self._log_debug_event(
+            "cublas_compute_retry",
+            original_compute=current,
+            fallback_compute=fallback,
+            input_file=getattr(self, "current_input_file", None),
+            stderr_tail=self._last_cublas_not_supported_snippet,
+        )
+        self.output_buffer = ""
+        self.last_line_was_overwrite = False
+        self.transcription_completed_successfully = False
+        self._recent_stderr_lines.clear()
+        self.process = None
+        self._append_text_to_console(
+            f"\ncuBLAS reports compute type '{current}' is not supported on this GPU. "
+            f"Retrying with '{fallback}'...\n"
+        )
+        input_file = getattr(self, "current_input_file", None)
+        if self._current_processed_audio and os.path.exists(self._current_processed_audio):
+            input_file = self._current_processed_audio
+        command = self.build_command(input_file)
+        self._compute_type_override = None
+        if not command:
+            return False
         return self.start_transcription_process(command, clear_output=False)
 
     def _resolve_vad_device(self):
@@ -5023,12 +2771,10 @@ class WhisperGUI(QMainWindow):
         return text
 
     def _is_windows_path(self, path):
-        return bool(re.match(r"^[A-Za-z]:\\\\", path))
+        return is_windows_path(path)
 
     def _windows_to_posix_path(self, path):
-        drive = path[0].lower()
-        rest = path[2:].replace("\\", "/").lstrip("/")
-        return f"/mnt/{drive}/{rest}"
+        return windows_to_posix_path(path)
 
     def _get_models_registry(self):
         registry = self.settings.get("models_registry")
@@ -5089,11 +2835,7 @@ class WhisperGUI(QMainWindow):
             self._models_registry_dirty = True
 
     def _sanitize_model_name(self, name):
-        if not name:
-            return ""
-        cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", name.strip())
-        cleaned = cleaned.strip("-._")
-        return cleaned.lower()
+        return sanitize_model_name(name)
 
     def _get_enabled_model_entries(self):
         return [entry for entry in self._get_models_registry() if entry.get("enabled")]
@@ -5184,29 +2926,7 @@ class WhisperGUI(QMainWindow):
         return f"{MODEL_DIR_PREFIX}{model_name}"
 
     def _parse_hf_repo_id(self, value):
-        if not value:
-            return None
-        text = value.strip()
-        if not text:
-            return None
-        if text.startswith("http://") or text.startswith("https://"):
-            marker = "huggingface.co/"
-            if marker not in text:
-                return None
-            text = text.split(marker, 1)[1]
-        elif text.startswith("huggingface.co/"):
-            text = text.split("huggingface.co/", 1)[1]
-        text = text.split("?", 1)[0].split("#", 1)[0].strip("/")
-        for marker in ("/blob/", "/tree/"):
-            if marker in text:
-                text = text.split(marker, 1)[0]
-        parts = [part for part in text.split("/") if part]
-        if len(parts) < 2:
-            return None
-        repo_id = "/".join(parts[:2])
-        if re.match(r"^[^/]+/[^/]+$", repo_id):
-            return repo_id
-        return None
+        return parse_hf_repo_id(value)
 
     def _sync_models_from_disk(self):
         registry = self._get_models_registry()
@@ -5532,6 +3252,9 @@ class WhisperGUI(QMainWindow):
         self._last_cuda_oom_snippet = None
         self._last_run_cuda_kernel_incompatible = False
         self._last_cuda_kernel_snippet = None
+        self._last_run_cublas_not_supported = False
+        self._last_cublas_not_supported_snippet = None
+        self._cublas_compute_retry_attempted = False
         self._vad_cpu_fallback_active = False
         self._vad_oom_retry_files = set()
         self._custom_model_retry_attempted = False
@@ -5688,6 +3411,8 @@ class WhisperGUI(QMainWindow):
         self._last_cuda_oom_snippet = None
         self._last_run_cuda_kernel_incompatible = False
         self._last_cuda_kernel_snippet = None
+        self._last_run_cublas_not_supported = False
+        self._last_cublas_not_supported_snippet = None
 
         if clear_output:
             self.output_text.clear()
@@ -5756,21 +3481,7 @@ class WhisperGUI(QMainWindow):
 
 
     def _filter_verbose_output(self, data):
-        lines = data.split('\n')
-        filtered_lines = []
-
-        for line in lines:
-            if re.match(
-                r'^\[(?:\d+:\d+\.\d+|\d+:\d+:\d+\.\d+)\s*-->\s*(?:\d+:\d+\.\d+|\d+:\d+:\d+\.\d+)\]',
-                line,
-            ):
-                filtered_lines.append(line)
-            elif 'Subtitles are written to' in line:
-                if not filtered_lines or filtered_lines[-1] != "":
-                    filtered_lines.append("")
-                filtered_lines.append(line)
-
-        return '\n'.join(filtered_lines) if filtered_lines else ''
+        return filter_verbose_output(data)
 
     def handle_stdout(self):
         data = self.process.readAllStandardOutput().data().decode('utf-8', errors='ignore')
@@ -5805,6 +3516,16 @@ class WhisperGUI(QMainWindow):
                     stderr_tail=self._last_cuda_kernel_snippet,
                 )
             self._last_run_cuda_kernel_incompatible = True
+        if data and self._detect_cublas_not_supported(data):
+            if not self._last_run_cublas_not_supported:
+                lines = [line.strip() for line in data.replace("\r", "\n").split("\n") if line.strip()]
+                self._last_cublas_not_supported_snippet = lines[-3:] if lines else None
+                self._log_debug_event(
+                    "cublas_not_supported_detected",
+                    input_file=getattr(self, "current_input_file", None),
+                    stderr_tail=self._last_cublas_not_supported_snippet,
+                )
+            self._last_run_cublas_not_supported = True
         if data:
             for line in data.replace("\r", "\n").split("\n"):
                 line = line.strip()
@@ -5876,226 +3597,30 @@ class WhisperGUI(QMainWindow):
 
     def create_sentences_only_file(self, txt_with_timestamps, sentences_only_path):
         """Helper method to create sentences-only file from timestamped txt"""
-        try:
-            if not os.path.exists(txt_with_timestamps):
-                self._append_text_to_console(f"\nWarning: Timestamped txt file not found at {txt_with_timestamps}\n")
-                return False
-            
-            with open(txt_with_timestamps, 'r', encoding='utf-8') as f:
-                content = f.read()
-            
-            if not content.strip():
-                self._append_text_to_console(f"\nWarning: Timestamped txt file is empty\n")
-                return False
-            
-            pattern = re.compile(r'^\[[\d:.\->\s]+\]\s*(.*)$')
-            speaker_pattern = re.compile(r'^\[(SPEAKER_?\d+)\]:\s*(.*)$')
-            records = []
-            saw_speaker = False
-
-            for raw_line in content.splitlines():
-                line = raw_line.strip()
-                if not line:
-                    continue
-                match = pattern.match(line)
-                if not match:
-                    continue
-                text = match.group(1).strip()
-                if not text:
-                    continue
-                speaker_match = speaker_pattern.match(text)
-                if speaker_match:
-                    speaker = speaker_match.group(1)
-                    remainder = speaker_match.group(2).strip()
-                    saw_speaker = True
-                    records.append((speaker, remainder))
-                else:
-                    records.append((None, text))
-
-            if not records:
-                self._append_text_to_console(f"\nWarning: No timestamped content found in txt file\n")
-                return False
-
-            if saw_speaker:
-                lines = []
-                current_speaker = None
-                current_parts = []
-                for speaker, text in records:
-                    if speaker:
-                        if current_speaker and speaker != current_speaker:
-                            prefix = f"[{current_speaker}]:"
-                            if current_parts:
-                                lines.append(prefix + " " + " ".join(current_parts))
-                            else:
-                                lines.append(prefix)
-                            current_parts = []
-                        current_speaker = speaker
-                        if text:
-                            current_parts.append(text)
-                    else:
-                        if current_speaker:
-                            current_parts.append(text)
-                        else:
-                            lines.append(text)
-                if current_speaker:
-                    prefix = f"[{current_speaker}]:"
-                    if current_parts:
-                        lines.append(prefix + " " + " ".join(current_parts))
-                    else:
-                        lines.append(prefix)
-                sentences_text = "\n".join(line for line in lines if line.strip())
-            else:
-                sentences_text = ' '.join(text for _, text in records if text)
-
-            if not sentences_text:
-                self._append_text_to_console(f"\nWarning: No valid sentences extracted from txt file\n")
-                return False
-            
-            with open(sentences_only_path, 'w', encoding='utf-8') as f:
-                f.write(sentences_text)
-            
-            return True
-            
-        except Exception as e:
-            self._append_text_to_console(f"Error creating sentences-only txt file: {str(e)}\n")
-            return False
+        success, warning = create_sentences_only(txt_with_timestamps, sentences_only_path)
+        if warning:
+            self._append_text_to_console(f"\nWarning: {warning}\n")
+        return success
 
     def _parse_txt_timestamp(self, value):
-        value = (value or "").strip()
-        if not value:
-            return None
-        parts = value.split(":")
-        try:
-            if len(parts) == 2:
-                minutes = int(parts[0])
-                seconds = float(parts[1])
-                return minutes * 60 + seconds
-            if len(parts) == 3:
-                hours = int(parts[0])
-                minutes = int(parts[1])
-                seconds = float(parts[2])
-                return hours * 3600 + minutes * 60 + seconds
-        except ValueError:
-            return None
-        return None
+        return parse_txt_timestamp(value)
 
     def _parse_srt_timestamp(self, value):
-        value = (value or "").strip()
-        if not value:
-            return None
-        match = re.match(r"^(?P<hh>\d{2}):(?P<mm>\d{2}):(?P<ss>\d{2}),(?P<ms>\d{3})$", value)
-        if not match:
-            return None
-        hours = int(match.group("hh"))
-        minutes = int(match.group("mm"))
-        seconds = int(match.group("ss"))
-        millis = int(match.group("ms"))
-        return hours * 3600 + minutes * 60 + seconds + (millis / 1000.0)
+        return parse_srt_timestamp(value)
 
     def _read_speaker_segments_from_srt(self, srt_path):
-        if not srt_path or not os.path.exists(srt_path):
-            return []
-        speaker_pattern = re.compile(r'^\s*\[(SPEAKER_?\d+)\]:\s*(.*)$')
-        time_pattern = re.compile(r"(?P<start>\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(?P<end>\d{2}:\d{2}:\d{2},\d{3})")
-        segments = []
-        try:
-            with open(srt_path, "r", encoding="utf-8") as handle:
-                lines = [line.rstrip("\n") for line in handle]
-            idx = 0
-            while idx < len(lines):
-                line = lines[idx].strip()
-                if not line:
-                    idx += 1
-                    continue
-                # Skip cue number if present
-                if line.isdigit():
-                    idx += 1
-                    if idx >= len(lines):
-                        break
-                    line = lines[idx].strip()
-                time_match = time_pattern.match(line)
-                if not time_match:
-                    idx += 1
-                    continue
-                start = self._parse_srt_timestamp(time_match.group("start"))
-                end = self._parse_srt_timestamp(time_match.group("end"))
-                idx += 1
-                text_lines = []
-                while idx < len(lines) and lines[idx].strip():
-                    text_lines.append(lines[idx].strip())
-                    idx += 1
-                text = " ".join(text_lines).strip()
-                speaker_match = speaker_pattern.match(text)
-                if speaker_match and start is not None and end is not None:
-                    speaker = speaker_match.group(1)
-                    segments.append({"start": start, "end": end, "speaker": speaker})
-                idx += 1
-        except Exception:
-            return []
-        return segments
+        return read_speaker_segments_from_srt(srt_path)
 
     def _read_speaker_segments_from_txt(self, txt_path):
-        if not txt_path or not os.path.exists(txt_path):
-            return []
-        line_pattern = re.compile(
-            r'^\[(?P<start>[\d:.]+)\s*-->\s*(?P<end>[\d:.]+)\]\s*(?P<text>.*)$'
-        )
-        speaker_pattern = re.compile(r'^\s*\[(SPEAKER_?\d+)\]:\s*(.*)$')
-        segments = []
-        try:
-            with open(txt_path, "r", encoding="utf-8") as handle:
-                for raw_line in handle:
-                    line = raw_line.strip()
-                    if not line:
-                        continue
-                    match = line_pattern.match(line)
-                    if not match:
-                        continue
-                    start = self._parse_txt_timestamp(match.group("start"))
-                    end = self._parse_txt_timestamp(match.group("end"))
-                    text = match.group("text").strip()
-                    speaker_match = speaker_pattern.match(text)
-                    if speaker_match and start is not None and end is not None:
-                        speaker = speaker_match.group(1)
-                        segments.append({"start": start, "end": end, "speaker": speaker})
-        except Exception:
-            return []
-        return segments
+        return read_speaker_segments_from_txt(txt_path)
 
     def _match_speaker_for_segment(self, start, end, speaker_segments):
-        if start is None or end is None or not speaker_segments:
-            return None
-        best_speaker = None
-        best_overlap = 0.0
-        for segment in speaker_segments:
-            overlap = min(end, segment["end"]) - max(start, segment["start"])
-            if overlap > best_overlap:
-                best_overlap = overlap
-                best_speaker = segment["speaker"]
-        if best_overlap > 0:
-            return best_speaker
-        mid = (start + end) / 2.0
-        tolerance = 0.5
-        for segment in speaker_segments:
-            if (segment["start"] - tolerance) <= mid <= (segment["end"] + tolerance):
-                return segment["speaker"]
-        nearest = None
-        nearest_delta = None
-        for segment in speaker_segments:
-            seg_mid = (segment["start"] + segment["end"]) / 2.0
-            delta = abs(mid - seg_mid)
-            if nearest_delta is None or delta < nearest_delta:
-                nearest_delta = delta
-                nearest = segment["speaker"]
-        return nearest
+        return match_speaker_for_segment(start, end, speaker_segments)
 
     def _extra_args_has_flag(self, flag, text=None):
         if text is None:
             text = self.extra_cli_args.toPlainText().strip()
-        if not text:
-            return False
-        pattern = re.compile(rf"(^|\s){re.escape(flag)}(=|\s|$)")
-        return bool(pattern.search(text))
+        return extra_args_has_flag(flag, text)
 
     def _get_last_review_json_path(self):
         output_dir = self._last_review_output_dir or self.get_output_dir()
@@ -6113,97 +3638,13 @@ class WhisperGUI(QMainWindow):
         return path or None
 
     def _replace_speaker_labels_in_text(self, path, mapping):
-        if not path or not os.path.exists(path):
-            return False
-        pattern = re.compile(r"\[(SPEAKER_?\d+)\]:")
-        try:
-            with open(path, "r", encoding="utf-8") as handle:
-                content = handle.read()
-            def repl(match):
-                speaker_id = match.group(1)
-                name = mapping.get(speaker_id)
-                if name:
-                    return f"[{name}]:"
-                return match.group(0)
-            updated = pattern.sub(repl, content)
-            if updated == content:
-                return False
-            with open(path, "w", encoding="utf-8") as handle:
-                handle.write(updated)
-            return True
-        except Exception:
-            return False
+        return replace_speaker_labels_in_text(path, mapping)
 
     def _apply_speaker_names_to_json(self, json_path, mapping):
-        if not json_path or not os.path.exists(json_path):
-            return False
-        try:
-            with open(json_path, "r", encoding="utf-8") as handle:
-                data = json.load(handle)
-            if isinstance(data, dict):
-                segments = data.get("segments") or []
-            elif isinstance(data, list):
-                segments = data
-            else:
-                return False
-            updated = False
-            for segment in segments:
-                if not isinstance(segment, dict):
-                    continue
-                speaker_id = segment.get("speaker")
-                if not speaker_id:
-                    continue
-                name = mapping.get(speaker_id)
-                if name:
-                    segment["speaker_name"] = name
-                    updated = True
-            if not updated:
-                return False
-            with open(json_path, "w", encoding="utf-8") as handle:
-                json.dump(data, handle, indent=4, ensure_ascii=False)
-            return True
-        except Exception:
-            return False
+        return apply_speaker_names_to_json(json_path, mapping)
 
     def _inject_speakers_into_json_path(self, json_path):
-        if not json_path or not os.path.exists(json_path):
-            return False
-        base = os.path.splitext(json_path)[0]
-        srt_path = base + ".srt"
-        txt_path = base + ".txt"
-        speaker_segments = self._read_speaker_segments_from_srt(srt_path)
-        if not speaker_segments:
-            speaker_segments = self._read_speaker_segments_from_txt(txt_path)
-        if not speaker_segments:
-            return False
-        try:
-            with open(json_path, "r", encoding="utf-8") as handle:
-                data = json.load(handle)
-            if isinstance(data, dict):
-                segments = data.get("segments") or []
-            elif isinstance(data, list):
-                segments = data
-            else:
-                return False
-            updated = False
-            for segment in segments:
-                if not isinstance(segment, dict):
-                    continue
-                if segment.get("speaker"):
-                    continue
-                start = segment.get("start")
-                end = segment.get("end")
-                speaker = self._match_speaker_for_segment(start, end, speaker_segments)
-                if speaker:
-                    segment["speaker"] = speaker
-                    updated = True
-            if not updated:
-                return False
-            with open(json_path, "w", encoding="utf-8") as handle:
-                json.dump(data, handle, indent=4, ensure_ascii=False)
-            return True
-        except Exception:
-            return False
+        return inject_speakers_into_json(json_path)
 
     def _show_diarization_prompt(self):
         dialog = QDialog(self)
@@ -6489,14 +3930,7 @@ class WhisperGUI(QMainWindow):
         return updated
 
     def _format_lrc_timestamp(self, seconds):
-        try:
-            total_centis = int(round(max(0.0, float(seconds)) * 100))
-        except (TypeError, ValueError):
-            total_centis = 0
-        minutes = total_centis // 6000
-        secs = (total_centis // 100) % 60
-        centis = total_centis % 100
-        return f"{minutes:02d}:{secs:02d}.{centis:02d}"
+        return format_lrc_timestamp(seconds)
 
     def create_enhanced_lrc_from_json(self, input_file_path):
         """Generate enhanced LRC with word timestamps from JSON output."""
@@ -6523,36 +3957,7 @@ class WhisperGUI(QMainWindow):
                 self._append_text_to_console("\nWarning: No segments found in JSON file\n")
                 return False
 
-            lines = []
-            for segment in segments:
-                if not isinstance(segment, dict):
-                    continue
-                start = segment.get("start", 0)
-                words = segment.get("words") or []
-                if words:
-                    word_chunks = []
-                    for word_entry in words:
-                        if not isinstance(word_entry, dict):
-                            continue
-                        word_text = str(word_entry.get("word", "")).strip()
-                        if not word_text:
-                            continue
-                        word_start = word_entry.get("start", start)
-                        word_ts = self._format_lrc_timestamp(word_start)
-                        word_chunks.append(f"<{word_ts}>{word_text}")
-                    if not word_chunks:
-                        text = str(segment.get("text", "")).strip()
-                        if not text:
-                            continue
-                        lines.append(f"[{self._format_lrc_timestamp(start)}]{text}")
-                    else:
-                        line = f"[{self._format_lrc_timestamp(start)}]" + " ".join(word_chunks)
-                        lines.append(line)
-                else:
-                    text = str(segment.get("text", "")).strip()
-                    if not text:
-                        continue
-                    lines.append(f"[{self._format_lrc_timestamp(start)}]{text}")
+            lines = build_lrc_lines(segments)
 
             if not lines:
                 self._append_text_to_console("\nWarning: No valid LRC lines created from JSON\n")
@@ -6685,10 +4090,17 @@ class WhisperGUI(QMainWindow):
                 except Exception:
                     remaining = ""
             if remaining:
+                if self._detect_cublas_not_supported(remaining):
+                    self._last_run_cublas_not_supported = True
+                    lines = [l.strip() for l in remaining.replace("\r", "\n").split("\n") if l.strip()]
+                    self._last_cublas_not_supported_snippet = lines[-3:] if lines else None
                 for line in remaining.replace("\r", "\n").split("\n"):
                     line = line.strip()
                     if line:
                         self._recent_stderr_lines.append(line)
+            if self._should_retry_cublas_compute():
+                if self._start_cublas_compute_retry():
+                    return
             if self._should_retry_with_vad_cpu():
                 if self._start_vad_cpu_retry():
                     return

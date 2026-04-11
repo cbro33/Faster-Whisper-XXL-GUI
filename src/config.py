@@ -1,5 +1,5 @@
 
-APP_VERSION = "1.15.1"
+APP_VERSION = "1.15.2"
 SUPPORTED_EXTENSIONS = ('.mp3', '.wav', '.mp4', '.m4a', '.flac', '.aac', '.ogg', '.webm', '.mkv', '.avi', '.mov')
 YTDLP_UPDATE_FAILURE_COOLDOWN_HOURS = 6
 YTDLP_DEBUG_LOG_NAME = "ytdlp_update_debug.log"

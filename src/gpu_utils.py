@@ -712,8 +712,8 @@ def get_recommended_settings(hardware_info):
     
     # Compute Type Based on Hardware
     if hardware_info["has_cuda"]:
-        if hardware_info["gpu_memory_gb"] >= 8:
-            recommendations["compute_type"] = "float16"  # Best quality
+        if hardware_info["gpu_memory_gb"] >= 7.5:
+            recommendations["compute_type"] = "float16"  # Best quality; 7.5 threshold avoids rounding-edge GPUs (e.g. 8 GB cards reporting 7.9)
         elif hardware_info["gpu_memory_gb"] >= 4:
             recommendations["compute_type"] = "int8_float16"  # Good balance
         else:

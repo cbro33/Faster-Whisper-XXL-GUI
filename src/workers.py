@@ -1,6 +1,7 @@
 import os
 import logging
 import subprocess
+import tempfile
 import threading
 import json
 from collections import deque
@@ -9,9 +10,10 @@ import time
 import queue
 import sys
 import shutil
+import requests
 from PyQt6.QtCore import pyqtSignal, QThread
 from utils import popen_hidden_subprocess, resolve_ffmpeg_location, run_hidden_subprocess
-from converter_utils import ensure_converter_bundle, get_converter_bundle_dir, get_fallback_python, scan_transformers_weights
+from converter_utils import ensure_converter_bundle, get_converter_bundle_dir, get_converter_python_path, get_fallback_python, scan_transformers_weights
 import ytdlp_utils
 from ytdlp_utils import log_ytdlp_update_debug
 from python_utils import refresh_python_detection_cache
@@ -1193,3 +1195,292 @@ class ModelConversionWorker(QThread):
         except Exception as exc:
             logging.error(f"Model conversion failed: {exc}")
             self.finished.emit(False, f"Conversion failed: {exc}")
+
+
+class YtDlpVersionCheckWorker(QThread):
+    finished = pyqtSignal(dict)
+
+    def __init__(self, url, timeout=5, headers=None, parent=None):
+        super().__init__(parent)
+        self.url = url
+        self.timeout = timeout
+        self.headers = headers or {}
+
+    def run(self):
+        result = {"ok": False, "status_code": None, "latest_version": None, "error": None}
+        try:
+            response = requests.get(self.url, timeout=self.timeout, headers=self.headers)
+            result["status_code"] = response.status_code
+            if response.status_code == 200:
+                data = response.json()
+                result["latest_version"] = data.get("tag_name")
+            result["ok"] = True
+        except Exception as exc:
+            result["error"] = str(exc)
+        self.finished.emit(result)
+
+
+class ConverterBundleRepairWorker(QThread):
+    progress = pyqtSignal(str, int)
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.stop_requested = False
+
+    def stop(self):
+        self.stop_requested = True
+
+    def run(self):
+        try:
+            self.progress.emit("Clearing converter bundle cache...", -1)
+            bundle_dir = get_converter_bundle_dir()
+            if bundle_dir and os.path.isdir(bundle_dir):
+                shutil.rmtree(bundle_dir, ignore_errors=True)
+            if self.stop_requested:
+                self.finished.emit(False, "Repair cancelled.")
+                return
+
+            def progress_cb(message, downloaded, total):
+                if self.stop_requested:
+                    return
+                percent = -1
+                if total:
+                    try:
+                        percent = int((downloaded / total) * 100)
+                    except Exception:
+                        percent = -1
+                self.progress.emit(message, percent)
+
+            ensure_converter_bundle(progress_cb=progress_cb, cancel_cb=lambda: self.stop_requested)
+            if self.stop_requested:
+                self.finished.emit(False, "Repair cancelled.")
+            else:
+                self.finished.emit(True, "Converter bundle repaired.")
+        except Exception as exc:
+            if self.stop_requested:
+                self.finished.emit(False, "Repair cancelled.")
+            else:
+                self.finished.emit(False, str(exc))
+
+
+class ConverterBundleVerifyWorker(QThread):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.stop_requested = False
+
+    def stop(self):
+        self.stop_requested = True
+
+    def _build_env(self):
+        env = os.environ.copy()
+        for key in ("PYTHONHOME", "PYTHONPATH"):
+            env.pop(key, None)
+        return env
+
+    def run(self):
+        try:
+            bundle_dir = get_converter_bundle_dir()
+            python_path = get_converter_python_path(bundle_dir)
+            if not python_path or not os.path.isfile(python_path):
+                self.finished.emit(False, "Converter bundle not installed.")
+                return
+            self.progress.emit("Verifying converter bundle...")
+            result = run_hidden_subprocess(
+                [
+                    python_path,
+                    "-c",
+                    (
+                        "import ctranslate2, transformers, torch, safetensors;"
+                        "import ctranslate2.converters.transformers;"
+                        "print('ctranslate2', ctranslate2.__version__);"
+                        "print('transformers', transformers.__version__);"
+                        "print('torch', torch.__version__);"
+                        "print('safetensors', safetensors.__version__)"
+                    )
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                env=self._build_env(),
+            )
+            if result.returncode == 0:
+                self.finished.emit(True, "Converter bundle is ready.")
+            else:
+                detail = (result.stderr or result.stdout or "").strip()
+                if not detail:
+                    detail = "Missing required packages."
+                self.finished.emit(False, detail)
+        except Exception as exc:
+            if self.stop_requested:
+                self.finished.emit(False, "Verification cancelled.")
+            else:
+                self.finished.emit(False, str(exc))
+
+
+class LoudnessAnalysisWorker(QThread):
+    progress = pyqtSignal(int, int, str)
+    finished = pyqtSignal(object, object, bool)
+
+    def __init__(self, ffmpeg_path, file_paths, parent=None):
+        super().__init__(parent)
+        self.ffmpeg_path = ffmpeg_path
+        self.file_paths = list(file_paths)
+        self.stop_requested = False
+
+    def stop(self):
+        self.stop_requested = True
+
+    def run(self):
+        results = []
+        failed = []
+        total = len(self.file_paths)
+        for index, path in enumerate(self.file_paths, start=1):
+            if self.stop_requested:
+                break
+            self.progress.emit(index, total, os.path.basename(path))
+            data, error = self._analyze_loudness_file(path)
+            if data is None:
+                failed.append((path, error))
+            else:
+                results.append((path, data))
+        canceled = self.stop_requested
+        self.progress.emit(total, total, "Done")
+        self.finished.emit(results, failed, canceled)
+
+    def _analyze_loudness_file(self, input_file):
+        command = [
+            self.ffmpeg_path,
+            "-hide_banner",
+            "-i",
+            input_file,
+            "-filter_complex",
+            "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json",
+            "-f",
+            "null",
+            "-",
+        ]
+        result = run_hidden_subprocess(command, capture_output=True, text=True)
+        output = (result.stderr or "") + (result.stdout or "")
+        match = re.findall(r"\{.*?\}", output, flags=re.DOTALL)
+        if not match:
+            return None, "parse_failed"
+        try:
+            return json.loads(match[-1]), None
+        except json.JSONDecodeError:
+            return None, "decode_failed"
+
+
+class AudioPreprocessWorker(QThread):
+    finished = pyqtSignal(object)
+
+    def __init__(self, ffmpeg_path, input_file, output_dir, filters, parent=None):
+        super().__init__(parent)
+        self.ffmpeg_path = ffmpeg_path
+        self.input_file = input_file
+        self.output_dir = output_dir
+        self.filters = list(filters or [])
+        self.stop_requested = False
+
+    def stop(self):
+        self.stop_requested = True
+
+    def run(self):
+        if not self.filters:
+            self.finished.emit({"ok": True, "path": self.input_file})
+            return
+        base_name = os.path.splitext(os.path.basename(self.input_file))[0]
+        stamp = int(time.time() * 1000)
+        output_path = os.path.join(self.output_dir, f"{base_name}_preprocessed_{stamp}.wav")
+        command = [
+            self.ffmpeg_path,
+            "-y",
+            "-i",
+            self.input_file,
+            "-filter_complex",
+            ",".join(self.filters),
+            "-c:a",
+            "pcm_s16le",
+            output_path,
+        ]
+        result = run_hidden_subprocess(command, capture_output=True, text=True)
+        if self.stop_requested:
+            if os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except Exception:
+                    pass
+            self.finished.emit({"ok": False, "error": "canceled"})
+            return
+        if result.returncode != 0:
+            snippet = (result.stderr or result.stdout or "").strip()
+            if snippet:
+                snippet = snippet.splitlines()[-1]
+            self.finished.emit({"ok": False, "error": snippet or "ffmpeg failed"})
+            return
+        self.finished.emit({"ok": True, "path": output_path})
+
+
+class VerifyModelsWorker(QThread):
+    progress = pyqtSignal(int, int, str)
+    finished = pyqtSignal(list)
+
+    def __init__(self, executable_path, checks, audio_path, device_type, compute_type, parent=None):
+        super().__init__(parent)
+        self.executable_path = executable_path
+        self.checks = list(checks)
+        self.audio_path = audio_path
+        self.device_type = device_type
+        self.compute_type = compute_type
+        self._cancel_event = threading.Event()
+
+    def cancel(self):
+        self._cancel_event.set()
+
+    def run(self):
+        results = []
+        total = len(self.checks)
+        for index, item in enumerate(self.checks, start=1):
+            if self._cancel_event.is_set():
+                results.append((item["name"], "Cancelled", "Verification cancelled by user."))
+                break
+            self.progress.emit(index, total, item["name"])
+            temp_dir = tempfile.mkdtemp(prefix="fw-verify-")
+            cmd = [
+                self.executable_path,
+                "--check_files",
+                "-m",
+                item["name"],
+                "--model_dir",
+                item["model_dir_cli"],
+                "--device",
+                self.device_type,
+                "--compute_type",
+                self.compute_type,
+                "--output_dir",
+                temp_dir,
+                self.audio_path,
+            ]
+            try:
+                result = run_hidden_subprocess(cmd, capture_output=True, text=True, timeout=45)
+            except Exception as exc:
+                results.append((item["name"], "Failed", f"Failed to run check: {exc}"))
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                continue
+            output = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
+            output = output.strip()
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            if result.returncode == 0:
+                results.append((item["name"], "OK", output or "Model check passed."))
+            else:
+                message = output or "Model check failed."
+                if result.returncode == -1073741819:
+                    message += (
+                        "\nThe backend crashed while loading the model. This usually means the model "
+                        "conversion is incompatible with the bundled faster-whisper-xxl binary."
+                    )
+                results.append((item["name"], "Failed", message))
+        self.finished.emit(results)
