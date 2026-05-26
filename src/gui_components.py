@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import pyqtSignal, Qt, QTimer
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
-from utils import get_window_stays_on_top_flag, run_hidden_subprocess, get_app_directory
+from utils import get_window_stays_on_top_flag, run_hidden_subprocess, get_app_directory, find_7zip
 from gpu_utils import detect_hardware_capabilities, get_recommended_settings
 from config import SUPPORTED_EXTENSIONS
 from converter_utils import find_transformers_weight_files, get_converter_bundle_dir, get_converter_python_path
@@ -545,23 +545,11 @@ class DownloadManager(QDialog):
             os.makedirs(extract_dir, exist_ok=True)
             logging.info(f"Created temp directory: {extract_dir}")
 
-            sevenzip_executable = shutil.which('7z')
-            if not sevenzip_executable and sys.platform == "win32":
-                prog_files = os.environ.get("ProgramFiles", "C:\\Program Files")
-                prog_files_x86 = os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")
-                possible_paths = [
-                    os.path.join(prog_files, "7-Zip", "7z.exe"),
-                    os.path.join(prog_files_x86, "7-Zip", "7z.exe")
-                ]
-                for path in possible_paths:
-                    if os.path.exists(path):
-                        sevenzip_executable = path
-                        break
+            sevenzip_executable = find_7zip()
             if not sevenzip_executable:
-                error_msg = ("7-Zip/p7zip executable not found. Please install it and ensure it's in your system's PATH. "
-                             "On Windows, install from https://www.7-zip.org/. On Linux, use e.g., "
-                             "'sudo apt install p7zip-full'.")
-                raise FileNotFoundError(error_msg)
+                raise FileNotFoundError(
+                    "7-Zip is required but was not found on your system."
+                )
 
             logging.info(f"Using 7-Zip executable: {sevenzip_executable}")
             self.extraction_progress.emit(0, 0, "Extracting archive using 7-Zip... (This may take a moment)")

@@ -25,7 +25,7 @@ class YouTubeDownloader(QThread):
     file_ready = pyqtSignal(str)
     total_found = pyqtSignal(int)
 
-    def __init__(self, urls, output_path, audio_only=True, stream_mode=True, serial_mode=False, ytdlp_exe=None):
+    def __init__(self, urls, output_path, audio_only=True, stream_mode=True, serial_mode=False, ytdlp_exe=None, cookies_from_browser=None, cookies_file=None):
         super().__init__()
         if isinstance(urls, str):
             self.urls = [urls]
@@ -36,6 +36,8 @@ class YouTubeDownloader(QThread):
         self.stream_mode = stream_mode
         self.serial_mode = serial_mode
         self.ytdlp_exe = ytdlp_exe
+        self.cookies_from_browser = cookies_from_browser or None
+        self.cookies_file = cookies_file or None
         self.stop_requested = False
         self._resume_event = threading.Event()
         self._resume_event.set()
@@ -136,6 +138,10 @@ class YouTubeDownloader(QThread):
                 }
             if ffmpeg_location:
                 ydl_opts['ffmpeg_location'] = ffmpeg_location
+            if self.cookies_from_browser:
+                ydl_opts['cookiesfrombrowser'] = (self.cookies_from_browser,)
+            elif self.cookies_file:
+                ydl_opts['cookiefile'] = self.cookies_file
 
             downloaded_files = []
             total_expected = 0
@@ -266,6 +272,10 @@ class YouTubeDownloader(QThread):
             cmd.extend(["-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"])
         if ffmpeg_location:
             cmd.extend(["--ffmpeg-location", ffmpeg_location])
+        if self.cookies_from_browser:
+            cmd.extend(["--cookies-from-browser", self.cookies_from_browser])
+        elif self.cookies_file:
+            cmd.extend(["--cookies", self.cookies_file])
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
         process = popen_hidden_subprocess(
@@ -746,6 +756,10 @@ class YouTubeDownloader(QThread):
             "--no-warnings",
             "--yes-playlist",
         ]
+        if self.cookies_from_browser:
+            cmd.extend(["--cookies-from-browser", self.cookies_from_browser])
+        elif self.cookies_file:
+            cmd.extend(["--cookies", self.cookies_file])
         stdout, stderr, returncode = self._run_ytdlp_exe_command(cmd, timeout=20, label="playlist_count")
         if returncode != 0:
             snippet = (stderr or stdout or "").strip()

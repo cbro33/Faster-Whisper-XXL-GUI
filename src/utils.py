@@ -2,6 +2,7 @@ import sys
 import os
 import logging
 import re
+import shutil
 import subprocess
 import shutil
 from PyQt6.QtCore import Qt
@@ -322,8 +323,18 @@ def detect_model_arch_from_dir(model_path):
     return None
 
 
+def strip_terminal_escapes(data):
+    """Strip ANSI escape sequences and OSC terminal title sequences from text."""
+    data = re.sub(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)', '', data)
+    data = re.sub(r'\]0;[^\[]*', '', data)
+    data = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', data)
+    data = re.sub(r'\[\d+(?:;\d+)*m', '', data)
+    return data
+
+
 def filter_verbose_output(data):
     """Filter transcription output to show only timestamp lines and completion messages."""
+    data = strip_terminal_escapes(data)
     lines = data.split('\n')
     filtered_lines = []
     for line in lines:
@@ -378,3 +389,65 @@ def text_indicates_transcription_success(text):
         "audio seconds/s",
     ]
     return any(indicator in text for indicator in success_indicators)
+
+
+def find_7zip():
+    """Find 7-Zip executable on the system. Returns path or None."""
+    exe = shutil.which('7z') or shutil.which('7zr')
+    if exe:
+        return exe
+    app_dir = get_app_directory()
+    for name in ['7zr.exe', '7z.exe', '7zr', '7z']:
+        local_path = os.path.join(app_dir, 'bin', name)
+        if os.path.exists(local_path):
+            return local_path
+    if sys.platform == "win32":
+        prog_files = os.environ.get("ProgramFiles", "C:\\Program Files")
+        prog_files_x86 = os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")
+        for base in [prog_files, prog_files_x86]:
+            path = os.path.join(base, "7-Zip", "7z.exe")
+            if os.path.exists(path):
+                return path
+    return None
+
+
+_7ZR_DOWNLOAD_URL = "https://github.com/ip7z/7zip/releases/download/26.01/7zr.exe"
+
+
+def download_7zr_portable(dest_dir=None):
+    """Download portable 7zr.exe to dest_dir (defaults to app bin/). Returns path or None."""
+    import requests
+    if dest_dir is None:
+        dest_dir = os.path.join(get_app_directory(), 'bin')
+    os.makedirs(dest_dir, exist_ok=True)
+    dest_path = os.path.join(dest_dir, '7zr.exe')
+    try:
+        logging.info(f"Downloading 7zr.exe to {dest_path}")
+        resp = requests.get(_7ZR_DOWNLOAD_URL, timeout=30)
+        resp.raise_for_status()
+        with open(dest_path, 'wb') as f:
+            f.write(resp.content)
+        logging.info(f"Downloaded 7zr.exe ({len(resp.content)} bytes)")
+        return dest_path
+    except Exception as e:
+        logging.error(f"Failed to download 7zr.exe: {e}")
+        if os.path.exists(dest_path):
+            os.remove(dest_path)
+        return None
+
+
+def get_7zip_install_command():
+    """Return a platform-appropriate command to install 7-Zip, or None."""
+    if sys.platform == "win32":
+        return None
+    if shutil.which("pacman"):
+        return "sudo pacman -S p7zip"
+    if shutil.which("apt"):
+        return "sudo apt install p7zip-full"
+    if shutil.which("dnf"):
+        return "sudo dnf install p7zip p7zip-plugins"
+    if shutil.which("zypper"):
+        return "sudo zypper install p7zip-full"
+    if shutil.which("brew"):
+        return "brew install p7zip"
+    return None

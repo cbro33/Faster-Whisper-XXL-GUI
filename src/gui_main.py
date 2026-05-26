@@ -32,7 +32,8 @@ from utils import (
     redact_path_text, looks_like_path_token, sanitize_command_display,
     is_windows_path, windows_to_posix_path, sanitize_model_name,
     parse_hf_repo_id, detect_model_arch_from_dir,
-    filter_verbose_output, extract_links_from_text,
+    filter_verbose_output, strip_terminal_escapes, extract_links_from_text,
+    find_7zip, get_7zip_install_command, download_7zr_portable,
     normalize_version, version_tuple, text_indicates_transcription_success,
 )
 from python_utils import (
@@ -235,6 +236,10 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
             show_setup_warning(self, "Setup Incomplete", "Application cannot run without the required files.")
             return False
 
+        if not find_7zip():
+            if not self._prompt_install_7zip():
+                return False
+
         self.download_manager = DownloadManager(url, self.files_to_check, self.bin_dir, self)
         if self.download_manager.exec() == QDialog.DialogCode.Accepted:
             self.executable_path = os.path.abspath(local_executable_path)
@@ -251,6 +256,52 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
                     detailed_error += f"\n\nThe downloaded archive was kept at:\n{os.path.abspath(archive_path)}"
             show_setup_critical(self, "Setup Failed", detailed_error)
             return False
+
+    def _prompt_install_7zip(self):
+        """Prompt user to install 7-Zip when it's not found. Returns True if 7z becomes available."""
+        if sys.platform == "win32":
+            msg = (
+                "7-Zip is required to extract the downloaded archive but was not found.\n\n"
+                "Would you like to download it automatically? (< 1 MB)"
+            )
+            reply = show_setup_question(
+                self, "7-Zip Required", msg,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                path = download_7zr_portable(self.bin_dir)
+                if path and os.path.exists(path):
+                    show_setup_information(self, "7-Zip Ready", "7-Zip portable has been downloaded successfully.")
+                    return True
+                else:
+                    show_setup_critical(
+                        self, "Download Failed",
+                        "Could not download 7-Zip.\n\n"
+                        "Please install 7-Zip manually from https://www.7-zip.org/ and restart."
+                    )
+                    return False
+            return False
+
+        install_cmd = get_7zip_install_command()
+        msg = "7-Zip is required to extract the downloaded archive but was not found.\n\n"
+        if install_cmd:
+            msg += f"Please run the following command in a terminal, then click Retry:\n\n{install_cmd}"
+        else:
+            msg += "Please install p7zip using your system's package manager and click Retry."
+
+        while True:
+            reply = QMessageBox.question(
+                self, "7-Zip Required", msg,
+                QMessageBox.StandardButton.Retry | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Retry
+            )
+            if reply == QMessageBox.StandardButton.Retry:
+                if find_7zip():
+                    return True
+                QMessageBox.warning(self, "Not Found", "7-Zip still not found. Please install it and try again.")
+            else:
+                return False
 
     def init_ui(self):
         self.setWindowTitle(f"Faster Whisper XXL GUI v{APP_VERSION}")
@@ -3485,6 +3536,7 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
 
     def handle_stdout(self):
         data = self.process.readAllStandardOutput().data().decode('utf-8', errors='ignore')
+        data = strip_terminal_escapes(data)
         self.check_for_transcription_success(data)
         if self.full_console_checkbox.isChecked():
             self._append_text_to_console(data)
@@ -4221,13 +4273,17 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
                 self.run_btn.setEnabled(True)
                 self.stop_btn.setEnabled(False)
                 return
+        cookies_from_browser = self.settings.get("yt_dlp_cookies_from_browser") or None
+        cookies_file = self.settings.get("yt_dlp_cookies_file") or None
         self.downloader = YouTubeDownloader(
             urls,
             output_path,
             audio_only,
             stream_mode=stream_mode,
             serial_mode=serial_mode,
-            ytdlp_exe=ytdlp_exe
+            ytdlp_exe=ytdlp_exe,
+            cookies_from_browser=cookies_from_browser,
+            cookies_file=cookies_file
         )
         self.downloader.finished.connect(self.on_download_finished)
         self.downloader.error.connect(self.on_download_error)
@@ -4247,6 +4303,7 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
         self.downloader.start()
 
     def handle_download_progress(self, text):
+        text = strip_terminal_escapes(text)
         if text.strip() == "Downloading with yt-dlp.exe...":
             self._append_text_to_console(text + "\n\n")
         elif text.startswith("Downloading"):
@@ -4307,6 +4364,12 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
 
         self._append_text_to_console(f"YouTube Download Error:\n{error_message}\n")
         error_lower = (error_message or "").lower()
+
+        if self._is_cookie_auth_error(error_lower):
+            self.downloader = None
+            self._handle_cookie_auth_error()
+            return
+
         if (
             "http error 403" in error_lower
             or "403: forbidden" in error_lower
@@ -4334,6 +4397,154 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
             self.run_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
         self.downloader = None
+
+    def _is_cookie_auth_error(self, error_lower):
+        return (
+            "sign in to confirm" in error_lower
+            or "cookies-from-browser" in error_lower
+            or "use --cookies" in error_lower
+        )
+
+    def _detect_installed_browsers(self):
+        browser_executables = {
+            "brave": ["brave", "brave-browser"],
+            "chrome": ["google-chrome", "google-chrome-stable", "chrome"],
+            "chromium": ["chromium", "chromium-browser"],
+            "edge": ["microsoft-edge", "microsoft-edge-stable", "msedge"],
+            "firefox": ["firefox", "librewolf", "waterfox", "floorp"],
+            "opera": ["opera"],
+            "safari": ["safari"],
+            "vivaldi": ["vivaldi", "vivaldi-stable"],
+            "whale": ["whale", "naver-whale"],
+        }
+        installed = []
+        for browser, exe_names in browser_executables.items():
+            for exe in exe_names:
+                if shutil.which(exe):
+                    installed.append(browser)
+                    break
+        return installed
+
+    def _handle_cookie_auth_error(self):
+        already_set = self.settings.get("yt_dlp_cookies_from_browser") or ""
+        already_set_file = self.settings.get("yt_dlp_cookies_file") or ""
+        if already_set:
+            self._append_text_to_console(
+                f"\nCookie authentication failed even with browser '{already_set}' configured.\n"
+                "Try a different browser or ensure you are logged into YouTube in that browser.\n"
+            )
+        elif already_set_file:
+            self._append_text_to_console(
+                f"\nCookie authentication failed with cookies file: {already_set_file}\n"
+                "The file may be expired or invalid.\n"
+            )
+
+        installed_browsers = self._detect_installed_browsers()
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("YouTube Authentication Required")
+        dialog.setModal(True)
+        dialog.setMinimumSize(440, 320)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 16, 20, 20)
+        layout.setSpacing(12)
+
+        info = QLabel(
+            "YouTube is requiring authentication to download this video.\n\n"
+            "You can either let yt-dlp read cookies from an installed browser,\n"
+            "or provide a cookies.txt file (Netscape format)."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        combo = QComboBox()
+        combo.addItem("-- Select a browser --", "")
+        if installed_browsers:
+            for b in installed_browsers:
+                combo.addItem(b.capitalize(), b)
+        else:
+            combo.addItem("(no browsers detected)", "")
+        if already_set and already_set in installed_browsers:
+            combo.setCurrentIndex(installed_browsers.index(already_set) + 1)
+        layout.addWidget(combo)
+
+        file_row = QHBoxLayout()
+        file_label = QLabel("Or use cookies file:")
+        cookie_file_path = QLineEdit()
+        cookie_file_path.setPlaceholderText("Path to cookies.txt")
+        if already_set_file:
+            cookie_file_path.setText(already_set_file)
+        browse_btn = QPushButton("Browse...")
+        file_row.addWidget(file_label)
+        file_row.addWidget(cookie_file_path, 1)
+        file_row.addWidget(browse_btn)
+        layout.addLayout(file_row)
+
+        def on_browse():
+            path, _ = QFileDialog.getOpenFileName(
+                dialog, "Select cookies.txt", "", "Text files (*.txt);;All files (*)"
+            )
+            if path:
+                cookie_file_path.setText(path)
+                combo.setCurrentIndex(0)
+        browse_btn.clicked.connect(on_browse)
+
+        button_row = QHBoxLayout()
+        retry_btn = QPushButton("Save && Retry")
+        retry_btn.setEnabled(bool(already_set) or bool(already_set_file))
+        cancel_btn = QPushButton("Cancel")
+        button_row.addStretch()
+        button_row.addWidget(retry_btn)
+        button_row.addWidget(cancel_btn)
+        layout.addLayout(button_row)
+
+        def update_retry_state():
+            has_browser = bool(combo.currentData())
+            has_file = bool(cookie_file_path.text().strip())
+            retry_btn.setEnabled(has_browser or has_file)
+
+        combo.currentIndexChanged.connect(lambda _: update_retry_state())
+        cookie_file_path.textChanged.connect(lambda _: update_retry_state())
+
+        chosen = {"browser": None, "file": None}
+
+        def on_retry():
+            file_path = cookie_file_path.text().strip()
+            if file_path:
+                chosen["file"] = file_path
+                chosen["browser"] = None
+            else:
+                chosen["browser"] = combo.currentData()
+                chosen["file"] = None
+            dialog.accept()
+
+        retry_btn.clicked.connect(on_retry)
+        cancel_btn.clicked.connect(dialog.reject)
+
+        result = dialog.exec()
+        if result == QDialog.DialogCode.Accepted and (chosen["browser"] or chosen["file"]):
+            if chosen["file"]:
+                self.settings["yt_dlp_cookies_file"] = chosen["file"]
+                self.settings["yt_dlp_cookies_from_browser"] = ""
+                self.save_settings_to_file()
+                self._append_text_to_console(
+                    f"\nCookies file set: {chosen['file']}. Retrying download...\n"
+                    + "=" * 50 + "\n"
+                )
+            else:
+                self.settings["yt_dlp_cookies_from_browser"] = chosen["browser"]
+                self.settings["yt_dlp_cookies_file"] = ""
+                self.save_settings_to_file()
+                self._append_text_to_console(
+                    f"\nCookies set to use browser: {chosen['browser']}. Retrying download...\n"
+                    + "=" * 50 + "\n"
+                )
+            self.download_and_transcribe()
+        else:
+            self._append_text_to_console("\nCookie setup cancelled. Download aborted.\n")
+            self.downloads_completed = True
+            self.run_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
 
     def closeEvent(self, event):
         if self.process and self.process.state() == QProcess.ProcessState.Running:
