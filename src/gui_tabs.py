@@ -331,18 +331,51 @@ class TabSetupMixin:
         output_dir_layout.addWidget(self.browse_out_btn)
         layout.addRow(output_dir_label, output_dir_container)
 
+        # Both of these are single checkboxes; sharing one row keeps the
+        # Global Settings panel from overflowing its scroll area.
         self.output_dir_source_checkbox = QCheckBox("Use source folder")
         self.output_dir_source_checkbox.setObjectName("output_dir_source_checkbox")
         self.output_dir_source_checkbox.setToolTip("Save outputs next to each input file.")
-        layout.addRow("Output Location:", self.output_dir_source_checkbox)
 
-        self.output_name_match_checkbox = QCheckBox("Use input filename for outputs")
+        self.output_name_match_checkbox = QCheckBox("Use input filename")
         self.output_name_match_checkbox.setObjectName("output_name_match_checkbox")
         self.output_name_match_checkbox.setToolTip(
             "Prefer the original input name for outputs. A suffix may still be added to avoid conflicts."
         )
         self.output_name_match_checkbox.setChecked(True)
-        layout.addRow("Output Name:", self.output_name_match_checkbox)
+
+        output_toggles = QWidget()
+        output_toggles_layout = QHBoxLayout(output_toggles)
+        output_toggles_layout.setContentsMargins(0, 0, 0, 0)
+        output_toggles_layout.setSpacing(12)
+        output_toggles_layout.addWidget(self.output_dir_source_checkbox)
+        output_toggles_layout.addWidget(self.output_name_match_checkbox)
+        output_toggles_layout.addStretch()
+        output_toggles_label = QLabel("Output:")
+        output_toggles_label.setToolTip(
+            "Where outputs are saved, and whether they reuse the input filename."
+        )
+        layout.addRow(output_toggles_label, output_toggles)
+
+        existing_tip = (
+            "What to do when the outputs for a file already exist in the output folder.\n\n"
+            "Add suffix: name the new output e.g. 'video_mp4.srt' (default, current behavior).\n"
+            "Skip file: leave the existing outputs alone and move to the next file. "
+            "Useful for resuming an interrupted batch.\n"
+            "Overwrite: replace the existing outputs in place.\n\n"
+            "A file is only skipped when every selected output format is already present."
+        )
+        self.existing_output_combo = QComboBox()
+        for label, mode in (
+            ("Add suffix", "suffix"),
+            ("Skip file", "skip"),
+            ("Overwrite", "overwrite"),
+        ):
+            self.existing_output_combo.addItem(label, mode)
+        self.existing_output_combo.setToolTip(existing_tip)
+        existing_label = QLabel("Existing Outputs:")
+        existing_label.setToolTip(existing_tip)
+        layout.addRow(existing_label, self.existing_output_combo)
 
         self.model_combo = QComboBox()
         self.model_combo.setToolTip(

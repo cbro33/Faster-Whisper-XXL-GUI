@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, QProcess, QProcessEnvironment, QByteArray, QUrl, QThread, pyqtSignal, QModelIndex
 from PyQt6.QtGui import QIcon, QPalette, QColor, QTextCursor, QFont, QDesktopServices, QFontMetrics, QAction
 
-from config import APP_VERSION, SUPPORTED_EXTENSIONS
+from config import APP_VERSION, SUPPORTED_EXTENSIONS, HTTP_HEADERS
 from utils import (
     get_app_directory, get_settings_directory, get_portable_settings_directory,
     resource_path, format_path_for_display, detect_faster_whisper_binary_version,
@@ -87,6 +87,7 @@ from output_formats import (
     create_sentences_only,
     build_lrc_lines,
     extra_args_has_flag,
+    find_existing_outputs,
 )
 
 MODEL_DIR_PREFIX = "faster-whisper-"
@@ -95,7 +96,7 @@ BUILTIN_MODELS = [
     "large-v1", "large-v2", "large-v3", "large-v3-turbo",
     "distil-large-v2", "distil-large-v3", "distil-medium.en", "distil-small.en",
 ]
-GITHUB_HEADERS = {"User-Agent": f"Faster-Whisper-XXL-GUI/{APP_VERSION}"}
+GITHUB_HEADERS = dict(HTTP_HEADERS)
 
 from model_manager import ModelManagerDialog  # noqa: E402 — after MODULE_DIR_PREFIX is defined
 from gui_tabs import TabSetupMixin
@@ -173,7 +174,8 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
         self._last_review_output_dir = None
         self._last_review_output_base = None
         self._shown_ytdlp_403_hint = False
-        
+        self._skipped_existing_count = 0
+
         if not self.check_and_setup_dependencies():
             QTimer.singleShot(0, self.close)
             return
@@ -402,14 +404,24 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
         QTimer.singleShot(0, self._enforce_splitter_sizes_for_frozen)
 
     def _required_tab_bar_width(self):
+        """Width the tab bar needs to show every tab without scroll arrows.
+
+        QTabBar.tabSizeHint is protected, and the bar QTabWidget creates for us
+        lives on the C++ side, so calling it raises RuntimeError under PyQt6.
+        That made this whole function throw in frozen builds, where it is the
+        only caller path, leaving the tab bar permanently clipped. The bar's
+        public sizeHint already accounts for every tab.
+        """
         if not getattr(self, "tabs", None):
             return None
-        tab_bar = self.tabs.tabBar()
-        total = 20
-        for idx in range(self.tabs.count()):
-            hint = tab_bar.tabSizeHint(idx)
-            total += hint.width() + 2
-        return total
+        try:
+            hint = self.tabs.tabBar().sizeHint().width()
+        except Exception as exc:
+            logging.debug("Could not measure tab bar width: %s", exc)
+            return None
+        if hint <= 0:
+            return None
+        return hint + 20  # room for the panel's own margins
 
     def _apply_tab_minimums(self):
         if not getattr(sys, "frozen", False):
@@ -1189,19 +1201,86 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
             source_base = original_base
         if not source_base or source_base == target_base:
             return
+        overwrite = self._get_existing_output_mode() == "overwrite"
         extensions = ["srt", "vtt", "txt", "tsv", "json", "lrc"]
         for ext in extensions:
             src = os.path.join(output_dir, f"{source_base}.{ext}")
             if not os.path.exists(src):
                 continue
             dst = os.path.join(output_dir, f"{target_base}.{ext}")
-            if os.path.exists(dst):
+            if os.path.exists(dst) and not overwrite:
                 logging.warning("Output already exists, skipping rename: %s", dst)
                 continue
             try:
-                os.rename(src, dst)
+                # os.replace overwrites atomically; plain rename fails on Windows
+                # when the destination exists.
+                os.replace(src, dst)
             except Exception as exc:
                 logging.warning("Failed to rename output %s -> %s: %s", src, dst, exc)
+
+    def _get_existing_output_mode(self):
+        """How to handle a file whose outputs already exist: suffix/skip/overwrite."""
+        combo = getattr(self, "existing_output_combo", None)
+        if combo is None:
+            return "suffix"
+        mode = combo.currentData()
+        return mode if mode in ("suffix", "skip", "overwrite") else "suffix"
+
+    def _get_selected_output_format_labels(self):
+        """GUI format labels the user has checked, defaulting to srt when none."""
+        if self.output_format_checkboxes.get('all') and self.output_format_checkboxes['all'].isChecked():
+            return ['all']
+        labels = [
+            fmt for fmt, cb in self.output_format_checkboxes.items()
+            if fmt != 'all' and cb.isChecked()
+        ]
+        return labels or ['srt']
+
+    def _check_existing_outputs(self, input_file_path):
+        """Decide whether *input_file_path* can be skipped because it is done.
+
+        Returns ``(should_skip, note)``; *note* is an optional console line
+        explaining the decision, and is only produced when some outputs exist.
+        """
+        if self._get_existing_output_mode() != "skip":
+            return False, None
+        output_dir = self.get_output_dir(input_file_path)
+        if not output_dir:
+            return False, None
+        basename = self._get_existing_output_basename(input_file_path, output_dir)
+        existing, missing = find_existing_outputs(
+            output_dir, basename, self._get_selected_output_format_labels()
+        )
+        if existing and not missing:
+            return True, f"Skipped: outputs already exist for {basename}"
+        if existing:
+            # Partial outputs mean an interrupted run, so redo it but say why.
+            missing_names = ", ".join(os.path.basename(path) for path in missing)
+            return False, f"Not skipped: {basename} is missing {missing_names}"
+        return False, None
+
+    def _report_skipped_summary(self):
+        """Print how many files a finished batch skipped, then reset the count."""
+        count = getattr(self, "_skipped_existing_count", 0)
+        if count:
+            plural = "file" if count == 1 else "files"
+            self._append_text_to_console(
+                f"\nSkipped {count} {plural} with existing outputs.\n"
+            )
+        self._skipped_existing_count = 0
+
+    def _get_existing_output_basename(self, input_file_path, output_dir):
+        """Basename a previous run used for this input, else the plain input stem.
+
+        Checking against the recorded basename matters when an earlier run was
+        suffixed (``video_mp4``), because its outputs live under that name, not
+        ``video``.
+        """
+        map_key = self._make_output_map_key(input_file_path, output_dir)
+        stored_base = self._output_basename_map.get(map_key)
+        if stored_base:
+            return stored_base
+        return os.path.splitext(os.path.basename(input_file_path))[0]
 
     def _compute_output_basename(self, input_file_path, output_dir, force_suffix=False):
         original_base = os.path.splitext(os.path.basename(input_file_path))[0]
@@ -1210,6 +1289,10 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
             return original_base
         if force_suffix:
             return f"{original_base}_{original_ext}"
+        if self._get_existing_output_mode() == "overwrite":
+            # Reuse whatever name the previous run wrote so we replace it in
+            # place instead of adding a collision suffix.
+            return self._get_existing_output_basename(input_file_path, output_dir)
         map_key = self._make_output_map_key(input_file_path, output_dir)
         stored_base = self._output_basename_map.get(map_key)
         if stored_base:
@@ -2191,6 +2274,8 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
         self.vad_device.currentTextChanged.connect(self.save_combo_setting)
         self.diarize_backend.currentTextChanged.connect(self.save_combo_setting)
         self.diarize_device.currentTextChanged.connect(self.save_combo_setting)
+        if getattr(self, "existing_output_combo", None):
+            self.existing_output_combo.currentIndexChanged.connect(self.save_combo_setting)
         self.temperature.valueChanged.connect(self.save_spinbox_setting)
         self.beam_size.valueChanged.connect(self.save_spinbox_setting)
         self.best_of.valueChanged.connect(self.save_spinbox_setting)
@@ -2204,6 +2289,9 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
         if getattr(self, "output_dir_source_checkbox", None):
             self.output_dir_source_checkbox.toggled.connect(self.update_output_dir_mode)
         self.initial_prompt.textChanged.connect(self.save_text_setting)
+        # Without this, Extra CLI Args only persisted on a clean window close, and
+        # any other realtime save wrote a stale value over it. See issue #22.
+        self.extra_cli_args.textChanged.connect(self.save_text_setting)
         self.tooltips_checkbox.toggled.connect(self.apply_tooltip_visibility)
         
         for checkbox in self.findChildren(QCheckBox):
@@ -2226,6 +2314,7 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
         self.settings["vad_device"] = self.vad_device.currentText()
         self.settings["diarize_backend"] = self.diarize_backend.currentText()
         self.settings["diarize_device"] = self.diarize_device.currentText()
+        self.settings["existing_output_mode"] = self._get_existing_output_mode()
         self.save_settings_to_file()
 
     def save_spinbox_setting(self):
@@ -2245,6 +2334,7 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
         """Save text field settings immediately"""
         self.settings["output_dir"] = self.output_dir.text()
         self.settings["initial_prompt"] = self.initial_prompt.toPlainText()
+        self.settings["extra_cli_args"] = self.extra_cli_args.toPlainText()
         self.save_settings_to_file()
 
     def save_converter_python_path(self):
@@ -3290,7 +3380,34 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
                 )
                 return None
             cmd.extend(extra_tokens)
+            self._warn_about_inert_extra_args(extra_args_text)
         return cmd
+
+    # Flags the exe only honours when its input is a wildcard or a directory.
+    # This GUI runs the exe once per file with an explicit path, so they are
+    # silently ignored -- which has confused several people (issues #20, #22).
+    INERT_EXTRA_ARGS = {
+        "--skip": "use the 'Existing Outputs' setting in Global Settings instead",
+        "--batch_recursive": "add the folder with 'Add Folder' instead",
+        "--check_files": None,
+    }
+
+    def _warn_about_inert_extra_args(self, extra_args_text):
+        """Tell the user once per run about extra args that cannot take effect."""
+        if getattr(self, "_inert_args_warned", False):
+            return
+        for flag, hint in self.INERT_EXTRA_ARGS.items():
+            if not self._extra_args_has_flag(flag, extra_args_text):
+                continue
+            self._inert_args_warned = True
+            message = (
+                f"Note: {flag} has no effect here. It only works when "
+                "Faster Whisper XXL is given a wildcard or a folder, and this app "
+                "runs it once per file."
+            )
+            if hint:
+                message += f" To do this, {hint}."
+            self._append_text_to_console(message + "\n")
 
     def start_processing(self):
         self.stop_requested = False
@@ -3312,6 +3429,8 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
         self._compute_type_override = None
         self._cpu_compute_override_applied = False
         self._model_download_cancelled = False
+        self._skipped_existing_count = 0
+        self._inert_args_warned = False
         if not self.get_output_dir():
             return
 
@@ -3340,6 +3459,17 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
             self.batch_index += 1
             next_file = self.pending_files.pop(0)
             total_display = self.batch_total if self.batch_total_known else "?"
+            should_skip, note = self._check_existing_outputs(next_file)
+            if should_skip:
+                self._skipped_existing_count += 1
+                logging.info("start_next_file: skipping %s (outputs exist)", next_file)
+                # Keep this to a single short line: resuming a large batch can
+                # skip hundreds of files, and full paths would swamp the console.
+                self._append_text_to_console(
+                    f"\nSKIPPED FILE {self.batch_index}/{total_display} • "
+                    f"{os.path.basename(next_file)} (outputs already exist)\n"
+                )
+                continue
             self._append_text_to_console(
                 f"\nPROCESSING FILE {self.batch_index}/{total_display} • {next_file}\n\n"
             )
@@ -3347,6 +3477,19 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
                 started = True
                 break
         if not started and not self.stop_requested:
+            # Nothing ran, so on_finished will not fire to hand control back.
+            # In serial mode it is what releases the next download, so do that
+            # here instead or the queue stalls. Gate on serial_download_waiting
+            # rather than isRunning(): the downloader emits `finished` from
+            # inside run(), so in download-all mode the thread can still report
+            # itself running and we would wrongly leave Run disabled.
+            if self.serial_download_waiting and self.downloader and self.downloader.isRunning():
+                self.serial_download_waiting = False
+                self.downloader.allow_next_download()
+                self.run_btn.setEnabled(False)
+                self.stop_btn.setEnabled(True)
+                return
+            self._report_skipped_summary()
             self.run_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
             self.stop_requested = False
@@ -3361,6 +3504,16 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
         self._current_output_basename = None
         self._single_output_line_emitted = False
         logging.info("run_transcription: input=%s", input_file)
+
+        # Check before touching the model so a fully-skipped batch never waits
+        # on a model download it will not use.
+        should_skip, note = self._check_existing_outputs(input_file)
+        if note:
+            self._append_text_to_console(f"{note}\n")
+        if should_skip:
+            logging.info("run_transcription: skipping %s (outputs exist)", input_file)
+            self._skipped_existing_count += 1
+            return False
 
         if not self.ensure_model_available():
             logging.info("run_transcription: model download cancelled or failed")
@@ -4206,13 +4359,14 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
             self.stop_btn.setEnabled(True)
             return
 
+        self._report_skipped_summary()
         self.run_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.process = None
         self.downloader = None
         self.stop_requested = False
         self._force_output_suffix = False
-        
+
     def on_process_error(self, error):
         if error == QProcess.ProcessError.Crashed and self.transcription_completed_successfully:
             logging.info("Process crashed after successful transcription completion - ignoring crash error")
@@ -4350,6 +4504,7 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
             self.start_next_file()
         else:
             if not self.process and not self.pending_files:
+                self._report_skipped_summary()
                 self.run_btn.setEnabled(True)
                 self.stop_btn.setEnabled(False)
 
@@ -4735,6 +4890,10 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
         self.diarize_num_speakers.setValue(self.settings.get("diarize_num_speakers", 0))
         self.diarize_min_speakers.setValue(self.settings.get("diarize_min_speakers", 0))
         self.diarize_max_speakers.setValue(self.settings.get("diarize_max_speakers", 0))
+        if getattr(self, "existing_output_combo", None):
+            existing_mode = self.settings.get("existing_output_mode", "suffix")
+            existing_index = self.existing_output_combo.findData(existing_mode)
+            self.existing_output_combo.setCurrentIndex(existing_index if existing_index >= 0 else 0)
 
         all_checkboxes = {cb.objectName(): cb for cb in self.findChildren(QCheckBox) if cb.objectName()}
         checkbox_settings = self.settings.get("checkboxes", {})
