@@ -13,6 +13,7 @@ This document provides an in-depth explanation of all the settings and options a
     *   [Output Dir](#output-dir)
     *   [Output Location](#output-location)
     *   [Output Name](#output-name)
+    *   [Existing Outputs](#existing-outputs)
     *   [Model](#model)
     *   [Model Manager (Custom Models)](#model-manager-custom-models)
     *   [Transformers -> CTranslate2 Conversion](#transformers---ctranslate2-conversion)
@@ -49,6 +50,8 @@ This document provides an in-depth explanation of all the settings and options a
     *   [VRAM (GPU Memory)](#vram-gpu-memory)
     *   [Storage](#storage)
     *   [Recommended Configurations](#recommended-configurations)
+9.  [Troubleshooting](#9-troubleshooting)
+    *   [Antivirus Flags the App or a Download](#antivirus-flags-the-app-or-a-download)
 
 ---
 
@@ -105,6 +108,18 @@ These settings apply broadly to the transcription process and are crucial for pe
 *   **Description:** Controls output filename base behavior.
 *   **Option:** `Use input filename for outputs`
 *   **Behavior:** When checked, output files use the original media filename with transcription format extensions (`.srt`, `.txt`, etc.). When unchecked, default naming behavior is used.
+
+### Existing Outputs
+
+*   **Description:** Controls what happens when a file's outputs are already present in the output folder.
+*   **Options:** `Add suffix`, `Skip file`, `Overwrite`.
+*   **Behavior:**
+    *   **`Add suffix`** *(default, unchanged from previous versions)*: Writes the new output under a suffixed name, e.g. `video_mp4.srt`.
+    *   **`Skip file`**: Leaves the existing outputs untouched and moves on to the next file. The console reports each skipped file and prints a total when the batch ends. This is the only mode that guarantees existing files are not rewritten.
+    *   **`Overwrite`**: Replaces the existing outputs in place, with no suffixed copies.
+*   **Note:** A file is only skipped when **every** selected output format is already present. If a previous run was interrupted partway through writing its formats, the file is re-processed and the console explains which format was missing. This makes `Skip file` safe for resuming a large interrupted batch.
+*   **Note:** If an earlier run wrote suffixed outputs (`video_mp4.srt`), the app remembers that name and checks against it, so re-running with `Skip file` recognizes the work as done.
+*   **Note:** Faster Whisper XXL only honors `--skip` when its input is a wildcard or a directory. This app passes it one file at a time, so `--skip` in **Extra CLI Args** has no effect. Use this setting instead.
 
 ### Model
 
@@ -228,6 +243,8 @@ These settings provide more granular control over the Whisper model's behavior.
 *   **Description:** Free-form command-line arguments passed directly to Faster Whisper XXL for advanced options not exposed in the UI. Located in the Paths and Overrides tab.
 *   **Usage:** Enter flags as you would on the command line (e.g., `--diarize --vad_clip_duration 30`). These are appended to the command and can override earlier settings.
 *   **Tip:** Run the Faster Whisper XXL executable with `--help` to see available flags.
+*   **Note:** Flags that require Faster Whisper XXL to receive a wildcard or a folder as its input have no effect here, because the app runs it once per file with an explicit path. This applies to `--skip`, `--batch_recursive` and `--check_files`; the app prints a note in the console if it sees one of them. For skipping already-transcribed files use [Existing Outputs](#existing-outputs), and to process a whole folder use **Add Folder** in the File tab.
+*   **Note:** Everything else is passed through unchanged, and extra arguments are appended last, so they override the equivalent GUI settings.
 
 ### Word Timestamps
 
@@ -359,3 +376,26 @@ The performance of Faster Whisper XXL is heavily dependent on your hardware, par
     *   **Settings:** `large`, `large-v2`, or `large-v3` model, `cuda` device, `float16` compute type.
 
 By carefully selecting your settings based on your hardware and the characteristics of your audio, you can optimize the performance and accuracy of your transcriptions with Faster Whisper XXL GUI.
+
+---
+
+## 9. Troubleshooting
+
+### Antivirus Flags the App or a Download
+
+Some antivirus products report the app as a trojan, most often the first time it downloads a model, the Faster Whisper XXL archive, or the converter bundle. **This is a false positive.**
+
+**Why it happens**
+
+The Windows release is built with PyInstaller and is not code-signed. Antivirus engines score unsigned PyInstaller executables heavily on their own, because the same packaging is popular with malware authors. Downloading files then writing them to disk matches the behavioral pattern of a dropper, so the detection usually fires during setup or a model download rather than at launch. It is the packaging that is being flagged, not anything in the transcription or download code.
+
+**What you can do**
+
+*   Add an exclusion for the app folder (and the `bin` and model folders) in your antivirus settings.
+*   Report the file to your antivirus vendor as a false positive. Vendors do act on these, and it fixes the problem for everyone using that product, not just you. Microsoft Defender submissions go to the [Microsoft Security Intelligence portal](https://www.microsoft.com/en-us/wdsi/filesubmission) and are usually reviewed within a few days.
+*   Verify the download is genuine before excluding it: only download releases from the [official Releases page](https://github.com/cbro33/Faster-Whisper-XXL-GUI/releases), and check the file on [VirusTotal](https://www.virustotal.com/). A handful of engines flagging it while the major ones do not is the signature of a false positive.
+*   Run from source instead. Python scripts are not packed executables and do not trigger the same heuristics. See [Run From Source](https://github.com/cbro33/Faster-Whisper-XXL-GUI#run-from-source).
+
+**What would actually fix it**
+
+An Authenticode code-signing certificate, which is the only thing that reliably clears these detections. Certificates are a recurring paid cost that this project does not currently cover. Until then the app avoids the things that make the situation worse: the build is not UPX-packed, and every network request identifies itself with a proper `User-Agent`.
