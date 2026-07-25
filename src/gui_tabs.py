@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QFontMetrics
+from utils import executable_word
 from gui_components import (
     FileDropGroupBox, FileDropListWidget,
     LinkDropGroupBox, LinkDropListWidget,
@@ -175,7 +176,7 @@ class TabSetupMixin:
         fw_row.addWidget(fw_clear)
         fw_row.addWidget(fw_test)
         fw_row.addWidget(fw_find)
-        core_layout.addRow("Whisper XXL EXE:", fw_row)
+        core_layout.addRow(f"Whisper XXL {executable_word()}:", fw_row)
 
         self.model_dir_path = QLineEdit()
         self.model_dir_path.setPlaceholderText("Optional override for model directory")
@@ -217,8 +218,10 @@ class TabSetupMixin:
         ytdlp_layout.addRow(ytdlp_hint)
         self.ytdlp_source_combo = QComboBox()
         self.ytdlp_source_combo.addItem("Python module (current env/bundled)", "bundled")
-        self.ytdlp_source_combo.addItem("EXE (custom or PATH)", "path")
-        self.ytdlp_source_combo.setToolTip("Choose whether downloads use the Python module or yt-dlp EXE.")
+        self.ytdlp_source_combo.addItem(f"{executable_word()} (custom or PATH)", "path")
+        self.ytdlp_source_combo.setToolTip(
+            f"Choose whether downloads use the Python module or a yt-dlp {executable_word(False)}."
+        )
         ytdlp_layout.addRow("Source:", self.ytdlp_source_combo)
 
         self.ytdlp_exe_path = QLineEdit()
@@ -234,7 +237,7 @@ class TabSetupMixin:
         ytdlp_row.addWidget(ytdlp_clear)
         ytdlp_row.addWidget(ytdlp_test)
         ytdlp_row.addWidget(ytdlp_find)
-        ytdlp_layout.addRow("yt-dlp EXE:", ytdlp_row)
+        ytdlp_layout.addRow(f"yt-dlp {executable_word()}:", ytdlp_row)
 
         layout.addWidget(ytdlp_group)
 
@@ -256,7 +259,7 @@ class TabSetupMixin:
         ffmpeg_row.addWidget(ffmpeg_clear)
         ffmpeg_row.addWidget(ffmpeg_test)
         ffmpeg_row.addWidget(ffmpeg_find)
-        ffmpeg_layout.addRow("FFMPEG EXE:", ffmpeg_row)
+        ffmpeg_layout.addRow(f"FFMPEG {executable_word()}:", ffmpeg_row)
 
         layout.addWidget(ffmpeg_group)
 

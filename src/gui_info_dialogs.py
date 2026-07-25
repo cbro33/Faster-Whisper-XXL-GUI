@@ -18,6 +18,7 @@ from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QDesktopServices
 
 from config import APP_VERSION
+from utils import executable_word
 from utils import format_path_for_display, detect_faster_whisper_binary_version, get_app_directory
 from python_utils import (
     enumerate_python_runtimes, get_execution_environment,
@@ -237,7 +238,7 @@ class InfoDialogsMixin:
             info_lines.append("")
             info_lines.append("yt-dlp Update Planner:")
             if source == "path":
-                info_lines.append("• Source: EXE (custom or PATH)")
+                info_lines.append(f"• Source: {executable_word()} (custom or PATH)")
                 info_lines.append("• Update Method: Manual (download new yt-dlp.exe)")
             else:
                 info_lines.append("• Source: Python module (bundled/current env)")
@@ -269,7 +270,7 @@ class InfoDialogsMixin:
             info_lines.append("")
             if source == "path":
                 exe_version, exe_path, exe_error = self.get_ytdlp_exe_version()
-                info_lines.append("yt-dlp EXE:")
+                info_lines.append(f"yt-dlp {executable_word()}:")
                 info_lines.append(f"• Version: {exe_version or 'Unknown'}")
                 info_lines.append(f"• Location: {format_path_for_display(exe_path) or 'Unknown'}")
                 if exe_error:

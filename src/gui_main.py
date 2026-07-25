@@ -26,6 +26,7 @@ from PyQt6.QtGui import QIcon, QPalette, QColor, QTextCursor, QFont, QDesktopSer
 
 from config import APP_VERSION, SUPPORTED_EXTENSIONS, HTTP_HEADERS
 from utils import (
+    executable_word,
     get_app_directory, get_settings_directory, get_portable_settings_directory,
     resource_path, format_path_for_display, detect_faster_whisper_binary_version,
     run_hidden_subprocess, resolve_ffmpeg_location,
@@ -1439,12 +1440,12 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
         if source == "path":
             if current_version != latest_version:
                 update_msg = (
-                    f"Your yt-dlp EXE version ({current_version}) is outdated.\n"
+                    f"Your yt-dlp {executable_word(False)} version ({current_version}) is outdated.\n"
                     f"Latest version is {latest_version}.\n\n"
                     "Would you like to open the yt-dlp downloads page?"
                 )
                 if exe_path:
-                    update_msg += f"\n\nCurrent EXE:\n{format_path_for_display(exe_path)}"
+                    update_msg += f"\n\nCurrent {executable_word()}:\n{format_path_for_display(exe_path)}"
                 reply = show_setup_question(
                     self,
                     "yt-dlp Update Available",
@@ -4532,7 +4533,7 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
         ):
             self._append_text_to_console(
                 "\nTip: This usually means yt-dlp is outdated or YouTube changed access rules.\n"
-                "Try Settings -> yt-dlp and switch Source to EXE, then use the latest yt-dlp.exe.\n"
+                f"Try Settings -> yt-dlp and switch Source to {executable_word()}, then use the latest yt-dlp {executable_word(False)}.\n"
                 "If you use Python module mode, restart the app and accept the yt-dlp update prompt.\n"
             )
             if not self._shown_ytdlp_403_hint:
@@ -4543,7 +4544,7 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
                     (
                         "YouTube returned HTTP 403 (Forbidden).\n\n"
                         "Most common fix: use the latest yt-dlp.exe.\n"
-                        "Go to Settings -> yt-dlp, set Source to EXE, and point it to a new yt-dlp.exe.\n\n"
+                        f"Go to Settings -> yt-dlp, set Source to {executable_word()}, and point it to a new yt-dlp {executable_word(False)}.\n\n"
                         "If you prefer Python module mode, restart and accept the yt-dlp update prompt."
                     ),
                 )

@@ -100,6 +100,17 @@ def popen_hidden_subprocess(command, **kwargs):
     merged_kwargs = _apply_windows_hidden_process_kwargs(kwargs)
     return subprocess.Popen(command, **merged_kwargs)
 
+def executable_word(capitalized=True):
+    """The right word for a program file on this platform.
+
+    Windows calls these EXEs; Linux and macOS do not, so the paths screen used
+    to show "FFMPEG EXE:" to users who have no .exe files at all.
+    """
+    if sys.platform == "win32":
+        return "EXE"
+    return "Binary" if capitalized else "binary"
+
+
 def format_path_for_display(path):
     if not path:
         return ""

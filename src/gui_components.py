@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import pyqtSignal, Qt, QTimer
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
-from utils import get_window_stays_on_top_flag, run_hidden_subprocess, get_app_directory, find_7zip
+from utils import executable_word, get_window_stays_on_top_flag, run_hidden_subprocess, get_app_directory, find_7zip
 from gpu_utils import detect_hardware_capabilities, get_recommended_settings
 from config import SUPPORTED_EXTENSIONS, HTTP_HEADERS
 from converter_utils import find_transformers_weight_files, get_converter_bundle_dir, get_converter_python_path
@@ -175,7 +175,7 @@ def show_yt_dlp_unavailable(parent, reason="python_missing", plan=None):
         text = (
             "Your system doesn't have Python installed, so yt-dlp cannot be updated automatically.\n\n"
             "To update yt-dlp, you have these options:\n\n"
-            "• Download the latest yt-dlp.exe and set Source to EXE in Settings\n"
+            f"• Download the latest yt-dlp {executable_word(False)} and set Source to {executable_word()} in Settings\n"
             "• Install Python from python.org and restart this application\n"
             "• Download a newer version of this application (may include updated yt-dlp)\n"
             "• Continue using the current version (may have limitations with some videos)\n\n"
