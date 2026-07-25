@@ -434,3 +434,67 @@ def extra_args_has_flag(flag, text):
         return False
     pattern = re.compile(rf"(^|\s){re.escape(flag)}(=|\s|$)")
     return bool(pattern.search(text))
+
+
+# ---------------------------------------------------------------------------
+# Existing-output detection
+# ---------------------------------------------------------------------------
+
+# Maps a GUI output-format label to the filename suffix it produces for a run
+# with basename ``base`` (i.e. the output file is ``base`` + suffix).
+FORMAT_SUFFIXES = {
+    "json": ".json",
+    "vtt": ".vtt",
+    "srt": ".srt",
+    "lrc": ".lrc",
+    "tsv": ".tsv",
+    "txt (with timestamps)": ".txt",
+    "txt (sentences only)": "_sentences.txt",
+}
+
+# What the exe's ``--output_format all`` actually writes.
+ALL_FORMAT_SUFFIXES = (".json", ".vtt", ".srt", ".lrc", ".tsv", ".txt")
+
+
+def expected_output_suffixes(selected_formats):
+    """Filename suffixes a given GUI format selection is expected to produce.
+
+    *selected_formats* holds GUI checkbox labels (``"srt"``, ``"txt (sentences
+    only)"``, ``"all"``, ...). Returns a sorted, de-duplicated list. An empty or
+    unrecognised selection falls back to ``.srt``, matching ``build_command``'s
+    default when nothing is checked.
+    """
+    if "all" in (selected_formats or []):
+        return sorted(ALL_FORMAT_SUFFIXES)
+    suffixes = {
+        FORMAT_SUFFIXES[fmt]
+        for fmt in (selected_formats or [])
+        if fmt in FORMAT_SUFFIXES
+    }
+    if not suffixes:
+        return [".srt"]
+    return sorted(suffixes)
+
+
+def expected_output_paths(output_dir, basename, selected_formats):
+    """Absolute paths the run is expected to produce for *basename*."""
+    if not output_dir or not basename:
+        return []
+    return [
+        os.path.join(output_dir, f"{basename}{suffix}")
+        for suffix in expected_output_suffixes(selected_formats)
+    ]
+
+
+def find_existing_outputs(output_dir, basename, selected_formats):
+    """Split expected output paths into ``(existing, missing)``.
+
+    Callers treat "safe to skip" as ``existing and not missing``. This is
+    deliberately strict, because a batch interrupted partway through writing its formats
+    leaves some files missing, and that file should be redone rather than
+    silently skipped.
+    """
+    existing, missing = [], []
+    for path in expected_output_paths(output_dir, basename, selected_formats):
+        (existing if os.path.exists(path) else missing).append(path)
+    return existing, missing
