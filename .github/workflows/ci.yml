@@ -1,0 +1,153 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run unit tests
+        run: python -m pytest -q
+
+      - name: Smoke-test the GUI headlessly
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libxkbcommon-x11-0 libxcb-cursor0 \
+            libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libxcb-xinerama0
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, "src")
+          # Import every module so syntax/import errors fail the build, then
+          # build the main window offscreen to catch Qt wiring regressions.
+          from PyQt6.QtWidgets import QApplication
+          import gui_main
+          from gui_main import WhisperGUI
+
+          for m in ("check_hardware_optimization", "check_yt_dlp_version", "check_app_update"):
+              setattr(WhisperGUI, m, lambda self: None)
+          WhisperGUI.check_and_setup_dependencies = lambda self: True
+
+          app = QApplication([])
+          win = WhisperGUI()
+          win.resize(1250, 820)
+          win.show()
+          app.processEvents()
+
+          assert win.tabs.count() > 0, "no tabs were created"
+          assert win._required_tab_bar_width(), "tab bar measurement failed"
+
+          # These only run in frozen builds, so nothing else exercises them.
+          sys.frozen = True
+          win._apply_tab_minimums()
+          win._enforce_splitter_sizes_for_frozen()
+          win.resize(1300, 840)
+          app.processEvents()
+
+          print(f"OK: {win.tabs.count()} tabs, window {win.width()}x{win.height()}")
+          PY
+
+  build:
+    name: Windows build
+    runs-on: windows-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build executable
+        run: pyinstaller --noconfirm --clean faster-whisper-xxl-gui.spec
+
+      - name: Verify the packaged app starts
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          # Builds the real main window inside the packaged exe. Catches an
+          # `excludes` entry that removed something still needed, which would
+          # otherwise only show up as a crash on a user's machine.
+          $p = Start-Process -FilePath "dist/faster-whisper-xxl-gui.exe" `
+                             -ArgumentList "--selftest" -Wait -PassThru
+          if (Test-Path "dist/selftest.log") { Get-Content "dist/selftest.log" }
+          if ($p.ExitCode -ne 0) {
+            throw "Packaged app failed to start (exit $($p.ExitCode)). A PyInstaller exclude probably removed something needed."
+          }
+          Write-Host "Packaged app starts cleanly."
+
+      - name: Report size and checksum
+        shell: pwsh
+        run: |
+          $exe = "dist/faster-whisper-xxl-gui.exe"
+          $bytes = (Get-Item $exe).Length
+          $mb = [math]::Round($bytes / 1MB, 1)
+          Write-Host "Size: $bytes bytes ($mb MiB)"
+          # Microsoft's false-positive submission portal caps uploads at 50 MB.
+          if ($bytes -gt 50000000) {
+            Write-Warning "Over the 50 MB limit of Microsoft's submission portal."
+          } else {
+            Write-Host "Under the 50 MB submission limit."
+          }
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  faster-whisper-xxl-gui.exe" | Out-File -Encoding ascii dist/faster-whisper-xxl-gui.exe.sha256
+          Write-Host "SHA256: $hash"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: faster-whisper-xxl-gui-windows
+          path: |
+            dist/faster-whisper-xxl-gui.exe
+            dist/faster-whisper-xxl-gui.exe.sha256
+          retention-days: 30
+
+  release:
+    name: Publish release
+    runs-on: ubuntu-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: faster-whisper-xxl-gui-windows
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/faster-whisper-xxl-gui.exe
+            dist/faster-whisper-xxl-gui.exe.sha256
+          draft: true
+          generate_release_notes: true
