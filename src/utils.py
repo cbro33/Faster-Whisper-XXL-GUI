@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import shutil
 from PyQt6.QtCore import Qt
+from config import HTTP_HEADERS
 
 def get_app_directory():
     """ Get the application's base directory consistently, whether running from source or as executable """
@@ -423,7 +424,7 @@ def download_7zr_portable(dest_dir=None):
     dest_path = os.path.join(dest_dir, '7zr.exe')
     try:
         logging.info(f"Downloading 7zr.exe to {dest_path}")
-        resp = requests.get(_7ZR_DOWNLOAD_URL, timeout=30)
+        resp = requests.get(_7ZR_DOWNLOAD_URL, timeout=30, headers=HTTP_HEADERS)
         resp.raise_for_status()
         with open(dest_path, 'wb') as f:
             f.write(resp.content)

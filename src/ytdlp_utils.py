@@ -10,7 +10,7 @@ import importlib.util
 import shutil
 import subprocess
 
-from config import APP_VERSION, YTDLP_DEBUG_LOG_NAME, EXTERNAL_MODULE_DIR_NAME, YTDLP_UPDATE_FAILURE_COOLDOWN_HOURS
+from config import APP_VERSION, YTDLP_DEBUG_LOG_NAME, EXTERNAL_MODULE_DIR_NAME, YTDLP_UPDATE_FAILURE_COOLDOWN_HOURS, HTTP_HEADERS
 from utils import get_app_directory, get_settings_directory, get_portable_settings_directory, run_hidden_subprocess
 from python_utils import (
     get_external_python_modules_path, detect_python_runtime, get_python_info_script_path,
@@ -311,7 +311,7 @@ _YT_DLP_RELEASE_CACHE = {
     "timestamp": 0,
     "releases": None
 }
-GITHUB_HEADERS = {"User-Agent": f"Faster-Whisper-XXL-GUI/{APP_VERSION}"}
+GITHUB_HEADERS = dict(HTTP_HEADERS)
 
 
 def fetch_yt_dlp_releases(max_releases=30, cache_seconds=600):

@@ -15,10 +15,11 @@ from config import (
     CONVERTER_BUNDLE_ASSET,
     CONVERTER_BUNDLE_SHA256_ASSET,
     CONVERTER_BUNDLE_DIR_NAME,
+    HTTP_HEADERS,
 )
 from utils import get_settings_directory
 
-GITHUB_HEADERS = {"User-Agent": f"Faster-Whisper-XXL-GUI/{APP_VERSION}"}
+GITHUB_HEADERS = dict(HTTP_HEADERS)
 
 _WEIGHT_FILENAMES = {"model.safetensors", "pytorch_model.bin"}
 

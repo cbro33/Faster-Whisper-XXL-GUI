@@ -26,7 +26,7 @@ from PyQt6.QtCore import pyqtSignal, Qt, QTimer
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
 from utils import get_window_stays_on_top_flag, run_hidden_subprocess, get_app_directory, find_7zip
 from gpu_utils import detect_hardware_capabilities, get_recommended_settings
-from config import SUPPORTED_EXTENSIONS
+from config import SUPPORTED_EXTENSIONS, HTTP_HEADERS
 from converter_utils import find_transformers_weight_files, get_converter_bundle_dir, get_converter_python_path
 from workers import ModelConversionWorker
 
@@ -500,7 +500,7 @@ class DownloadManager(QDialog):
 
     def download_worker(self):
         try:
-            response = requests.get(self.url, stream=True, timeout=15)
+            response = requests.get(self.url, stream=True, timeout=15, headers=HTTP_HEADERS)
             response.raise_for_status()
             total_size = int(response.headers.get('content-length', 0))
 
@@ -819,7 +819,7 @@ class ModelDownloadDialog(QDialog):
         url = f"https://huggingface.co/{self.repo_id}/resolve/main/{filename}"
         try:
             # First, try HEAD request for Content-Length
-            head_resp = requests.head(url, allow_redirects=True, timeout=5)
+            head_resp = requests.head(url, allow_redirects=True, timeout=5, headers=HTTP_HEADERS)
             if head_resp.status_code == 200:
                 content_length = int(head_resp.headers.get("content-length", 0))
                 if content_length > 0:
@@ -833,7 +833,7 @@ class ModelDownloadDialog(QDialog):
 
         # If HEAD failed or gave 0, try GET request and parse content-length or use API
         try:
-            get_resp = requests.get(url, stream=True, timeout=5)
+            get_resp = requests.get(url, stream=True, timeout=5, headers=HTTP_HEADERS)
             if get_resp.status_code == 200:
                 content_length = int(get_resp.headers.get("content-length", 0))
                 if content_length > 0:
@@ -869,7 +869,7 @@ class ModelDownloadDialog(QDialog):
         
         try:
             api_url = f"https://huggingface.co/api/models/{self.repo_id}"
-            resp = requests.get(api_url, timeout=5)
+            resp = requests.get(api_url, timeout=5, headers=HTTP_HEADERS)
             if resp.status_code == 200:
                 data = resp.json()
                 for sibling in data.get("siblings", []):
@@ -886,7 +886,7 @@ class ModelDownloadDialog(QDialog):
 
     def _fetch_repo_file_list(self):
         api_url = f"https://huggingface.co/api/models/{self.repo_id}"
-        resp = requests.get(api_url, timeout=10)
+        resp = requests.get(api_url, timeout=10, headers=HTTP_HEADERS)
         if resp.status_code != 200:
             raise RuntimeError("Failed to fetch repo file list.")
         data = resp.json()
@@ -1002,7 +1002,7 @@ class ModelDownloadDialog(QDialog):
                 "[%s] aux download start total=%s", self._debug_id, total
             )
         
-        response = requests.get(url, stream=True, timeout=30)
+        response = requests.get(url, stream=True, timeout=30, headers=HTTP_HEADERS)
         self._active_response = response
         if response.status_code == 404:
             if required:
@@ -1054,7 +1054,7 @@ class ModelDownloadDialog(QDialog):
         url = f"https://huggingface.co/{self.repo_id}/resolve/main/{filename}"
         self.download_progress.emit(0, 0, f"{filename}@@init")
         
-        response = requests.get(url, stream=True, timeout=30)
+        response = requests.get(url, stream=True, timeout=30, headers=HTTP_HEADERS)
         self._active_response = response
         if response.status_code == 404:
             raise FileNotFoundError(f"{filename} not found.")
