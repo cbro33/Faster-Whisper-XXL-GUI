@@ -11,6 +11,7 @@ Faster Whisper XXL GUI is a desktop interface for the Faster Whisper XXL transcr
 - Model/task/language controls plus VAD and audio options.
 - Model Manager with custom HF/local models and Transformers -> CT2 conversion.
 - Multiple output formats (SRT, VTT, JSON, TXT, etc.).
+- Skip or overwrite existing outputs, for resuming interrupted batches.
 - Light/Dark/AMOLED themes.
 - Persistent settings.
 
@@ -19,6 +20,12 @@ Faster Whisper XXL GUI is a desktop interface for the Faster Whisper XXL transcr
 1. Download the latest `.exe` from the [Releases](https://github.com/cbro33/Faster-Whisper-XXL-GUI/releases) page.
 2. Run it (no installation required).
 3. On first launch, accept the prompt to download and set up Faster Whisper XXL + FFmpeg.
+
+## Antivirus False Positives
+
+Some antivirus products flag the `.exe` as a trojan, usually when it first downloads a model or the Faster Whisper XXL archive. This is a false positive: the release is an unsigned PyInstaller build, and antivirus engines score that packaging heavily on its own.
+
+Add an exclusion for the app folder, or run from source instead. Reporting the file to your antivirus vendor as a false positive helps everyone using that product. Microsoft Defender submissions go [here](https://www.microsoft.com/en-us/wdsi/filesubmission). See the [Wiki](https://github.com/cbro33/Faster-Whisper-XXL-GUI/wiki) for details.
 
 ## Manual yt-dlp Updates (No Python)
 
