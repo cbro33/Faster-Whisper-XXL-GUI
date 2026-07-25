@@ -2,6 +2,7 @@ import sys
 import os
 import json
 import logging
+import traceback
 import faulthandler
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt
@@ -48,7 +49,68 @@ _configure_logging()
 
 from gui_main import WhisperGUI
 
+
+def _run_selftest():
+    """Headless startup check used by CI. Exits 0 if the build is sound.
+
+    A packaged build can be broken in ways source runs never show: a PyInstaller
+    `excludes` entry that removed something still needed, or a missing Qt plugin.
+    Both surface as a crash on the user's machine. This builds the real main
+    window offscreen so the packaged app is exercised end to end, without
+    needing a display or the Faster Whisper XXL binary.
+    """
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+    # Startup work that needs the network or shows a dialog would block a
+    # non-interactive run, and none of it tells us whether the bundle is intact.
+    for name in ("check_hardware_optimization", "check_yt_dlp_version", "check_app_update"):
+        setattr(WhisperGUI, name, lambda self: None)
+    WhisperGUI.check_and_setup_dependencies = lambda self: True
+
+    app = QApplication(sys.argv)
+    window = WhisperGUI()
+    window.resize(1250, 820)
+    window.show()
+    app.processEvents()
+
+    if not window.tabs.count():
+        raise RuntimeError("no tabs were created")
+    if not window._required_tab_bar_width():
+        raise RuntimeError("tab bar could not be measured")
+
+    # Only reached in frozen builds, so nothing else covers these.
+    sys.frozen = True
+    window._apply_tab_minimums()
+    window._enforce_splitter_sizes_for_frozen()
+    window.resize(1300, 840)
+    app.processEvents()
+
+    message = f"selftest OK: {window.tabs.count()} tabs, {window.width()}x{window.height()}"
+    logging.info(message)
+    print(message)
+    # console=False builds have no stdout, so leave a file CI can read too.
+    try:
+        with open(os.path.join(get_app_directory(), "selftest.log"), "w", encoding="utf-8") as handle:
+            handle.write(message + "\n")
+    except Exception:
+        pass
+    return 0
+
+
 def main():
+    if "--selftest" in sys.argv:
+        try:
+            sys.exit(_run_selftest())
+        except Exception:
+            logging.exception("selftest failed")
+            traceback.print_exc()
+            try:
+                with open(os.path.join(get_app_directory(), "selftest.log"), "w", encoding="utf-8") as handle:
+                    handle.write("selftest FAILED\n" + traceback.format_exc())
+            except Exception:
+                pass
+            sys.exit(1)
+
     if hasattr(Qt.ApplicationAttribute, 'AA_EnableHighDpiScaling'):
         QApplication.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling, True)
     if hasattr(Qt.ApplicationAttribute, 'AA_UseHighDpiPixmaps'):
