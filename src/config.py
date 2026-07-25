@@ -1,5 +1,5 @@
 
-APP_VERSION = "1.17.0"
+APP_VERSION = "1.17.1"
 
 # Sent on every outbound request. A bare "python-requests/x.y" User-Agent from an
 # unsigned executable is a mild antivirus heuristic trigger, and both GitHub and
