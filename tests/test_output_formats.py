@@ -15,6 +15,9 @@ from output_formats import (
     create_sentences_only,
     build_lrc_lines,
     extra_args_has_flag,
+    expected_output_suffixes,
+    expected_output_paths,
+    find_existing_outputs,
 )
 
 
@@ -494,3 +497,98 @@ class TestExtraArgsHasFlag:
 
     def test_substring_not_matched(self):
         assert extra_args_has_flag("--dia", "--diarize") is False
+
+
+# ---------------------------------------------------------------------------
+# expected_output_suffixes
+# ---------------------------------------------------------------------------
+
+class TestExpectedOutputSuffixes:
+    def test_single_format(self):
+        assert expected_output_suffixes(["srt"]) == [".srt"]
+
+    def test_multiple_formats_sorted_and_deduped(self):
+        assert expected_output_suffixes(["vtt", "json", "vtt"]) == [".json", ".vtt"]
+
+    def test_txt_variants_map_to_distinct_files(self):
+        assert expected_output_suffixes(["txt (with timestamps)"]) == [".txt"]
+        assert expected_output_suffixes(["txt (sentences only)"]) == ["_sentences.txt"]
+
+    def test_both_txt_variants(self):
+        assert expected_output_suffixes(
+            ["txt (with timestamps)", "txt (sentences only)"]
+        ) == [".txt", "_sentences.txt"]
+
+    def test_all_expands_to_every_written_format(self):
+        assert expected_output_suffixes(["all"]) == [
+            ".json", ".lrc", ".srt", ".tsv", ".txt", ".vtt"
+        ]
+
+    def test_all_wins_over_other_selections(self):
+        assert expected_output_suffixes(["srt", "all"]) == expected_output_suffixes(["all"])
+
+    def test_empty_selection_defaults_to_srt(self):
+        # Mirrors build_command, which falls back to srt when nothing is checked.
+        assert expected_output_suffixes([]) == [".srt"]
+        assert expected_output_suffixes(None) == [".srt"]
+
+    def test_unknown_format_ignored(self):
+        assert expected_output_suffixes(["bogus"]) == [".srt"]
+        assert expected_output_suffixes(["bogus", "vtt"]) == [".vtt"]
+
+
+# ---------------------------------------------------------------------------
+# expected_output_paths / find_existing_outputs
+# ---------------------------------------------------------------------------
+
+class TestExpectedOutputPaths:
+    def test_builds_paths_from_basename(self, tmp_path):
+        paths = expected_output_paths(str(tmp_path), "video", ["srt", "json"])
+        assert paths == [
+            os.path.join(str(tmp_path), "video.json"),
+            os.path.join(str(tmp_path), "video.srt"),
+        ]
+
+    def test_sentences_suffix_has_no_extra_dot(self, tmp_path):
+        paths = expected_output_paths(str(tmp_path), "video", ["txt (sentences only)"])
+        assert paths == [os.path.join(str(tmp_path), "video_sentences.txt")]
+
+    def test_missing_inputs_yield_nothing(self, tmp_path):
+        assert expected_output_paths("", "video", ["srt"]) == []
+        assert expected_output_paths(str(tmp_path), "", ["srt"]) == []
+
+
+class TestFindExistingOutputs:
+    def test_nothing_exists(self, tmp_path):
+        existing, missing = find_existing_outputs(str(tmp_path), "video", ["srt"])
+        assert existing == []
+        assert len(missing) == 1
+
+    def test_all_exist_means_safe_to_skip(self, tmp_path):
+        (tmp_path / "video.srt").write_text("x")
+        (tmp_path / "video.json").write_text("x")
+        existing, missing = find_existing_outputs(str(tmp_path), "video", ["srt", "json"])
+        assert len(existing) == 2
+        assert missing == []
+
+    def test_partial_outputs_are_not_skippable(self, tmp_path):
+        # An interrupted run leaves some formats behind; it must be redone.
+        (tmp_path / "video.srt").write_text("x")
+        existing, missing = find_existing_outputs(str(tmp_path), "video", ["srt", "json"])
+        assert [os.path.basename(p) for p in existing] == ["video.srt"]
+        assert [os.path.basename(p) for p in missing] == ["video.json"]
+
+    def test_suffixed_basename_checked_independently(self, tmp_path):
+        # video.srt existing must not make video_mp4 look complete.
+        (tmp_path / "video.srt").write_text("x")
+        existing, missing = find_existing_outputs(str(tmp_path), "video_mp4", ["srt"])
+        assert existing == []
+        assert len(missing) == 1
+
+    def test_sentences_only_run_ignores_plain_txt(self, tmp_path):
+        (tmp_path / "video.txt").write_text("x")
+        existing, missing = find_existing_outputs(
+            str(tmp_path), "video", ["txt (sentences only)"]
+        )
+        assert existing == []
+        assert [os.path.basename(p) for p in missing] == ["video_sentences.txt"]
