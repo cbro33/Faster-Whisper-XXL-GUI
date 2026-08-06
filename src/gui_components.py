@@ -4,6 +4,7 @@ import logging
 import requests
 import webbrowser
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -25,7 +26,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import pyqtSignal, Qt, QTimer
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
-from utils import executable_word, get_window_stays_on_top_flag, run_hidden_subprocess, get_app_directory, find_7zip
+from utils import executable_word, get_window_stays_on_top_flag, run_hidden_subprocess, popen_hidden_subprocess, get_app_directory, find_7zip
 from gpu_utils import detect_hardware_capabilities, get_recommended_settings
 from config import SUPPORTED_EXTENSIONS, HTTP_HEADERS
 from converter_utils import find_transformers_weight_files, get_converter_bundle_dir, get_converter_python_path
@@ -502,6 +503,8 @@ class DownloadManager(QDialog):
             def progress_text(size):
                 return f"{size / (1024*1024):.2f} MB / {total_size / (1024*1024):.2f} MB"
 
+            logging.info(f"Downloading {total_size / (1024*1024):.1f} MB to {self.archive_path}")
+            started = time.monotonic()
             downloaded_size = 0
             last_emit = 0.0
             with open(self.archive_path, 'wb') as f:
@@ -518,6 +521,9 @@ class DownloadManager(QDialog):
                     self.download_progress.emit(downloaded_size, total_size, progress_text(downloaded_size))
 
             if not self.cancelled:
+                elapsed = time.monotonic() - started
+                speed = downloaded_size / (1024 * 1024) / elapsed if elapsed else 0
+                logging.info(f"Download complete in {elapsed:.1f}s ({speed:.1f} MB/s)")
                 self.download_progress.emit(downloaded_size, total_size, progress_text(downloaded_size))
                 self.download_finished_signal.emit()
         except Exception as e:
@@ -537,6 +543,42 @@ class DownloadManager(QDialog):
         self.worker_thread = threading.Thread(target=self.extraction_worker, daemon=True)
         self.worker_thread.start()
 
+    def _run_7zip(self, sevenzip_executable, extract_dir, progress):
+        command = [sevenzip_executable, 'x', self.archive_path, f'-o{extract_dir}', '-y']
+        if progress:
+            command.append('-bsp1')
+        logging.info(f"Executing command: {' '.join(command)}")
+        proc = popen_hidden_subprocess(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding='utf-8', errors='replace')
+
+        lines, buf, last_percent = [], "", -1
+        while True:
+            char = proc.stdout.read(1)
+            if not char:
+                break
+            # 7-Zip rewrites progress in place with backspaces, so a newline
+            # never arrives until the whole extraction is done.
+            if char not in "\r\n\b":
+                buf += char
+                continue
+            line, buf = buf.strip(), ""
+            if not line:
+                continue
+            match = re.match(r"(\d+)%", line)
+            if not match:
+                lines.append(line)
+                del lines[:-20]
+                continue
+            percent = int(match.group(1))
+            if percent != last_percent:
+                last_percent = percent
+                self.extraction_progress.emit(percent, 100, f"Extracting archive... {percent}%")
+        proc.wait()
+        if buf.strip():
+            lines.append(buf.strip())
+        return proc.returncode, "\n".join(lines)
+
     def extraction_worker(self):
         # Use secure temporary directory instead of hardcoded name
         extract_dir = tempfile.mkdtemp(prefix="whisper_extract_")
@@ -555,16 +597,22 @@ class DownloadManager(QDialog):
                 )
 
             logging.info(f"Using 7-Zip executable: {sevenzip_executable}")
-            self.extraction_progress.emit(0, 0, "Extracting archive using 7-Zip... (This may take a moment)")
-            command = [sevenzip_executable, 'x', self.archive_path, f'-o{extract_dir}', '-y']
-            logging.info(f"Executing command: {' '.join(command)}")
-            result = run_hidden_subprocess(command, capture_output=True, text=True, encoding='utf-8', errors='replace')
-            if result.returncode != 0:
-                logging.error(f"7-Zip failed with code {result.returncode}\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}")
-                raise RuntimeError(f"7-Zip extraction failed. Error: {result.stderr or result.stdout}")
-            logging.info("Extraction complete.")
+            archive_mb = os.path.getsize(self.archive_path) / (1024 * 1024)
+            logging.info(f"Extracting {archive_mb:.1f} MB archive to {extract_dir}")
+            self.extraction_progress.emit(0, 100, "Extracting archive...")
 
-            self.extraction_progress.emit(1, 2, "Finalizing installation...")
+            started = time.monotonic()
+            returncode, output = self._run_7zip(sevenzip_executable, extract_dir, progress=True)
+            if returncode != 0:
+                logging.warning(f"7-Zip returned {returncode} with -bsp1, retrying without it")
+                returncode, output = self._run_7zip(sevenzip_executable, extract_dir, progress=False)
+            if returncode != 0:
+                logging.error(f"7-Zip failed with code {returncode}\n{output}")
+                raise RuntimeError(f"7-Zip extraction failed. Error: {output}")
+            logging.info(f"Extraction complete in {time.monotonic() - started:.1f}s")
+
+            self.extraction_progress.emit(100, 100, "Finalizing installation...")
+            move_started = time.monotonic()
 
             extracted_items = os.listdir(extract_dir)
             logging.info(f"Items in temp_extract: {extracted_items}")
@@ -590,15 +638,17 @@ class DownloadManager(QDialog):
                 source_path = os.path.join(source_dir, item_name)
                 dest_path = os.path.join(self.destination_dir, item_name)
                 logging.info(f"Moving '{source_path}' to '{dest_path}'")
-                
+
                 if os.path.isdir(dest_path):
                     shutil.rmtree(dest_path)
                 elif os.path.exists(dest_path):
                     os.remove(dest_path)
-                
+
                 shutil.move(source_path, dest_path)
 
-            self.extraction_progress.emit(2, 2, "Verifying files...")
+            logging.info(f"Move into {self.destination_dir} finished in {time.monotonic() - move_started:.1f}s")
+
+            self.extraction_progress.emit(100, 100, "Verifying files...")
             logging.info("Verifying extracted files...")
 
             for filename in self.files_to_extract:
