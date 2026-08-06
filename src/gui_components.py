@@ -38,7 +38,6 @@ def create_always_on_top_message_box(parent, icon, title, text, buttons=None, de
     msg.setWindowTitle(title)
     msg.setText(text)
     
-    # Set always on top flag with compatibility
     stay_on_top_flag = get_window_stays_on_top_flag()
     if stay_on_top_flag is not None:
         try:
@@ -51,7 +50,6 @@ def create_always_on_top_message_box(parent, icon, title, text, buttons=None, de
     if default_button:
         msg.setDefaultButton(default_button)
     
-    # Ensure dialog appears on top and is activated
     msg.activateWindow()
     msg.raise_()
     
@@ -217,7 +215,6 @@ class UpdateProgressDialog(QDialog):
         self.setModal(True)
         self.setMinimumSize(400, 150)
         
-        # Make dialog stay on top during update
         stay_on_top_flag = get_window_stays_on_top_flag()
         if stay_on_top_flag is not None:
             try:
@@ -232,21 +229,17 @@ class UpdateProgressDialog(QDialog):
     def setup_ui(self):
         layout = QVBoxLayout(self)
         
-        # Status label
         self.status_label = QLabel("Preparing to update yt-dlp...", self)
         layout.addWidget(self.status_label)
         
-        # Progress bar (indeterminate for now)
         self.progress_bar = QProgressBar(self)
         self.progress_bar.setRange(0, 0)  # Indeterminate progress
         layout.addWidget(self.progress_bar)
         
-        # Cancel button
         self.cancel_button = QPushButton("Cancel", self)
         self.cancel_button.clicked.connect(self.reject)
         layout.addWidget(self.cancel_button)
         
-        # Center the cancel button
         button_layout = QHBoxLayout()
         button_layout.addStretch()
         button_layout.addWidget(self.cancel_button)
@@ -256,7 +249,6 @@ class UpdateProgressDialog(QDialog):
     def update_progress(self, message):
         """Update the progress message"""
         self.status_label.setText(message)
-        # Process events to ensure UI updates
         from PyQt6.QtCore import QCoreApplication
         QCoreApplication.processEvents()
     
@@ -691,7 +683,7 @@ class ModelDownloadDialog(QDialog):
         self.cancelled = False
         self.worker_thread = None
         self._active_response = None
-        self.file_sizes = {}  # Cache for API sizes
+        self.file_sizes = {}
         self._logged_zero_total = set()
         self._transformers_weight_files = []
         self._transformers_only = False
@@ -722,14 +714,12 @@ class ModelDownloadDialog(QDialog):
         layout.setContentsMargins(30, 30, 30, 30)
         layout.setSpacing(10)
 
-        # 1. Header
         self.status_label = QLabel(f"Downloading model: {self.display_name}", self)
         self.status_label.setStyleSheet("font-size: 18px; font-weight: bold;")
         layout.addWidget(self.status_label)
 
         layout.addSpacing(5)
 
-        # 2. Info Row (Filename ... Size/Percentage)
         info_layout = QHBoxLayout()
         self.file_label = QLabel("Initializing...", self)
         self.file_label.setStyleSheet("font-size: 14px;")
@@ -745,7 +735,6 @@ class ModelDownloadDialog(QDialog):
         info_layout.addWidget(self.details_label)
         layout.addLayout(info_layout)
 
-        # 3. Progress Bar
         self.progress_bar = QProgressBar(self)
         self.progress_bar.setMinimumHeight(10)
         self.progress_bar.setMaximumHeight(10)
@@ -753,7 +742,6 @@ class ModelDownloadDialog(QDialog):
         self.progress_bar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         layout.addWidget(self.progress_bar)
 
-        # 4. Buttons
         layout.addStretch()
         button_layout = QHBoxLayout()
         button_layout.addStretch()
@@ -801,7 +789,6 @@ class ModelDownloadDialog(QDialog):
             self._active_response is not None,
         )
         
-        # Update UI to show cancellation
         self.file_label.setText("Cancelling...")
         self.details_label.setText("")
         self.cancel_button.setEnabled(False)
@@ -829,7 +816,6 @@ class ModelDownloadDialog(QDialog):
         """Safely get file size from URL, falling back to API if header is missing."""
         url = f"https://huggingface.co/{self.repo_id}/resolve/main/{filename}"
         try:
-            # First, try HEAD request for Content-Length
             head_resp = requests.head(url, allow_redirects=True, timeout=5, headers=HTTP_HEADERS)
             if head_resp.status_code == 200:
                 content_length = int(head_resp.headers.get("content-length", 0))
@@ -887,7 +873,7 @@ class ModelDownloadDialog(QDialog):
                     fname = sibling.get("rfilename")
                     fsize = sibling.get("size")
                     if fname and fsize:
-                        self.file_sizes[fname] = fsize  # Cache it
+                        self.file_sizes[fname] = fsize
                         if fname == filename:
                             return fsize
         except Exception:
@@ -941,7 +927,6 @@ class ModelDownloadDialog(QDialog):
                 if "model.bin" not in self.files_to_download and not self._transformers_only:
                     raise FileNotFoundError("model.bin not found in repo.")
             else:
-                # Fetch all sizes at the start
                 self.file_sizes["config.json"] = self._fetch_file_size("config.json")
                 self.file_sizes["tokenizer.json"] = self._fetch_file_size("tokenizer.json")
                 self.file_sizes["preprocessor_config.json"] = self._fetch_file_size("preprocessor_config.json")
@@ -961,20 +946,17 @@ class ModelDownloadDialog(QDialog):
                     else:
                         self._download_file(filename, required=True)
             else:
-                # Download small files
                 for filename in ["config.json", "tokenizer.json", "preprocessor_config.json"]:
                     if self.cancelled:
                         raise RuntimeError("Cancelled")
                     required = (filename != "preprocessor_config.json")
                     self._download_file(filename, required=required)
 
-                # Vocabulary
                 if self.cancelled:
                     raise RuntimeError("Cancelled")
                 if not self._download_file("vocabulary.json", required=False):
                     self._download_file("vocabulary.txt", required=False)
 
-                # Model Binary
                 if self.cancelled:
                     raise RuntimeError("Cancelled")
                 self._download_model_bin()
@@ -994,9 +976,8 @@ class ModelDownloadDialog(QDialog):
             return False
         target_path = os.path.join(self.target_dir, filename)
         
-        total = self.file_sizes.get(filename, 0)  # Use cached API size or 0
+        total = self.file_sizes.get(filename, 0)
 
-        # Check if already downloaded
         if os.path.exists(target_path):
             existing_size = os.path.getsize(target_path)
             if total > 0 and existing_size == total:
@@ -1021,7 +1002,6 @@ class ModelDownloadDialog(QDialog):
             return False
         response.raise_for_status()
         
-        # If total is still 0, use header size if available
         if total == 0:
             total = int(response.headers.get("content-length", 0))
             if filename != "model.bin":
@@ -1071,7 +1051,7 @@ class ModelDownloadDialog(QDialog):
             raise FileNotFoundError(f"{filename} not found.")
         response.raise_for_status()
         
-        if total == 0:  # If API size failed, try header size
+        if total == 0:
             total = int(response.headers.get("content-length", 0))
             self._debug_logger.info(
                 "[%s] model download header total=%s", self._debug_id, total
@@ -1130,7 +1110,6 @@ class ModelDownloadDialog(QDialog):
             
             self.details_label.setText(f"{percent}%  •  {current_str} / {total_str}")
         else:
-            # Fallback if total size is unknown
             self.progress_bar.setRange(0, 0)
             if value > 0:
                 self.details_label.setText(f"{self.format_size(value)} downloaded")
@@ -1182,7 +1161,7 @@ class ModelDownloadDialog(QDialog):
 
     def on_error(self, message):
         if self.cancelled:
-            return  # Don't show error if we cancelled it
+            return
         self.error_string = message
         self.file_label.setText("Error occurred")
         self.details_label.setText("Failed")
@@ -1199,14 +1178,12 @@ class HardwareOptimizationDialog(QDialog):
         self.setModal(True)
         self.setMinimumSize(500, 400)
         
-        # Detect hardware
         self.hardware_info = detect_hardware_capabilities()
         self.recommendations = get_recommended_settings(self.hardware_info)
         self.user_accepted = False
         
         self.init_ui()
         
-        # Set always on top flag
         stay_on_top_flag = get_window_stays_on_top_flag()
         if stay_on_top_flag is not None:
             try:
@@ -1217,16 +1194,13 @@ class HardwareOptimizationDialog(QDialog):
     def init_ui(self):
         layout = QVBoxLayout(self)
         
-        # Title
         title_label = QLabel("Hardware Optimization")
         title_label.setStyleSheet("font-size: 16px; font-weight: bold; margin-bottom: 10px;")
         layout.addWidget(title_label)
         
-        # Hardware detection results
         hw_group = QGroupBox("Detected Hardware")
         hw_layout = QVBoxLayout(hw_group)
         
-        # GPU info with detection details
         gpu_layout = QHBoxLayout()
         if self.hardware_info["has_cuda"]:
             detection_method = self.hardware_info.get("detection_method", "unknown")
@@ -1238,7 +1212,6 @@ class HardwareOptimizationDialog(QDialog):
             gpu_text = "⚠️ GPU: No CUDA-compatible GPU detected"
             gpu_label = QLabel(gpu_text)
             
-            # Add "Show Details" button for failed detection
             if self.hardware_info.get("detection_details"):
                 self.details_button = QPushButton("Show Details")
                 self.details_button.clicked.connect(self.show_detection_details)
@@ -1252,23 +1225,19 @@ class HardwareOptimizationDialog(QDialog):
         if self.hardware_info["has_cuda"]:
             hw_layout.addWidget(gpu_label)
         
-        # RAM info
         ram_text = f"✅ System RAM: {self.hardware_info['ram_gb']:.1f}GB"
         ram_label = QLabel(ram_text)
         hw_layout.addWidget(ram_label)
         
-        # CPU info
         cpu_text = f"✅ CPU: {self.hardware_info['cpu_cores']} cores detected"
         cpu_label = QLabel(cpu_text)
         hw_layout.addWidget(cpu_label)
         
         layout.addWidget(hw_group)
         
-        # Recommendations
         rec_group = QGroupBox("Recommended Settings")
         rec_layout = QFormLayout(rec_group)
         
-        # Device recommendation
         device_text = self.recommendations["device"].upper()
         if device_text == "CUDA":
             device_text += " (faster processing)"
@@ -1276,7 +1245,6 @@ class HardwareOptimizationDialog(QDialog):
             device_text += " (most compatible)"
         rec_layout.addRow("Device:", QLabel(device_text))
         
-        # Model recommendation
         model_text = self.recommendations["model"]
         if model_text == "large-v2":
             model_text += " (highest quality)"
@@ -1286,7 +1254,6 @@ class HardwareOptimizationDialog(QDialog):
             model_text += " (fastest)"
         rec_layout.addRow("Model:", QLabel(model_text))
         
-        # Compute type
         compute_text = self.recommendations["compute_type"]
         if compute_text == "float16":
             compute_text += " (best quality)"
@@ -1296,7 +1263,6 @@ class HardwareOptimizationDialog(QDialog):
             compute_text += " (memory efficient)"
         rec_layout.addRow("Compute Type:", QLabel(compute_text))
         
-        # VAD method
         vad_text = self.recommendations["vad_method"]
         if "pyannote" in vad_text:
             vad_text += " (best accuracy)"
@@ -1306,12 +1272,10 @@ class HardwareOptimizationDialog(QDialog):
         
         layout.addWidget(rec_group)
         
-        # Note about large-v2
         note_label = QLabel("Note: large-v2 provides the best transcription quality")
         note_label.setStyleSheet("color: #666; font-style: italic; margin: 10px 0;")
         layout.addWidget(note_label)
         
-        # Buttons
         button_layout = QHBoxLayout()
         
         self.apply_button = QPushButton("Apply Recommendations")
@@ -1368,7 +1332,6 @@ class FileDropLineEdit(QLineEdit):
             urls = event.mimeData().urls()
             if urls and len(urls) == 1:
                 file_path = urls[0].toLocalFile()
-                # Check if it's a supported audio/video file
                 if file_path.lower().endswith(SUPPORTED_EXTENSIONS):
                     event.acceptProposedAction()
                     return

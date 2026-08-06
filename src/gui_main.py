@@ -119,7 +119,6 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
         self.batch_total_known = False
         self._download_seen_paths = set()
         
-        # Use portable settings location (same directory as exe/source)
         portable_dir = get_portable_settings_directory()
         self.settings_file = os.path.join(portable_dir, "settings.json")
         self.old_roaming_settings_file = os.path.join(get_settings_directory(), "settings.json")  # For migration FROM roaming
@@ -131,14 +130,12 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
         self._output_basename_map = {}
         self._load_output_basename_map()
         
-        # yt-dlp update tracking to prevent multiple checks
         self.yt_dlp_update_checked = False
         self.yt_dlp_update_in_progress = False
         self.yt_dlp_update_session_complete = False
         
         self.executable_path = None
         self.executable_name = None
-        # Use application directory for persistent bin folder location
         app_dir = get_app_directory()
         self.bin_dir = os.path.join(app_dir, "bin")
         
@@ -187,10 +184,8 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
         set_ytdlp_debug_logging_enabled(self.settings.get("debug_model_download_logging", False))
         self.setup_realtime_saving()
         
-        # Check for hardware optimization on first run
         QTimer.singleShot(500, self.check_hardware_optimization)
         
-        # Check yt-dlp version after UI is ready (only if not already checked this session)
         if not self.yt_dlp_update_checked:
             QTimer.singleShot(1000, self.check_yt_dlp_version)
         QTimer.singleShot(1200, self.check_app_update)
@@ -320,7 +315,6 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
             self.setGeometry(100, 100, 1331, 880)
         self.setMinimumSize(1250, 800)
 
-        # Create menu bar
         self.create_menu_bar()
 
         central_widget = QWidget()
@@ -873,7 +867,6 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
 
         self._apply_menu_bar_font_scaling()
         
-        # Save theme change immediately
         self.save_settings_to_file()
 
     def update_audio_preprocess_controls(self, enabled):
@@ -1340,17 +1333,15 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
     def get_system_theme(self):
         """Detect system theme preference"""
         try:
-            # Try to detect system theme using Qt's palette
             palette = QApplication.palette()
             bg_color = palette.color(QPalette.ColorRole.Window)
-            # If background is dark (low lightness), system is in dark mode
             if bg_color.lightness() < 128:
                 return "dark"
             else:
                 return "light"
         except Exception as e:
             logging.warning(f"Could not detect system theme: {e}")
-            return "dark"  # Default fallback
+            return "dark"
 
     def check_yt_dlp_version(self):
         """Check if yt-dlp needs updating and prompt user (with persistent tracking)"""

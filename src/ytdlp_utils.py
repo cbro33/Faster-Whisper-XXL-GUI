@@ -553,7 +553,6 @@ def is_within_update_cooldown(last_update_timestamp, cooldown_hours=24):
 def should_check_ytdlp_update(current_version=None, env=None):
     """Determine if we should check for yt-dlp updates based on persistent tracking."""
     try:
-        # Get current installation info if not provided
         if current_version is None or env is None:
             install_info = get_ytdlp_installation_info()
             if env is None:
@@ -564,11 +563,9 @@ def should_check_ytdlp_update(current_version=None, env=None):
         if not current_version:
             return True  # yt-dlp not found, should check
         
-        # Load persistent update status
         update_data = load_ytdlp_update_status()
         env_data = update_data["ytdlp_updates"].get(env, {})
         
-        # Check if we recently updated successfully
         last_updated_version = env_data.get("last_updated_version")
         last_update_timestamp = env_data.get("last_update_timestamp")
         last_failure_version = env_data.get("last_failure_version")
@@ -583,7 +580,6 @@ def should_check_ytdlp_update(current_version=None, env=None):
             save_ytdlp_update_status(update_data)
             last_failure_timestamp = None
 
-        # If we have a record of updating to the current version recently, skip
         if (
             last_updated_version == current_version and 
             is_within_update_cooldown(last_update_timestamp)
@@ -607,13 +603,10 @@ def record_ytdlp_update_success(updated_version):
     try:
         import time
         
-        # Get current environment
         env = get_execution_environment()
         
-        # Load existing data
         update_data = load_ytdlp_update_status()
         
-        # Update the data for current environment
         if env not in update_data["ytdlp_updates"]:
             update_data["ytdlp_updates"][env] = {}
         
@@ -621,12 +614,10 @@ def record_ytdlp_update_success(updated_version):
             "last_updated_version": updated_version,
             "last_update_timestamp": time.time()
         })
-        # Clear any previous failure markers for this environment.
         update_data["ytdlp_updates"][env].pop("last_failure_timestamp", None)
         update_data["ytdlp_updates"][env].pop("last_failure_reason", None)
         update_data["ytdlp_updates"][env].pop("last_failure_version", None)
         
-        # Save the updated data
         save_ytdlp_update_status(update_data)
         
         logging.info(f"Recorded successful yt-dlp update to {updated_version} in {env} mode")
@@ -670,6 +661,5 @@ def clear_ytdlp_update_failure(env=None):
     except Exception as e:
         logging.error(f"Could not clear yt-dlp update failure markers: {e}")
 
-# Initial load
 import yt_dlp as bundled_yt_dlp
 yt_dlp = maybe_use_external_yt_dlp(bundled_yt_dlp)

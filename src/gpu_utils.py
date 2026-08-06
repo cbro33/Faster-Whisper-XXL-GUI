@@ -7,7 +7,6 @@ def try_pytorch_detection():
     try:
         import torch
         
-        # Check if CUDA is available
         cuda_available = torch.cuda.is_available()
         
         if cuda_available:
@@ -62,7 +61,6 @@ def try_nvml_detection():
             memory_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
             memory_gb = memory_info.total / (1024**3)
             
-            # Try to get CUDA version
             try:
                 cuda_version = pynvml.nvmlSystemGetCudaDriverVersion()
                 cuda_version_str = f"{cuda_version // 1000}.{(cuda_version % 1000) // 10}"
@@ -146,12 +144,10 @@ def try_platform_detection():
     """ Try platform-specific GPU detection """
     try:
         if sys.platform == "win32":
-            # Windows: Try WMI detection
             try:
                 result = run_hidden_subprocess(['wmic', 'path', 'win32_VideoController', 'get', 'name'], 
                                       capture_output=True, text=True, timeout=10)
                 if result.returncode == 0 and 'nvidia' in result.stdout.lower():
-                    # Found NVIDIA GPU, but can't get memory info this way
                     lines = result.stdout.strip().split('\n')
                     for line in lines:
                         if line.strip() and 'nvidia' in line.lower():
@@ -160,7 +156,7 @@ def try_platform_detection():
                                 "success": True,
                                 "gpu_info": {
                                     "has_cuda": True,
-                                    "gpu_memory_gb": 4.0,  # Conservative estimate
+                                    "gpu_memory_gb": 4.0,
                                     "gpu_name": gpu_name,
                                     "cuda_version": "Unknown",
                                     "recommended_device": "cuda",
@@ -186,7 +182,6 @@ def try_intel_gpu_detection():
     """ Detect Intel integrated and dedicated GPUs """
     try:
         if sys.platform == "win32":
-            # Windows: WMI query for Intel graphics
             result = run_hidden_subprocess(['wmic', 'path', 'win32_VideoController', 'where', 
                                    'name like "%Intel%"', 'get', 'name,AdapterRAM'], 
                                   capture_output=True, text=True, timeout=10)
@@ -197,13 +192,12 @@ def try_intel_gpu_detection():
                     if line.strip() and 'intel' in line.lower():
                         parts = line.strip().split()
                         if len(parts) >= 2:
-                            # Extract GPU name and memory
                             gpu_name = ' '.join(parts[:-1]) if len(parts) > 1 else line.strip()
                             try:
                                 memory_bytes = int(parts[-1]) if parts[-1].isdigit() else 0
-                                memory_gb = memory_bytes / (1024**3) if memory_bytes > 0 else 2.0  # Default estimate
+                                memory_gb = memory_bytes / (1024**3) if memory_bytes > 0 else 2.0
                             except:
-                                memory_gb = 2.0  # Conservative estimate for integrated
+                                memory_gb = 2.0
                             
                             return {
                                 "success": True,
@@ -219,12 +213,10 @@ def try_intel_gpu_detection():
                             }
         
         elif sys.platform == "linux":
-            # Linux: Try lspci for Intel graphics
             result = run_hidden_subprocess(['lspci', '-nn'], capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
                 lines = result.stdout.lower()
                 if 'intel' in lines and ('vga' in lines or '3d' in lines):
-                    # Found Intel GPU in lspci
                     for line in result.stdout.split('\n'):
                         if 'intel' in line.lower() and ('vga' in line.lower() or '3d' in line.lower()):
                             gpu_name = line.split(': ')[-1].strip() if ': ' in line else "Intel Graphics"
@@ -232,7 +224,7 @@ def try_intel_gpu_detection():
                                 "success": True,
                                 "gpu_info": {
                                     "has_cuda": False,
-                                    "gpu_memory_gb": 2.0,  # Conservative estimate
+                                    "gpu_memory_gb": 2.0,
                                     "gpu_name": gpu_name,
                                     "cuda_version": None,
                                     "recommended_device": "cpu",
@@ -257,7 +249,6 @@ def try_amd_gpu_detection():
     """ Detect AMD integrated and dedicated GPUs """
     try:
         if sys.platform == "win32":
-            # Windows: WMI query for AMD graphics
             result = run_hidden_subprocess(['wmic', 'path', 'win32_VideoController', 'where', 
                                    'name like "%AMD%" or name like "%Radeon%"', 
                                    'get', 'name,AdapterRAM'], 
@@ -269,13 +260,12 @@ def try_amd_gpu_detection():
                     if line.strip() and ('amd' in line.lower() or 'radeon' in line.lower()):
                         parts = line.strip().split()
                         if len(parts) >= 2:
-                            # Extract GPU name and memory
                             gpu_name = ' '.join(parts[:-1]) if len(parts) > 1 else line.strip()
                             try:
                                 memory_bytes = int(parts[-1]) if parts[-1].isdigit() else 0
-                                memory_gb = memory_bytes / (1024**3) if memory_bytes > 0 else 4.0  # Default estimate
+                                memory_gb = memory_bytes / (1024**3) if memory_bytes > 0 else 4.0
                             except:
-                                memory_gb = 4.0  # Conservative estimate
+                                memory_gb = 4.0
                             
                             return {
                                 "success": True,
@@ -291,12 +281,10 @@ def try_amd_gpu_detection():
                             }
         
         elif sys.platform == "linux":
-            # Linux: Try lspci for AMD graphics
             result = run_hidden_subprocess(['lspci', '-nn'], capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
                 lines = result.stdout.lower()
                 if ('amd' in lines or 'radeon' in lines) and ('vga' in lines or '3d' in lines):
-                    # Found AMD GPU in lspci
                     for line in result.stdout.split('\n'):
                         if ('amd' in line.lower() or 'radeon' in line.lower()) and ('vga' in line.lower() or '3d' in line.lower()):
                             gpu_name = line.split(': ')[-1].strip() if ': ' in line else "AMD Radeon Graphics"
@@ -304,7 +292,7 @@ def try_amd_gpu_detection():
                                 "success": True,
                                 "gpu_info": {
                                     "has_cuda": False,
-                                    "gpu_memory_gb": 4.0,  # Conservative estimate
+                                    "gpu_memory_gb": 4.0,
                                     "gpu_name": gpu_name,
                                     "cuda_version": None,
                                     "recommended_device": "cpu",
@@ -331,7 +319,6 @@ def try_universal_gpu_detection():
         gpu_list = []
         
         if sys.platform == "win32":
-            # Windows: WMI query for all GPUs
             result = run_hidden_subprocess(['wmic', 'path', 'win32_VideoController', 
                                    'get', 'name,AdapterRAM'], 
                                   capture_output=True, text=True, timeout=10)
@@ -349,7 +336,6 @@ def try_universal_gpu_detection():
                             except:
                                 memory_gb = 2.0
                             
-                            # Determine vendor and capabilities
                             vendor = "unknown"
                             has_cuda = False
                             if 'nvidia' in gpu_name.lower():
@@ -371,14 +357,12 @@ def try_universal_gpu_detection():
                             })
         
         elif sys.platform == "linux":
-            # Linux: lspci for all graphics devices
             result = run_hidden_subprocess(['lspci', '-nn'], capture_output=True, text=True, timeout=5)
             if result.returncode == 0:
                 for line in result.stdout.split('\n'):
                     if 'vga' in line.lower() or '3d' in line.lower():
                         gpu_name = line.split(': ')[-1].strip() if ': ' in line else "Graphics Device"
                         
-                        # Determine vendor
                         vendor = "unknown"
                         has_cuda = False
                         memory_gb = 2.0
@@ -428,9 +412,8 @@ def assess_gpu_capabilities(gpu_info):
     memory_gb = gpu_info.get("gpu_memory_gb", 0)
     vendor = gpu_info.get("gpu_vendor", "unknown")
     
-    # NVIDIA GPUs - CUDA support
     if vendor == "nvidia" or "nvidia" in gpu_name or "geforce" in gpu_name or "rtx" in gpu_name:
-        if any(x in gpu_name for x in ["rtx 50", "rtx 40"]):  # High-end modern
+        if any(x in gpu_name for x in ["rtx 50", "rtx 40"]):
             return {
                 "tier": "high-end", 
                 "ai_capable": True, 
@@ -438,7 +421,7 @@ def assess_gpu_capabilities(gpu_info):
                 "recommended_model": "large-v2",
                 "recommended_compute": "float16"
             }
-        elif any(x in gpu_name for x in ["rtx 30", "rtx 20"]):  # Mid-high
+        elif any(x in gpu_name for x in ["rtx 30", "rtx 20"]):
             return {
                 "tier": "mid-high", 
                 "ai_capable": True, 
@@ -446,7 +429,7 @@ def assess_gpu_capabilities(gpu_info):
                 "recommended_model": "large-v2" if memory_gb >= 6 else "medium",
                 "recommended_compute": "int8_float16"
             }
-        elif "gtx" in gpu_name:  # Older, limited CUDA
+        elif "gtx" in gpu_name:
             return {
                 "tier": "legacy", 
                 "ai_capable": True, 
@@ -455,9 +438,8 @@ def assess_gpu_capabilities(gpu_info):
                 "recommended_compute": "int8"
             }
     
-    # Intel GPUs
     elif vendor == "intel" or "intel" in gpu_name:
-        if "arc" in gpu_name:  # Intel Arc dedicated
+        if "arc" in gpu_name:
             return {
                 "tier": "mid-range", 
                 "ai_capable": False, 
@@ -465,7 +447,7 @@ def assess_gpu_capabilities(gpu_info):
                 "recommended_model": "medium",
                 "recommended_compute": "int8"
             }
-        elif any(x in gpu_name for x in ["iris xe", "iris plus"]):  # Better integrated
+        elif any(x in gpu_name for x in ["iris xe", "iris plus"]):
             return {
                 "tier": "integrated-good", 
                 "ai_capable": False, 
@@ -482,9 +464,8 @@ def assess_gpu_capabilities(gpu_info):
                 "recommended_compute": "int8"
             }
     
-    # AMD GPUs
     elif vendor == "amd" or "amd" in gpu_name or "radeon" in gpu_name:
-        if any(x in gpu_name for x in ["rx 7000", "rx 6000"]):  # Modern high-end
+        if any(x in gpu_name for x in ["rx 7000", "rx 6000"]):
             return {
                 "tier": "high-end", 
                 "ai_capable": False, 
@@ -492,7 +473,7 @@ def assess_gpu_capabilities(gpu_info):
                 "recommended_model": "large-v2",  # Usually paired with good CPU
                 "recommended_compute": "int8"
             }
-        elif any(x in gpu_name for x in ["rx 5000", "rx 500"]):  # Mid-range
+        elif any(x in gpu_name for x in ["rx 5000", "rx 500"]):
             return {
                 "tier": "mid-range", 
                 "ai_capable": False, 
@@ -540,14 +521,11 @@ def select_best_gpu_for_ai(gpu_list):
         score = 0
         capabilities = assess_gpu_capabilities(gpu)
         
-        # CUDA support gets highest priority
         if gpu.get("has_cuda", False):
             score += 1000
         
-        # Memory amount
         score += gpu.get("gpu_memory_gb", 0) * 10
         
-        # GPU tier scoring
         tier_scores = {
             "high-end": 100,
             "mid-high": 80,
@@ -563,7 +541,6 @@ def select_best_gpu_for_ai(gpu_list):
             best_score = score
             best_gpu = gpu
     
-    # Add capability assessment to the best GPU
     if best_gpu:
         capabilities = assess_gpu_capabilities(best_gpu)
         best_gpu.update(capabilities)
@@ -575,10 +552,8 @@ def detect_gpu_info():
     all_detected_gpus = []
     detection_details = []
     
-    # Phase 1: NVIDIA GPU Detection (CUDA-capable, highest priority)
     logging.info("Phase 1: Trying NVIDIA GPU detection methods...")
     
-    # Method 1: PyTorch detection (most reliable for CUDA)
     logging.info("Trying PyTorch GPU detection...")
     pytorch_result = try_pytorch_detection()
     if pytorch_result["success"]:
@@ -588,8 +563,7 @@ def detect_gpu_info():
         detection_details.append(f"PyTorch: {pytorch_result['error']}")
         logging.info(f"PyTorch detection failed: {pytorch_result['error']}")
     
-    # Method 2: NVML detection
-    if not all_detected_gpus:  # Only try if PyTorch didn't find anything
+    if not all_detected_gpus:
         logging.info("Trying NVML GPU detection...")
         nvml_result = try_nvml_detection()
         if nvml_result["success"]:
@@ -599,8 +573,7 @@ def detect_gpu_info():
             detection_details.append(f"NVML: {nvml_result['error']}")
             logging.info(f"NVML detection failed: {nvml_result['error']}")
     
-    # Method 3: nvidia-smi detection
-    if not all_detected_gpus:  # Only try if no NVIDIA GPU found yet
+    if not all_detected_gpus:
         logging.info("Trying nvidia-smi GPU detection...")
         smi_result = try_nvidia_smi_detection()
         if smi_result["success"]:
@@ -610,8 +583,7 @@ def detect_gpu_info():
             detection_details.append(f"nvidia-smi: {smi_result['error']}")
             logging.info(f"nvidia-smi detection failed: {smi_result['error']}")
     
-    # Phase 2: Intel GPU Detection
-    if not all_detected_gpus:  # Only if no NVIDIA GPU found
+    if not all_detected_gpus:
         logging.info("Phase 2: Trying Intel GPU detection...")
         intel_result = try_intel_gpu_detection()
         if intel_result["success"]:
@@ -621,8 +593,7 @@ def detect_gpu_info():
             detection_details.append(f"Intel: {intel_result['error']}")
             logging.info(f"Intel detection failed: {intel_result['error']}")
     
-    # Phase 3: AMD GPU Detection
-    if not all_detected_gpus:  # Only if no NVIDIA or Intel GPU found
+    if not all_detected_gpus:
         logging.info("Phase 3: Trying AMD GPU detection...")
         amd_result = try_amd_gpu_detection()
         if amd_result["success"]:
@@ -643,7 +614,6 @@ def detect_gpu_info():
             detection_details.append(f"Universal: {universal_result['error']}")
             logging.info(f"Universal detection failed: {universal_result['error']}")
     
-    # Select best GPU from all detected GPUs
     if all_detected_gpus:
         best_gpu = select_best_gpu_for_ai(all_detected_gpus)
         if best_gpu:
@@ -651,7 +621,6 @@ def detect_gpu_info():
             logging.info(f"Selected best GPU: {best_gpu['gpu_name']} (method: {best_gpu.get('detection_method', 'unknown')})")
             return best_gpu
     
-    # No GPUs found - return CPU fallback
     logging.warning("No GPUs detected by any method")
     return {
         "has_cuda": False,
@@ -677,7 +646,6 @@ def detect_system_info():
         system_info["cpu_cores"] = psutil.cpu_count(logical=False) or psutil.cpu_count()
     except ImportError:
         logging.info("psutil not available for system detection, using fallback values")
-        # Try alternative methods
         try:
             import multiprocessing
             system_info["cpu_cores"] = multiprocessing.cpu_count()
@@ -704,44 +672,38 @@ def get_recommended_settings(hardware_info):
     """ Generate optimal settings based on hardware """
     recommendations = {}
     
-    # Device Selection
     if hardware_info["has_cuda"] and hardware_info["gpu_memory_gb"] >= 4:
         recommendations["device"] = "cuda"
     else:
         recommendations["device"] = "cpu"
     
-    # Compute Type Based on Hardware
     if hardware_info["has_cuda"]:
         if hardware_info["gpu_memory_gb"] >= 7.5:
             recommendations["compute_type"] = "float16"  # Best quality; 7.5 threshold avoids rounding-edge GPUs (e.g. 8 GB cards reporting 7.9)
         elif hardware_info["gpu_memory_gb"] >= 4:
-            recommendations["compute_type"] = "int8_float16"  # Good balance
+            recommendations["compute_type"] = "int8_float16"
         else:
             recommendations["compute_type"] = "int8"  # Memory limited
     else:
-        # CPU optimizations
         if hardware_info["ram_gb"] >= 16:
             recommendations["compute_type"] = "int8"  # Faster on CPU
         else:
             recommendations["compute_type"] = "int8"  # Memory conservative
     
-    # Model Size Recommendations (large-v2 is the best quality model)
     if hardware_info["has_cuda"] and hardware_info["gpu_memory_gb"] >= 6:
         recommendations["model"] = "large-v2"  # BEST quality model
     elif hardware_info["has_cuda"] and hardware_info["gpu_memory_gb"] >= 4:
-        recommendations["model"] = "medium"   # Good balance for mid-range GPU
+        recommendations["model"] = "medium"
     elif hardware_info["ram_gb"] >= 8:
-        recommendations["model"] = "medium"   # CPU with sufficient RAM
+        recommendations["model"] = "medium"
     else:
         recommendations["model"] = "base"     # Memory-limited systems
     
-    # Beam Size Based on Memory
     if hardware_info["gpu_memory_gb"] >= 8 or hardware_info["ram_gb"] >= 16:
         recommendations["beam_size"] = 5  # Default
     else:
         recommendations["beam_size"] = 3  # More memory efficient
     
-    # VAD Method Based on Hardware
     if hardware_info["has_cuda"] and hardware_info["gpu_memory_gb"] >= 4:
         recommendations["vad_method"] = "pyannote_v3"  # Best accuracy with CUDA
     else:

@@ -246,7 +246,6 @@ def discover_python_standard_locations():
         except PermissionError:
             continue
 
-    # Also check system root for py.exe specifically
     system_root = os.environ.get("SystemRoot")
     if system_root:
         for sub in ("py.exe", os.path.join("System32", "py.exe")):
@@ -349,7 +348,6 @@ def build_command_label(command_tokens):
 def get_execution_environment():
     """ Detect how the application is running and what update capabilities are available """
     try:
-        # Check if running as PyInstaller executable
         is_frozen = getattr(sys, 'frozen', False)
         
         if not is_frozen:

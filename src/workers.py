@@ -75,7 +75,6 @@ class YouTubeDownloader(QThread):
         if self.stop_requested:
             raise ytdlp_utils.yt_dlp.utils.DownloadError("Download cancelled by user.")
         if d['status'] == 'downloading':
-            # Sanitize the output to prevent weird formatting issues
             percent_str = d.get('_percent_str', 'N/A').strip()
             total_bytes_str = d.get('_total_bytes_str', 'N/A').strip()
             speed_str = d.get('_speed_str', 'N/A').strip()

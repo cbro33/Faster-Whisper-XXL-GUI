@@ -11,16 +11,12 @@ from config import HTTP_HEADERS
 def get_app_directory():
     """ Get the application's base directory consistently, whether running from source or as executable """
     try:
-        # Check if running as PyInstaller executable
         if getattr(sys, 'frozen', False):
-            # Running as PyInstaller executable - use directory where .exe is located
             return os.path.dirname(sys.executable)
         else:
-            # Running from source - use parent directory of src/
             script_dir = os.path.dirname(os.path.abspath(__file__))
-            return os.path.dirname(script_dir)  # Go up one level from src/
+            return os.path.dirname(script_dir)
     except Exception as e:
-        # Fallback to current working directory if all else fails
         print(f"Warning: Could not determine app directory: {e}, using current working directory")
         return os.getcwd()
 
@@ -29,23 +25,18 @@ def get_settings_directory():
     """ Get a writable, persistent directory for settings across all execution modes """
     try:
         if sys.platform == "win32":
-            # Windows: Use %APPDATA%\FasterWhisperXXL\
             appdata = os.environ.get('APPDATA')
             if appdata:
                 settings_dir = os.path.join(appdata, "FasterWhisperXXL")
             else:
-                # Fallback to user profile
                 settings_dir = os.path.join(os.path.expanduser("~"), ".faster-whisper-xxl")
         else:
-            # Linux/Mac: Use ~/.faster-whisper-xxl/
             settings_dir = os.path.join(os.path.expanduser("~"), ".faster-whisper-xxl")
         
-        # Create directory if it doesn't exist
         os.makedirs(settings_dir, exist_ok=True)
         return settings_dir
     except Exception as e:
         logging.warning(f"Could not create settings directory: {e}, using app directory")
-        # Final fallback to app directory (if writable)
         return get_app_directory()
 
 
@@ -53,10 +44,8 @@ def get_portable_settings_directory():
     """ Get settings directory that stays with the application (portable) """
     try:
         if getattr(sys, 'frozen', False):
-            # Running as exe - use same directory as .exe
             return os.path.dirname(sys.executable)
         else:
-            # Running from source - use src/ directory
             return os.path.dirname(os.path.abspath(__file__))
     except Exception as e:
         logging.warning(f"Could not determine portable settings directory: {e}")
@@ -68,13 +57,10 @@ def resource_path(relative_path):
     try:
         # PyInstaller creates a temp folder and stores path in _MEIPASS
         base_path = sys._MEIPASS
-        # In PyInstaller, resources are in a 'resources' subdirectory
         return os.path.join(base_path, "resources", relative_path)
     except AttributeError:
-        # Fallback for normal execution
-        # When running from src/, resources are in the parent directory
         script_dir = os.path.dirname(os.path.abspath(__file__))
-        base_path = os.path.dirname(script_dir)  # Go up one level from src/
+        base_path = os.path.dirname(script_dir)
         return os.path.join(base_path, "resources", relative_path)
 
 def _apply_windows_hidden_process_kwargs(kwargs):
@@ -186,10 +172,6 @@ def resolve_ffmpeg_location():
         logging.debug(f"Could not resolve ffmpeg path: {exc}")
         return None
 
-
-# ---------------------------------------------------------------------------
-# Pure text / path utilities (extracted from gui_main.WhisperGUI)
-# ---------------------------------------------------------------------------
 
 def redact_path_text(text):
     """Replace file-system paths in *text* with ``<path>`` for safe display."""

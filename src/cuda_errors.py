@@ -5,10 +5,6 @@ Everything here is free of Qt and GUI state so it can be unit-tested trivially.
 """
 
 
-# ---------------------------------------------------------------------------
-# Error detection  (string → bool)
-# ---------------------------------------------------------------------------
-
 def detect_cuda_oom(text):
     """Return True if *text* contains a CUDA out-of-memory indicator."""
     if not text:
@@ -38,10 +34,6 @@ def detect_cublas_not_supported(text):
         return False
     return "cublas_status_not_supported" in text.lower()
 
-
-# ---------------------------------------------------------------------------
-# Compute-type fallback
-# ---------------------------------------------------------------------------
 
 COMPUTE_FALLBACK_ORDER = {
     "int8_float16": "float16",

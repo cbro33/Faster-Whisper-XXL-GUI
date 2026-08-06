@@ -9,10 +9,6 @@ import os
 import re
 
 
-# ---------------------------------------------------------------------------
-# Timestamp parsing
-# ---------------------------------------------------------------------------
-
 def parse_txt_timestamp(value):
     """Parse a txt-style timestamp (``mm:ss.xxx`` or ``hh:mm:ss.xxx``) to seconds."""
     value = (value or "").strip()
@@ -60,10 +56,6 @@ def format_lrc_timestamp(seconds):
     centis = total_centis % 100
     return f"{minutes:02d}:{secs:02d}.{centis:02d}"
 
-
-# ---------------------------------------------------------------------------
-# Speaker segment extraction
-# ---------------------------------------------------------------------------
 
 def read_speaker_segments_from_srt(srt_path):
     """Return a list of ``{start, end, speaker}`` dicts parsed from an SRT file."""
@@ -140,10 +132,6 @@ def read_speaker_segments_from_txt(txt_path):
     return segments
 
 
-# ---------------------------------------------------------------------------
-# Speaker matching
-# ---------------------------------------------------------------------------
-
 def match_speaker_for_segment(start, end, speaker_segments):
     """Find the best-matching speaker for the time range *start*–*end*.
 
@@ -175,10 +163,6 @@ def match_speaker_for_segment(start, end, speaker_segments):
             nearest = segment["speaker"]
     return nearest
 
-
-# ---------------------------------------------------------------------------
-# Speaker label replacement
-# ---------------------------------------------------------------------------
 
 def replace_speaker_labels_in_text(path, mapping):
     """Replace ``[SPEAKER_XX]:`` labels in a text file using *mapping*.
@@ -291,10 +275,6 @@ def inject_speakers_into_json(json_path):
         return False
 
 
-# ---------------------------------------------------------------------------
-# Sentences-only file creation
-# ---------------------------------------------------------------------------
-
 def create_sentences_only(txt_with_timestamps, sentences_only_path):
     """Create a sentences-only text file from a timestamped transcript.
 
@@ -382,10 +362,6 @@ def create_sentences_only(txt_with_timestamps, sentences_only_path):
     return True, None
 
 
-# ---------------------------------------------------------------------------
-# LRC generation from JSON segments
-# ---------------------------------------------------------------------------
-
 def build_lrc_lines(segments):
     """Build LRC content lines from a list of JSON segment dicts.
 
@@ -424,10 +400,6 @@ def build_lrc_lines(segments):
     return lines
 
 
-# ---------------------------------------------------------------------------
-# Extra-args flag check
-# ---------------------------------------------------------------------------
-
 def extra_args_has_flag(flag, text):
     """Return True if *flag* (e.g. ``--diarize``) appears in *text*."""
     if not text:
@@ -435,10 +407,6 @@ def extra_args_has_flag(flag, text):
     pattern = re.compile(rf"(^|\s){re.escape(flag)}(=|\s|$)")
     return bool(pattern.search(text))
 
-
-# ---------------------------------------------------------------------------
-# Existing-output detection
-# ---------------------------------------------------------------------------
 
 # Maps a GUI output-format label to the filename suffix it produces for a run
 # with basename ``base`` (i.e. the output file is ``base`` + suffix).
