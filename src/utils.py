@@ -385,6 +385,49 @@ def text_indicates_transcription_success(text):
     return any(indicator in text for indicator in success_indicators)
 
 
+def _7zip_dirs_from_registry():
+    """Install directories 7-Zip recorded for itself, machine wide and per user."""
+    if sys.platform != "win32":
+        return []
+    try:
+        import winreg
+    except ImportError:
+        return []
+    dirs = []
+    for root, access in (
+        (winreg.HKEY_CURRENT_USER, 0),
+        (winreg.HKEY_LOCAL_MACHINE, 0),
+        (winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_32KEY),
+    ):
+        try:
+            with winreg.OpenKey(root, r"SOFTWARE\7-Zip", 0, winreg.KEY_READ | access) as key:
+                value = winreg.QueryValueEx(key, "Path")[0]
+        except OSError:
+            continue
+        except Exception as exc:
+            logging.debug("Could not read 7-Zip registry path: %s", exc)
+            continue
+        if value and value not in dirs:
+            dirs.append(value)
+    return dirs
+
+
+def _windows_7zip_dirs():
+    dirs = _7zip_dirs_from_registry()
+    bases = [
+        os.environ.get("ProgramFiles", "C:\\Program Files"),
+        os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"),
+    ]
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        bases.append(os.path.join(local_appdata, "Programs"))
+    for base in bases:
+        candidate = os.path.join(base, "7-Zip")
+        if candidate not in dirs:
+            dirs.append(candidate)
+    return dirs
+
+
 def find_7zip():
     """Find 7-Zip executable on the system. Returns path or None."""
     exe = shutil.which('7z') or shutil.which('7zr')
@@ -396,12 +439,11 @@ def find_7zip():
         if os.path.exists(local_path):
             return local_path
     if sys.platform == "win32":
-        prog_files = os.environ.get("ProgramFiles", "C:\\Program Files")
-        prog_files_x86 = os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")
-        for base in [prog_files, prog_files_x86]:
-            path = os.path.join(base, "7-Zip", "7z.exe")
-            if os.path.exists(path):
-                return path
+        for directory in _windows_7zip_dirs():
+            for name in ("7z.exe", "7zr.exe"):
+                path = os.path.join(directory, name)
+                if os.path.exists(path):
+                    return path
     return None
 
 

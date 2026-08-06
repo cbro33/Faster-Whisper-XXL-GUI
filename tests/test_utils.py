@@ -2,6 +2,8 @@ import os
 import json
 import pytest
 
+import utils
+
 from utils import (
     format_path_for_display,
     normalize_path_signature,
@@ -18,6 +20,7 @@ from utils import (
     normalize_version,
     version_tuple,
     text_indicates_transcription_success,
+    find_7zip,
 )
 
 
@@ -379,3 +382,67 @@ class TestTextIndicatesTranscriptionSuccess:
 
     def test_no_match(self):
         assert text_indicates_transcription_success("Processing audio...") is False
+
+
+# ---------------------------------------------------------------------------
+# find_7zip
+# ---------------------------------------------------------------------------
+
+class TestFind7zip:
+    """The Windows branches cannot run here, so they are driven with stubs."""
+
+    def _windows(self, monkeypatch, tmp_path, registry=None, env=None):
+        monkeypatch.setattr(utils.sys, "platform", "win32")
+        monkeypatch.setattr(utils.shutil, "which", lambda name: None)
+        monkeypatch.setattr(utils, "get_app_directory", lambda: str(tmp_path / "app"))
+        monkeypatch.setattr(utils, "_7zip_dirs_from_registry", lambda: registry or [])
+        for key in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+            monkeypatch.delenv(key, raising=False)
+        for key, value in (env or {}).items():
+            monkeypatch.setenv(key, value)
+
+    def test_prefers_executable_on_path(self, monkeypatch):
+        monkeypatch.setattr(utils.shutil, "which", lambda name: "/usr/bin/7z" if name == "7z" else None)
+        assert find_7zip() == "/usr/bin/7z"
+
+    def test_returns_none_when_nothing_found(self, monkeypatch, tmp_path):
+        self._windows(monkeypatch, tmp_path)
+        assert find_7zip() is None
+
+    def test_finds_install_recorded_in_registry(self, monkeypatch, tmp_path):
+        custom = tmp_path / "D_Tools" / "7-Zip"
+        custom.mkdir(parents=True)
+        (custom / "7z.exe").write_text("")
+        self._windows(monkeypatch, tmp_path, registry=[str(custom)])
+        assert find_7zip() == str(custom / "7z.exe")
+
+    def test_registry_wins_over_program_files(self, monkeypatch, tmp_path):
+        custom = tmp_path / "custom" / "7-Zip"
+        custom.mkdir(parents=True)
+        (custom / "7z.exe").write_text("")
+        progfiles = tmp_path / "Program Files"
+        (progfiles / "7-Zip").mkdir(parents=True)
+        (progfiles / "7-Zip" / "7z.exe").write_text("")
+        self._windows(monkeypatch, tmp_path, registry=[str(custom)],
+                      env={"ProgramFiles": str(progfiles)})
+        assert find_7zip() == str(custom / "7z.exe")
+
+    def test_finds_per_user_install(self, monkeypatch, tmp_path):
+        local = tmp_path / "LocalAppData"
+        target = local / "Programs" / "7-Zip"
+        target.mkdir(parents=True)
+        (target / "7z.exe").write_text("")
+        self._windows(monkeypatch, tmp_path, env={"LOCALAPPDATA": str(local)})
+        assert find_7zip() == str(target / "7z.exe")
+
+    def test_falls_back_to_7zr_in_install_dir(self, monkeypatch, tmp_path):
+        progfiles = tmp_path / "Program Files"
+        target = progfiles / "7-Zip"
+        target.mkdir(parents=True)
+        (target / "7zr.exe").write_text("")
+        self._windows(monkeypatch, tmp_path, env={"ProgramFiles": str(progfiles)})
+        assert find_7zip() == str(target / "7zr.exe")
+
+    def test_registry_helper_is_noop_off_windows(self, monkeypatch):
+        monkeypatch.setattr(utils.sys, "platform", "linux")
+        assert utils._7zip_dirs_from_registry() == []
