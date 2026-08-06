@@ -6,6 +6,7 @@ import webbrowser
 import shutil
 import tempfile
 import threading
+import time
 import re
 from PyQt6.QtWidgets import (
     QDialog,
@@ -409,7 +410,8 @@ class DownloadManager(QDialog):
         self.files_to_extract = files_to_extract
         self.destination_dir = destination_dir
         self.error_string = None
-        self.archive_path = "whisper_essentials.7z"
+        self.archive_dir = os.path.join(tempfile.gettempdir(), "faster-whisper-xxl-gui")
+        self.archive_path = os.path.join(self.archive_dir, "whisper_essentials.7z")
         self.worker_thread = None
         self.cancelled = False
         self.thread = None
@@ -426,14 +428,11 @@ class DownloadManager(QDialog):
 
         self.setWindowTitle("Setup Progress")
         self.setModal(True)
-        
-        # Make dialog stay on top during setup
-        stay_on_top_flag = get_window_stays_on_top_flag()
-        if stay_on_top_flag is not None:
-            try:
-                self.setWindowFlags(self.windowFlags() | stay_on_top_flag)
-            except Exception as e:
-                logging.warning(f"Could not set always-on-top flag for DownloadManager: {e}")
+
+        try:
+            self.setWindowFlags(self.windowFlags() | Qt.WindowType.WindowMinimizeButtonHint)
+        except Exception as e:
+            logging.warning(f"Could not add minimize button to DownloadManager: {e}")
         self.activateWindow()
         self.raise_()
         layout = QVBoxLayout(self)
@@ -498,24 +497,36 @@ class DownloadManager(QDialog):
         self.worker_thread = threading.Thread(target=self.download_worker, daemon=True)
         self.worker_thread.start()
 
+    DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+    PROGRESS_MIN_INTERVAL_SECONDS = 0.1
+
     def download_worker(self):
         try:
+            os.makedirs(self.archive_dir, exist_ok=True)
             response = requests.get(self.url, stream=True, timeout=15, headers=HTTP_HEADERS)
             response.raise_for_status()
             total_size = int(response.headers.get('content-length', 0))
 
+            def progress_text(size):
+                return f"{size / (1024*1024):.2f} MB / {total_size / (1024*1024):.2f} MB"
+
             downloaded_size = 0
+            last_emit = 0.0
             with open(self.archive_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
+                for chunk in response.iter_content(chunk_size=self.DOWNLOAD_CHUNK_SIZE):
                     if self.cancelled:
                         self.cleanup_archive()
                         return
                     f.write(chunk)
                     downloaded_size += len(chunk)
-                    status_text = f"{downloaded_size / (1024*1024):.2f} MB / {total_size / (1024*1024):.2f} MB"
-                    self.download_progress.emit(downloaded_size, total_size, status_text)
-            
+                    now = time.monotonic()
+                    if now - last_emit < self.PROGRESS_MIN_INTERVAL_SECONDS:
+                        continue
+                    last_emit = now
+                    self.download_progress.emit(downloaded_size, total_size, progress_text(downloaded_size))
+
             if not self.cancelled:
+                self.download_progress.emit(downloaded_size, total_size, progress_text(downloaded_size))
                 self.download_finished_signal.emit()
         except Exception as e:
             self.error_occurred.emit(f"Download failed: {e}")

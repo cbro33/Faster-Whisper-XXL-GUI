@@ -215,9 +215,10 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
             return False
 
         local_executable_path = os.path.join(self.bin_dir, self.executable_name)
-        all_files_in_bin = all(os.path.exists(os.path.join(self.bin_dir, f)) for f in self.files_to_check)
+        missing_files = [f for f in self.files_to_check
+                         if not os.path.exists(os.path.join(self.bin_dir, f))]
 
-        if all_files_in_bin:
+        if not missing_files:
             self.executable_path = os.path.abspath(local_executable_path)
             logging.info(f"Found all required files in: {self.bin_dir}")
             return True
@@ -228,8 +229,12 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
             logging.info(f"Found executable in system PATH: {path_in_system}")
             return True
 
+        logging.info(f"Missing from {self.bin_dir}: {', '.join(missing_files)}")
+        missing_list = "\n".join(f"    {name}" for name in missing_files)
         reply = show_setup_question(self, "Download Required Files?",
-                                f"The core components (e.g., '{self.executable_name}') were not found in the 'bin' directory or system PATH.\n\n"
+                                f"These files were not found in the 'bin' directory or on your PATH:\n\n"
+                                f"{missing_list}\n\n"
+                                f"Looked in: {os.path.abspath(self.bin_dir)}\n\n"
                                 "Would you like to download and set them up automatically? (Approx. 1.4 GB)\n\n"
                                 "This is a one-time setup.",
                                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
