@@ -1,0 +1,2 @@
+# Keep line endings consistent so a Windows checkout does not rewrite whole files.
+* text=auto
