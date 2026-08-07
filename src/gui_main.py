@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, QProcess, QProcessEnvironment, QByteArray, QUrl, QThread, pyqtSignal, QModelIndex
 from PyQt6.QtGui import QIcon, QPalette, QColor, QTextCursor, QFont, QDesktopServices, QFontMetrics, QAction
 
-from config import APP_VERSION, SUPPORTED_EXTENSIONS, HTTP_HEADERS
+from config import APP_VERSION, SUPPORTED_EXTENSIONS, HTTP_HEADERS, ENGINE_ARCHIVES
 from utils import (
     executable_word,
     get_app_directory, get_settings_directory, get_portable_settings_directory,
@@ -199,11 +199,11 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
             return True
         if sys.platform == "win32":
             self.executable_name = "faster-whisper-xxl.exe"
-            url = "https://github.com/Purfview/whisper-standalone-win/releases/download/Faster-Whisper-XXL/Faster-Whisper-XXL_r245.4_windows.7z"
+            archive = ENGINE_ARCHIVES["windows"]
             self.files_to_check = [self.executable_name, "ffmpeg.exe"]
         elif sys.platform in ["linux", "darwin"]:
             self.executable_name = "faster-whisper-xxl"
-            url = "https://github.com/Purfview/whisper-standalone-win/releases/download/Faster-Whisper-XXL/Faster-Whisper-XXL_r245.4_linux.7z"
+            archive = ENGINE_ARCHIVES["linux"]
             self.files_to_check = [self.executable_name, "ffmpeg"]
         else:
             show_setup_critical(self, "Unsupported OS", f"Your OS '{sys.platform}' is not supported.")
@@ -243,7 +243,8 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
             if not self._prompt_install_7zip():
                 return False
 
-        self.download_manager = DownloadManager(url, self.files_to_check, self.bin_dir, self)
+        self.download_manager = DownloadManager(archive["url"], self.files_to_check, self.bin_dir,
+                                               self, expected_sha256=archive["sha256"])
         if self.download_manager.exec() == QDialog.DialogCode.Accepted:
             self.executable_path = os.path.abspath(local_executable_path)
             if sys.platform != "win32" and os.path.exists(self.executable_path):

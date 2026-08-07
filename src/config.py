@@ -9,6 +9,27 @@ APP_USER_AGENT = (
     "(+https://github.com/cbro33/Faster-Whisper-XXL-GUI)"
 )
 HTTP_HEADERS = {"User-Agent": APP_USER_AGENT}
+# The engine archive is downloaded and its contents are then executed, and
+# upstream publishes no checksum of its own. GitHub release assets can be
+# replaced in place without the URL changing, so the hash is pinned here where
+# it is covered by this repository rather than by the download server. Update
+# both values together when moving to a newer upstream release.
+ENGINE_ARCHIVE_BASE = (
+    "https://github.com/Purfview/whisper-standalone-win/releases/download/Faster-Whisper-XXL/"
+)
+ENGINE_ARCHIVES = {
+    "windows": {
+        "url": ENGINE_ARCHIVE_BASE + "Faster-Whisper-XXL_r245.4_windows.7z",
+        "sha256": "237dee23939cdabfc96ef859fc5e584b842c3a5557e0d2ca744e1f87c14c5844",
+        "size": 1424256246,
+    },
+    "linux": {
+        "url": ENGINE_ARCHIVE_BASE + "Faster-Whisper-XXL_r245.4_linux.7z",
+        "sha256": "510ee48ed73a7d4779fa8a7531437513ae109a76d934e983cbdaea3fc248c4f4",
+        "size": 1657690937,
+    },
+}
+
 SUPPORTED_EXTENSIONS = ('.mp3', '.wav', '.mp4', '.m4a', '.flac', '.aac', '.ogg', '.webm', '.mkv', '.avi', '.mov')
 YTDLP_UPDATE_FAILURE_COOLDOWN_HOURS = 6
 YTDLP_DEBUG_LOG_NAME = "ytdlp_update_debug.log"

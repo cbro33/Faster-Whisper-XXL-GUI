@@ -1,8 +1,10 @@
 import os
+import re
 import json
 import pytest
 
 import utils
+from config import ENGINE_ARCHIVES
 
 from utils import (
     format_path_for_display,
@@ -21,6 +23,8 @@ from utils import (
     version_tuple,
     text_indicates_transcription_success,
     find_7zip,
+    is_safe_download_filename,
+    is_within_directory,
 )
 
 
@@ -446,3 +450,87 @@ class TestFind7zip:
     def test_registry_helper_is_noop_off_windows(self, monkeypatch):
         monkeypatch.setattr(utils.sys, "platform", "linux")
         assert utils._7zip_dirs_from_registry() == []
+
+
+# ---------------------------------------------------------------------------
+# is_safe_download_filename / is_within_directory
+# ---------------------------------------------------------------------------
+
+class TestIsSafeDownloadFilename:
+    @pytest.mark.parametrize("name", [
+        "model.bin",
+        "config.json",
+        "model-00001-of-00002.safetensors",
+        "tokenizer.model",
+    ])
+    def test_plain_filenames_allowed(self, name):
+        assert is_safe_download_filename(name) is True
+
+    @pytest.mark.parametrize("name", [
+        "../../etc/passwd",
+        "..\\..\\..\\Windows\\System32\\evil.dll",
+        "sub/dir/model.bin",
+        "sub\\dir\\model.bin",
+        "C:evil.dll",
+        "model.bin:hidden",
+        "..",
+        ".",
+        "",
+        None,
+        "nul\0byte",
+    ])
+    def test_path_components_rejected(self, name):
+        assert is_safe_download_filename(name) is False
+
+    def test_backslash_rejected_on_every_platform(self):
+        """The Windows separator must be rejected even when running on Linux."""
+        assert is_safe_download_filename("..\\..\\evil.dll") is False
+
+
+class TestIsWithinDirectory:
+    def test_child_is_inside(self, tmp_path):
+        assert is_within_directory(str(tmp_path), str(tmp_path / "model.bin")) is True
+
+    def test_nested_child_is_inside(self, tmp_path):
+        assert is_within_directory(str(tmp_path), str(tmp_path / "a" / "b.bin")) is True
+
+    def test_parent_is_outside(self, tmp_path):
+        assert is_within_directory(str(tmp_path / "models"), str(tmp_path / "evil.dll")) is False
+
+    def test_traversal_is_outside(self, tmp_path):
+        target = os.path.join(str(tmp_path), "..", "..", "evil.dll")
+        assert is_within_directory(str(tmp_path), target) is False
+
+    def test_directory_itself_counts_as_inside(self, tmp_path):
+        assert is_within_directory(str(tmp_path), str(tmp_path)) is True
+
+    def test_sibling_with_shared_prefix_is_outside(self, tmp_path):
+        assert is_within_directory(str(tmp_path / "models"), str(tmp_path / "models-evil" / "x")) is False
+
+
+# ---------------------------------------------------------------------------
+# Pinned engine archives
+# ---------------------------------------------------------------------------
+
+class TestEngineArchivePinning:
+    """A placeholder or malformed hash would break setup for every user."""
+
+    @pytest.mark.parametrize("platform", ["windows", "linux"])
+    def test_entry_exists(self, platform):
+        assert platform in ENGINE_ARCHIVES
+
+    @pytest.mark.parametrize("platform", ["windows", "linux"])
+    def test_sha256_is_a_real_digest(self, platform):
+        digest = ENGINE_ARCHIVES[platform]["sha256"]
+        assert re.fullmatch(r"[0-9a-f]{64}", digest), f"{platform}: {digest!r}"
+
+    @pytest.mark.parametrize("platform", ["windows", "linux"])
+    def test_url_is_https(self, platform):
+        assert ENGINE_ARCHIVES[platform]["url"].startswith("https://")
+
+    @pytest.mark.parametrize("platform", ["windows", "linux"])
+    def test_size_is_positive(self, platform):
+        assert ENGINE_ARCHIVES[platform]["size"] > 0
+
+    def test_platforms_do_not_share_a_hash(self):
+        assert ENGINE_ARCHIVES["windows"]["sha256"] != ENGINE_ARCHIVES["linux"]["sha256"]

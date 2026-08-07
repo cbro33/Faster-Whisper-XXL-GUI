@@ -141,6 +141,8 @@ def ensure_converter_bundle(progress_cb=None, cancel_cb=None):
 
         sha_asset = _find_release_asset(release, CONVERTER_BUNDLE_SHA256_ASSET)
         sha_url = sha_asset.get("browser_download_url") if sha_asset else None
+        if not sha_url:
+            raise RuntimeError(f"Converter bundle checksum not found: {CONVERTER_BUNDLE_SHA256_ASSET}")
 
         zip_path = os.path.join(temp_dir, CONVERTER_BUNDLE_ASSET)
         if progress_cb:
@@ -154,16 +156,17 @@ def ensure_converter_bundle(progress_cb=None, cancel_cb=None):
         if not ok:
             raise RuntimeError("Converter download cancelled.")
 
-        sha_expected = None
-        if sha_url:
-            sha_path = os.path.join(temp_dir, CONVERTER_BUNDLE_SHA256_ASSET)
-            _download_file(sha_url, sha_path, cancel_cb=cancel_cb)
-            sha_expected = _read_sha256_file(sha_path)
+        # Verification is mandatory: this bundle ships a Python interpreter that
+        # the app then executes, so an unverified download must not proceed.
+        sha_path = os.path.join(temp_dir, CONVERTER_BUNDLE_SHA256_ASSET)
+        _download_file(sha_url, sha_path, cancel_cb=cancel_cb)
+        sha_expected = _read_sha256_file(sha_path)
+        if not sha_expected:
+            raise RuntimeError("Could not read the converter bundle checksum.")
 
-        if sha_expected:
-            sha_actual = _compute_sha256(zip_path)
-            if sha_actual != sha_expected:
-                raise RuntimeError("Converter bundle checksum mismatch.")
+        sha_actual = _compute_sha256(zip_path)
+        if sha_actual != sha_expected:
+            raise RuntimeError("Converter bundle checksum mismatch.")
 
         if progress_cb:
             progress_cb("Extracting converter bundle...", 0, 0)

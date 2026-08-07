@@ -242,6 +242,32 @@ def windows_to_posix_path(path):
     return f"/mnt/{drive}/{rest}"
 
 
+def is_safe_download_filename(name):
+    """True only for a plain filename carrying no path component.
+
+    Both separators are rejected whatever the current platform, because the
+    app runs on Windows where a backslash separates directories: filtering
+    only "/" lets a remote name like ..\\..\\evil.dll escape its directory.
+    A colon is rejected too, since it introduces drive letters and NTFS
+    alternate data streams.
+    """
+    if not name or not isinstance(name, str):
+        return False
+    if name in (".", ".."):
+        return False
+    return not any(char in name for char in ("/", "\\", ":", "\0"))
+
+
+def is_within_directory(directory, target):
+    """Whether ``target`` resolves to a location inside ``directory``."""
+    try:
+        directory = os.path.abspath(directory)
+        target = os.path.abspath(target)
+        return os.path.commonpath([directory, target]) == directory
+    except ValueError:
+        return False
+
+
 def sanitize_model_name(name):
     """Sanitize a model name to contain only safe characters."""
     if not name:

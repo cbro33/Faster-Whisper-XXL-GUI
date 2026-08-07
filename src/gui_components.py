@@ -3,6 +3,7 @@ import sys
 import logging
 import requests
 import webbrowser
+import hashlib
 import shutil
 import subprocess
 import tempfile
@@ -26,7 +27,9 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import pyqtSignal, Qt, QTimer
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent
-from utils import executable_word, get_window_stays_on_top_flag, run_hidden_subprocess, popen_hidden_subprocess, get_app_directory, find_7zip
+from utils import (executable_word, get_window_stays_on_top_flag, run_hidden_subprocess,
+                   popen_hidden_subprocess, get_app_directory, find_7zip,
+                   is_safe_download_filename, is_within_directory)
 from gpu_utils import detect_hardware_capabilities, get_recommended_settings
 from config import SUPPORTED_EXTENSIONS, HTTP_HEADERS
 from converter_utils import find_transformers_weight_files, get_converter_bundle_dir, get_converter_python_path
@@ -390,6 +393,10 @@ def run_transformers_conversion_dialog(parent, model_dir, use_bundle=False):
     return result["ok"], result["message"]
 
 
+class ArchiveVerificationError(RuntimeError):
+    """The archive did not match its pinned hash and must not be extracted."""
+
+
 class DownloadManager(QDialog):
     download_progress = pyqtSignal(int, int, str)
     extraction_progress = pyqtSignal(int, int, str)
@@ -397,11 +404,12 @@ class DownloadManager(QDialog):
     download_finished_signal = pyqtSignal()
     extraction_finished_signal = pyqtSignal()
 
-    def __init__(self, url, files_to_extract, destination_dir, parent=None):
+    def __init__(self, url, files_to_extract, destination_dir, parent=None, expected_sha256=None):
         super().__init__(parent)
         self.url = url
         self.files_to_extract = files_to_extract
         self.destination_dir = destination_dir
+        self.expected_sha256 = (expected_sha256 or "").lower() or None
         self.error_string = None
         self.archive_dir = os.path.join(tempfile.gettempdir(), "faster-whisper-xxl-gui")
         self.archive_path = os.path.join(self.archive_dir, "whisper_essentials.7z")
@@ -477,9 +485,22 @@ class DownloadManager(QDialog):
 
         QTimer.singleShot(100, self.start_download)
 
+    def _prepare_archive_dir(self):
+        # The path is predictable and on Linux the temp directory is shared, so
+        # another user could pre-create either of these as a symlink and have a
+        # 1.4 GB download written somewhere of their choosing.
+        for path in (self.archive_dir, self.archive_path):
+            if os.path.islink(path):
+                raise RuntimeError(f"Refusing to use {path}: it is a symbolic link.")
+        if os.path.isdir(self.archive_dir) and hasattr(os, "getuid"):
+            if os.stat(self.archive_dir).st_uid != os.getuid():
+                raise RuntimeError(f"Refusing to use {self.archive_dir}: it belongs to another user.")
+        os.makedirs(self.archive_dir, mode=0o700, exist_ok=True)
+
     def start_download(self):
         self.keep_archive_on_error = False
-        if os.path.exists(self.archive_path) and os.path.getsize(self.archive_path) > 0:
+        if (os.path.exists(self.archive_path) and not os.path.islink(self.archive_path)
+                and os.path.getsize(self.archive_path) > 0):
             self.details_label.setText("Using existing download archive...")
             self.progress_bar.setRange(0, 1)
             self.progress_bar.setValue(1)
@@ -495,7 +516,7 @@ class DownloadManager(QDialog):
 
     def download_worker(self):
         try:
-            os.makedirs(self.archive_dir, exist_ok=True)
+            self._prepare_archive_dir()
             response = requests.get(self.url, stream=True, timeout=15, headers=HTTP_HEADERS)
             response.raise_for_status()
             total_size = int(response.headers.get('content-length', 0))
@@ -579,10 +600,41 @@ class DownloadManager(QDialog):
             lines.append(buf.strip())
         return proc.returncode, "\n".join(lines)
 
+    def _verify_archive(self):
+        """Check the archive against the hash pinned in config before extracting.
+
+        Runs for a fresh download and for a reused one alike, since both reach
+        extraction through the same path.
+        """
+        if not self.expected_sha256:
+            return
+        self.extraction_progress.emit(0, 0, "Verifying download...")
+        started = time.monotonic()
+        digest = hashlib.sha256()
+        with open(self.archive_path, "rb") as handle:
+            for block in iter(lambda: handle.read(1 << 20), b""):
+                if self.cancelled:
+                    return
+                digest.update(block)
+        actual = digest.hexdigest()
+        if actual == self.expected_sha256:
+            logging.info(f"Archive checksum verified in {time.monotonic() - started:.1f}s")
+            return
+        logging.error(f"Archive checksum mismatch: expected {self.expected_sha256}, got {actual}")
+        self.cleanup_archive()
+        raise ArchiveVerificationError(
+            "The downloaded archive did not match the expected checksum, so it was "
+            "deleted rather than extracted.\n\n"
+            "Try setup again, or install the files manually using the buttons above."
+        )
+
     def extraction_worker(self):
         # Use secure temporary directory instead of hardcoded name
         extract_dir = tempfile.mkdtemp(prefix="whisper_extract_")
         try:
+            self._verify_archive()
+            if self.cancelled:
+                return
             logging.info("--- Starting Extraction ---")
             if os.path.exists(extract_dir):
                 logging.info(f"Removing existing temp directory: {extract_dir}")
@@ -661,6 +713,11 @@ class DownloadManager(QDialog):
                 self.extraction_finished_signal.emit()
                 logging.info("--- Extraction Successful ---")
 
+        except ArchiveVerificationError as e:
+            # Deliberately not kept: a file that failed verification is exactly
+            # the one we do not want left on disk for a retry to reuse.
+            logging.error(f"--- Verification Failed ---\n{e}")
+            self.error_occurred.emit(str(e))
         except Exception as e:
             import traceback
             error_details = traceback.format_exc()
@@ -940,7 +997,9 @@ class ModelDownloadDialog(QDialog):
         files = []
         for sibling in data.get("siblings", []):
             fname = sibling.get("rfilename")
-            if not fname or "/" in fname:
+            if not is_safe_download_filename(fname):
+                if fname:
+                    logging.warning(f"Skipping repo file with unsafe name: {fname!r}")
                 continue
             files.append(fname)
             fsize = sibling.get("size")
@@ -1025,6 +1084,9 @@ class ModelDownloadDialog(QDialog):
         if self.cancelled:
             return False
         target_path = os.path.join(self.target_dir, filename)
+        if not is_safe_download_filename(filename) or not is_within_directory(self.target_dir, target_path):
+            logging.error(f"Refusing to write outside the model directory: {filename!r}")
+            return False
         
         total = self.file_sizes.get(filename, 0)
 
