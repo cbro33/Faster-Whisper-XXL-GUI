@@ -27,6 +27,12 @@ Some antivirus products flag the `.exe` as a trojan, usually when it first downl
 
 Add an exclusion for the app folder, or run from source instead. Reporting the file to your antivirus vendor as a false positive helps everyone using that product. Microsoft Defender submissions go [here](https://www.microsoft.com/en-us/wdsi/filesubmission). See the [Wiki](https://github.com/cbro33/Faster-Whisper-XXL-GUI/wiki) for details.
 
+## Code Signing
+
+Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
+
+Windows releases are built by GitHub Actions from the tagged commit and signed by SignPath. The private key is held by SignPath and is never in this repository or on a maintainer machine. See [CODE_SIGNING_POLICY.md](CODE_SIGNING_POLICY.md).
+
 ## Manual yt-dlp Updates (No Python)
 
 1. Download the latest `yt-dlp.exe` from the official [yt-dlp releases page](https://github.com/yt-dlp/yt-dlp/releases).
