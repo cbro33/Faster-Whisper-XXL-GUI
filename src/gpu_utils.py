@@ -1,6 +1,19 @@
+import os
+import shutil
 import sys
 import logging
 from utils import run_hidden_subprocess
+
+
+def nvidia_driver_present():
+    """Whether an NVIDIA driver is installed."""
+    if shutil.which("nvidia-smi"):
+        return True
+    if sys.platform == "win32":
+        system32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+        return any(os.path.exists(os.path.join(system32, name))
+                   for name in ("nvml.dll", "nvcuda.dll"))
+    return os.path.exists("/proc/driver/nvidia") or os.path.exists("/dev/nvidiactl")
 
 def try_pytorch_detection():
     """ Try PyTorch detection with detailed diagnostics """
@@ -552,28 +565,12 @@ def detect_gpu_info():
     all_detected_gpus = []
     detection_details = []
     
-    logging.info("Phase 1: Trying NVIDIA GPU detection methods...")
-    
-    logging.info("Trying PyTorch GPU detection...")
-    pytorch_result = try_pytorch_detection()
-    if pytorch_result["success"]:
-        logging.info(f"NVIDIA GPU detected via PyTorch: {pytorch_result['gpu_info']['gpu_name']}")
-        all_detected_gpus.append(pytorch_result["gpu_info"])
+    if not nvidia_driver_present():
+        logging.info("Phase 1: No NVIDIA driver present, skipping NVIDIA detection")
+        detection_details.append("NVIDIA: no driver present")
     else:
-        detection_details.append(f"PyTorch: {pytorch_result['error']}")
-        logging.info(f"PyTorch detection failed: {pytorch_result['error']}")
-    
-    if not all_detected_gpus:
-        logging.info("Trying NVML GPU detection...")
-        nvml_result = try_nvml_detection()
-        if nvml_result["success"]:
-            logging.info(f"NVIDIA GPU detected via NVML: {nvml_result['gpu_info']['gpu_name']}")
-            all_detected_gpus.append(nvml_result["gpu_info"])
-        else:
-            detection_details.append(f"NVML: {nvml_result['error']}")
-            logging.info(f"NVML detection failed: {nvml_result['error']}")
-    
-    if not all_detected_gpus:
+        logging.info("Phase 1: Trying NVIDIA GPU detection methods...")
+
         logging.info("Trying nvidia-smi GPU detection...")
         smi_result = try_nvidia_smi_detection()
         if smi_result["success"]:
@@ -582,7 +579,19 @@ def detect_gpu_info():
         else:
             detection_details.append(f"nvidia-smi: {smi_result['error']}")
             logging.info(f"nvidia-smi detection failed: {smi_result['error']}")
-    
+
+        if not all_detected_gpus:
+            logging.info("Trying NVML GPU detection...")
+            nvml_result = try_nvml_detection()
+            if nvml_result["success"]:
+                logging.info(f"NVIDIA GPU detected via NVML: {nvml_result['gpu_info']['gpu_name']}")
+                all_detected_gpus.append(nvml_result["gpu_info"])
+            else:
+                detection_details.append(f"NVML: {nvml_result['error']}")
+                logging.info(f"NVML detection failed: {nvml_result['error']}")
+
+
+
     if not all_detected_gpus:
         logging.info("Phase 2: Trying Intel GPU detection...")
         intel_result = try_intel_gpu_detection()
@@ -613,7 +622,19 @@ def detect_gpu_info():
         else:
             detection_details.append(f"Universal: {universal_result['error']}")
             logging.info(f"Universal detection failed: {universal_result['error']}")
-    
+
+    # Last resort: importing torch costs far more than every probe above, so it
+    # only runs when nothing else found a GPU at all.
+    if not all_detected_gpus:
+        logging.info("Phase 5: Trying PyTorch GPU detection...")
+        pytorch_result = try_pytorch_detection()
+        if pytorch_result["success"]:
+            logging.info(f"NVIDIA GPU detected via PyTorch: {pytorch_result['gpu_info']['gpu_name']}")
+            all_detected_gpus.append(pytorch_result["gpu_info"])
+        else:
+            detection_details.append(f"PyTorch: {pytorch_result['error']}")
+            logging.info(f"PyTorch detection failed: {pytorch_result['error']}")
+
     if all_detected_gpus:
         best_gpu = select_best_gpu_for_ai(all_detected_gpus)
         if best_gpu:

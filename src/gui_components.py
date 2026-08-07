@@ -1281,16 +1281,50 @@ class ModelDownloadDialog(QDialog):
         self.reject()
 
 
-class HardwareOptimizationDialog(QDialog):
-    """Dialog for showing hardware detection results and optimization recommendations"""
-    
+class HardwareDetectionDialog(QDialog):
+    """Runs hardware detection on a worker thread."""
+
+    detection_finished = pyqtSignal(object)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Hardware Optimization")
         self.setModal(True)
+        self.hardware_info = None
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Detecting your hardware...", self))
+        bar = QProgressBar(self)
+        bar.setRange(0, 0)
+        layout.addWidget(bar)
+        layout.addWidget(QLabel("This can take a moment on some systems.", self))
+
+        self.detection_finished.connect(self._on_detection_finished)
+        QTimer.singleShot(0, lambda: threading.Thread(target=self._worker, daemon=True).start())
+
+    def _worker(self):
+        try:
+            info = detect_hardware_capabilities()
+        except Exception as exc:
+            logging.error(f"Hardware detection failed: {exc}")
+            info = None
+        self.detection_finished.emit(info)
+
+    def _on_detection_finished(self, info):
+        self.hardware_info = info
+        self.accept()
+
+
+class HardwareOptimizationDialog(QDialog):
+    """Dialog for showing hardware detection results and optimization recommendations"""
+
+    def __init__(self, parent=None, hardware_info=None):
+        super().__init__(parent)
+        self.setWindowTitle("Hardware Optimization")
+        self.setModal(True)
         self.setMinimumSize(500, 400)
-        
-        self.hardware_info = detect_hardware_capabilities()
+
+        self.hardware_info = hardware_info if hardware_info is not None else detect_hardware_capabilities()
         self.recommendations = get_recommended_settings(self.hardware_info)
         self.user_accepted = False
         

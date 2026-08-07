@@ -54,7 +54,7 @@ from workers import (
     LoudnessAnalysisWorker, AudioPreprocessWorker, VerifyModelsWorker,
 )
 from gui_components import (
-    DownloadManager, HardwareOptimizationDialog, FileDropGroupBox, FileDropListWidget,
+    DownloadManager, HardwareDetectionDialog, HardwareOptimizationDialog, FileDropGroupBox, FileDropListWidget,
     FileDropWidget, LinkDropGroupBox, LinkDropListWidget, UpdateProgressDialog, show_setup_critical,
     show_setup_question, show_setup_warning, show_setup_information,
     show_yt_dlp_unavailable, ModelDownloadDialog, set_model_download_logging_enabled,
@@ -1707,7 +1707,9 @@ class WhisperGUI(QMainWindow, TabSetupMixin, InfoDialogsMixin):
     def show_hardware_optimization_dialog(self):
         """ Show hardware optimization dialog and apply recommendations """
         try:
-            dialog = HardwareOptimizationDialog(self)
+            detector = HardwareDetectionDialog(self)
+            detector.exec()
+            dialog = HardwareOptimizationDialog(self, hardware_info=detector.hardware_info)
             result = dialog.exec()
             
             if result == QDialog.DialogCode.Accepted and dialog.user_accepted:
