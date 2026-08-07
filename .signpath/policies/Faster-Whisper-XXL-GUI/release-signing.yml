@@ -1,0 +1,5 @@
+# Path is fixed by SignPath: .signpath/policies/<project-slug>/<signing-policy-slug>.yml
+# Without this, anyone holding the API token could have an artifact signed.
+github-policies:
+  runners:
+    require_github_hosted: true

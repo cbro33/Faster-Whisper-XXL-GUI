@@ -76,6 +76,11 @@ jobs:
     name: Windows build
     runs-on: windows-latest
     needs: test
+    permissions:
+      contents: read
+      # The signing action reads the job details and downloads the uploaded
+      # artifact back through the GitHub API.
+      actions: read
     steps:
       - uses: actions/checkout@v4
 
@@ -108,10 +113,50 @@ jobs:
           }
           Write-Host "Packaged app starts cleanly."
 
+      # SignPath pulls the artifact back out of GitHub, so the unsigned exe has
+      # to be uploaded on its own first. Nothing else may ride along: the
+      # artifact configuration describes one executable inside the zip that
+      # upload-artifact produces, and a stray file will not match it.
+      - name: Upload the unsigned executable
+        id: unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: faster-whisper-xxl-gui-unsigned
+          path: dist/faster-whisper-xxl-gui.exe
+          retention-days: 1
+
+      # Signed on tags, and on a manual run so the pipeline can be rehearsed
+      # without cutting a release. Ordinary pushes are left alone: a signing
+      # request per commit would spend the Foundation's certificate for nothing.
+      - name: Sign the executable
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        uses: signpath/github-action-submit-signing-request@v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: Faster-Whisper-XXL-GUI
+          # Tags reach users and must carry the Foundation's release
+          # certificate. Manual runs use the test certificate, which chains to
+          # an untrusted root, so choosing the policy from the trigger rather
+          # than by hand keeps a test signature out of a published release.
+          signing-policy-slug: ${{ startsWith(github.ref, 'refs/tags/') && 'release-signing' || 'test-signing' }}
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed
+
+      - name: Stage the unsigned build
+        if: ${{ !(startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch') }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force signed | Out-Null
+          Copy-Item dist/faster-whisper-xxl-gui.exe signed/
+
+      # After signing, never before. The signature changes the file, so a hash
+      # taken earlier would not describe what people actually download.
       - name: Report size and checksum
         shell: pwsh
         run: |
-          $exe = "dist/faster-whisper-xxl-gui.exe"
+          $exe = "signed/faster-whisper-xxl-gui.exe"
           $bytes = (Get-Item $exe).Length
           $mb = [math]::Round($bytes / 1MB, 1)
           Write-Host "Size: $bytes bytes ($mb MiB)"
@@ -122,15 +167,36 @@ jobs:
             Write-Host "Under the 50 MB submission limit."
           }
           $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
-          "$hash  faster-whisper-xxl-gui.exe" | Out-File -Encoding ascii dist/faster-whisper-xxl-gui.exe.sha256
+          "$hash  faster-whisper-xxl-gui.exe" | Out-File -Encoding ascii signed/faster-whisper-xxl-gui.exe.sha256
           Write-Host "SHA256: $hash"
 
+      - name: Verify the signature
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature "signed/faster-whisper-xxl-gui.exe"
+          Write-Host "Status: $($sig.Status)"
+          Write-Host "Signer: $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -eq 'NotSigned') {
+            throw "SignPath returned a file with no signature on it."
+          }
+          # The test certificate chains to a root Windows does not trust, so on
+          # a manual run anything other than NotSigned means the pipeline works.
+          # A tag ships to users and has to chain properly.
+          if ($sig.Status -ne 'Valid' -and $env:GITHUB_REF -like 'refs/tags/*') {
+            throw "Release signature is not trusted: $($sig.Status)"
+          }
+
+      # Manual runs sign with the test certificate. Publishing that as an
+      # artifact would leave a binary nobody should run sitting in the Actions
+      # tab of a public repository, so it stays on the runner and dies with it.
       - uses: actions/upload-artifact@v4
+        if: github.event_name != 'workflow_dispatch'
         with:
           name: faster-whisper-xxl-gui-windows
           path: |
-            dist/faster-whisper-xxl-gui.exe
-            dist/faster-whisper-xxl-gui.exe.sha256
+            signed/faster-whisper-xxl-gui.exe
+            signed/faster-whisper-xxl-gui.exe.sha256
           retention-days: 30
 
   release:
