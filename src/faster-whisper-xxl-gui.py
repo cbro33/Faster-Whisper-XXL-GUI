@@ -50,6 +50,69 @@ _configure_logging()
 from gui_main import WhisperGUI
 
 
+def _selftest_themes(app, window):
+    """Apply every theme and check the stylesheet actually landed.
+
+    apply_theme falls back to an empty stylesheet and only logs when a .qss is
+    missing, so calling it proves nothing on its own. A packaged build that
+    failed to bundle `resources` would pass otherwise.
+    """
+    original = window.settings.get("theme", "light")
+    for theme in ("Light", "Dark", "AMOLED"):
+        window.apply_theme(theme)
+        if not window.styleSheet():
+            raise RuntimeError(f"{theme} theme produced an empty stylesheet")
+        app.processEvents()
+    window.apply_theme(original.capitalize())
+
+
+def _selftest_dialogs(app, window):
+    """Build every dialog a user can open.
+
+    These are constructed on demand, so nothing above covers them, and a Qt
+    plugin missing from the bundle would surface here first. They are only
+    constructed, never exec'd, so none of them block.
+    """
+    import tempfile
+
+    from model_manager import ModelManagerDialog
+    from gui_components import (
+        AudioPreprocessDialog,
+        ConverterProgressDialog,
+        HardwareOptimizationDialog,
+        LoudnessProgressDialog,
+        ModelDownloadDialog,
+        UpdateProgressDialog,
+    )
+
+    # HardwareDetectionDialog is left out on purpose: it starts real hardware
+    # detection on a worker thread from its constructor, which would make this
+    # slow and flaky for no extra coverage over the dialog below.
+    with tempfile.TemporaryDirectory() as tmp:
+        dialogs = [
+            ModelManagerDialog(window),
+            UpdateProgressDialog(window),
+            ConverterProgressDialog(window),
+            ModelDownloadDialog("tiny", tmp, window),
+            LoudnessProgressDialog(1, window),
+            AudioPreprocessDialog(window),
+        ]
+        # Both branches, since a CI runner has no GPU and would only ever build
+        # the second one.
+        for has_cuda in (True, False):
+            dialogs.append(HardwareOptimizationDialog(window, {
+                "has_cuda": has_cuda,
+                "gpu_name": "Selftest GPU",
+                "gpu_memory_gb": 8.0,
+                "ram_gb": 16.0,
+                "cpu_cores": 8,
+                "detection_method": "selftest",
+            }))
+        app.processEvents()
+
+    logging.info(f"selftest built {len(dialogs)} dialogs")
+
+
 def _run_selftest():
     """Headless startup check used by CI. Exits 0 if the build is sound.
 
@@ -84,6 +147,9 @@ def _run_selftest():
     window._enforce_splitter_sizes_for_frozen()
     window.resize(1300, 840)
     app.processEvents()
+
+    _selftest_themes(app, window)
+    _selftest_dialogs(app, window)
 
     message = f"selftest OK: {window.tabs.count()} tabs, {window.width()}x{window.height()}"
     logging.info(message)
