@@ -53,6 +53,25 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+# The `excludes` above only reach Python imports. These DLLs arrive underneath
+# them as Qt dependencies, and nothing in the bundle imports any of them, read
+# off the PE import tables of a shipped build. opengl32sw is the 20 MB software
+# OpenGL fallback that qwindows.dll loads only if a GL context is asked for, and
+# a widgets-only app never asks. Qt6Pdf exists for the PDF image format plugin,
+# and Qt6Network is left with no users at all once that and the TUIO touch
+# plugin are gone.
+UNUSED_BINARIES = {
+    'opengl32sw.dll',
+    'qt6pdf.dll',
+    'qpdf.dll',
+    'qt6network.dll',
+    'qtuiotouchplugin.dll',
+}
+a.binaries = [
+    entry for entry in a.binaries
+    if entry[0].replace('\\', '/').rsplit('/', 1)[-1].lower() not in UNUSED_BINARIES
+]
+
 pyz = PYZ(a.pure)
 
 exe = EXE(

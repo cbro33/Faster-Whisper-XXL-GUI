@@ -102,13 +102,19 @@ jobs:
           # Builds the real main window inside the packaged exe. Catches an
           # `excludes` entry that removed something still needed, which would
           # otherwise only show up as a crash on a user's machine.
-          $p = Start-Process -FilePath "dist/faster-whisper-xxl-gui.exe" `
-                             -ArgumentList "--selftest" -Wait -PassThru
-          if (Test-Path "dist/selftest.log") { Get-Content "dist/selftest.log" }
-          if ($p.ExitCode -ne 0) {
-            throw "Packaged app failed to start (exit $($p.ExitCode)). A PyInstaller exclude probably removed something needed."
+          # The selftest defaults to the offscreen plugin, so only the second
+          # pass loads qwindows.dll and whatever it pulls in behind it.
+          foreach ($platform in @("offscreen", "windows")) {
+            $env:QT_QPA_PLATFORM = $platform
+            Remove-Item "dist/selftest.log" -ErrorAction SilentlyContinue
+            $p = Start-Process -FilePath "dist/faster-whisper-xxl-gui.exe" `
+                               -ArgumentList "--selftest" -Wait -PassThru
+            if (Test-Path "dist/selftest.log") { Get-Content "dist/selftest.log" }
+            if ($p.ExitCode -ne 0) {
+              throw "Packaged app failed to start under QT_QPA_PLATFORM=$platform (exit $($p.ExitCode)). A PyInstaller exclude probably removed something needed."
+            }
+            Write-Host "Packaged app starts cleanly under $platform."
           }
-          Write-Host "Packaged app starts cleanly."
 
       # SignPath pulls the artifact back out of GitHub, so the unsigned exe has
       # to be uploaded on its own first. Nothing else may ride along: the
