@@ -110,7 +110,7 @@ def _selftest_dialogs(app, window):
             }))
         app.processEvents()
 
-    logging.info(f"selftest built {len(dialogs)} dialogs")
+    return len(dialogs)
 
 
 def _run_selftest():
@@ -149,9 +149,12 @@ def _run_selftest():
     app.processEvents()
 
     _selftest_themes(app, window)
-    _selftest_dialogs(app, window)
+    dialogs = _selftest_dialogs(app, window)
 
-    message = f"selftest OK: {window.tabs.count()} tabs, {window.width()}x{window.height()}"
+    # A windowed build has no stdout, so this line is the only thing CI sees.
+    # Counting the dialogs here is what shows that coverage actually ran.
+    message = (f"selftest OK: {window.tabs.count()} tabs, {dialogs} dialogs, "
+               f"{window.width()}x{window.height()}")
     logging.info(message)
     print(message)
     # console=False builds have no stdout, so leave a file CI can read too.
