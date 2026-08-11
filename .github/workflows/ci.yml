@@ -76,11 +76,8 @@ jobs:
     name: Windows build
     runs-on: windows-latest
     needs: test
-    permissions:
-      contents: read
-      # The signing action reads the job details and downloads the uploaded
-      # artifact back through the GitHub API.
-      actions: read
+    outputs:
+      unsigned-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@v4
 
@@ -123,13 +120,28 @@ jobs:
         with:
           name: faster-whisper-xxl-gui-unsigned
           path: dist/faster-whisper-xxl-gui.exe
-          retention-days: 1
+          # Long enough to re-run signing on a later day without a rebuild.
+          retention-days: 7
 
+  # Kept out of the build job: release signing waits on a human in the SignPath
+  # UI, and a missed approval should not cost another PyInstaller run.
+  sign:
+    name: Sign and package
+    runs-on: windows-latest
+    needs: build
+    permissions:
+      contents: read
+      # The signing action reads the job details and downloads the uploaded
+      # artifact back through the GitHub API.
+      actions: read
+    env:
       # Signed on tags, and on a manual run so the pipeline can be rehearsed
       # without cutting a release. Ordinary pushes are left alone: a signing
       # request per commit would spend the Foundation's certificate for nothing.
+      SIGNING: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' }}
+    steps:
       - name: Sign the executable
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        if: env.SIGNING == 'true'
         uses: signpath/github-action-submit-signing-request@v2
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
@@ -140,16 +152,19 @@ jobs:
           # an untrusted root, so choosing the policy from the trigger rather
           # than by hand keeps a test signature out of a published release.
           signing-policy-slug: ${{ startsWith(github.ref, 'refs/tags/') && 'release-signing' || 'test-signing' }}
-          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          github-artifact-id: ${{ needs.build.outputs.unsigned-artifact-id }}
           wait-for-completion: true
+          # Release signing waits on manual approval, and the request only
+          # appears once the build is done, so the default 600 is easy to miss.
+          wait-for-completion-timeout-in-seconds: ${{ startsWith(github.ref, 'refs/tags/') && '3600' || '600' }}
           output-artifact-directory: signed
 
-      - name: Stage the unsigned build
-        if: ${{ !(startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch') }}
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force signed | Out-Null
-          Copy-Item dist/faster-whisper-xxl-gui.exe signed/
+      - name: Fetch the unsigned build
+        if: env.SIGNING != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: faster-whisper-xxl-gui-unsigned
+          path: signed
 
       # After signing, never before. The signature changes the file, so a hash
       # taken earlier would not describe what people actually download.
@@ -171,7 +186,7 @@ jobs:
           Write-Host "SHA256: $hash"
 
       - name: Verify the signature
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        if: env.SIGNING == 'true'
         shell: pwsh
         run: |
           $sig = Get-AuthenticodeSignature "signed/faster-whisper-xxl-gui.exe"
@@ -202,7 +217,7 @@ jobs:
   release:
     name: Publish release
     runs-on: ubuntu-latest
-    needs: build
+    needs: sign
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
